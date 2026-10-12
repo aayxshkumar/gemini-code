@@ -20,6 +20,12 @@ export interface GeminiResponse {
  */
 export interface IGeminiDriver {
   /**
+   * The Gem this tab's conversation runs inside, if any. Optional so fakes and
+   * other drivers needn't care; when present, the loop tells the model that the
+   * tool protocol outranks the Gem's own style instructions.
+   */
+  readonly currentGem?: { name: string };
+  /**
    * Sends a prompt. `attachFile` uploads a local file alongside it, used
    * when a tool result is too long to paste into the composer (the web UI
    * has a practical text-length limit that the API wouldn't).

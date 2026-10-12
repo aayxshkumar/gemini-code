@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseGeminiReply, looksLikeAbandonedWork, looksUnfinished } from "../agent/toolCallParser.js";
-import { formatToolResult, buildContextDocument, buildSystemPrimer } from "../agent/promptTemplate.js";
+import { formatToolResult, buildContextDocument, buildSystemPrimer, buildProtocolReminder } from "../agent/promptTemplate.js";
 import { AgentSession } from "../agent/loop.js";
 import type { IGeminiDriver, GeminiResponse } from "../driver/IGeminiDriver.js";
 import { readFileTool } from "../tools/readFile.js";
@@ -27,6 +27,7 @@ import { webSearchTool, parseResults } from "../tools/webSearch.js";
 import { resolveModel, DEFAULT_MODEL_ALIAS, EXTENDED_THINKING } from "../driver/models.js";
 import { resolveGem } from "../driver/GeminiDriver.js";
 import { createAskGemTool } from "../tools/askGem.js";
+import { gemIdFromHref } from "../driver/GeminiDriver.js";
 import { gemFlag, gemModeFlag, serveArgs } from "../args.js";
 import { startServer } from "../server/openai.js";
 import { isDialogRace } from "../driver/processGuards.js";
@@ -109,6 +110,11 @@ class FakeDriver implements IGeminiDriver {
     if (next === undefined) throw new Error("FakeDriver ran out of scripted replies");
     return next;
   }
+}
+
+/** A FakeDriver whose tab is inside a Gem, as GeminiDriver reports it. */
+class GemFakeDriver extends FakeDriver {
+  readonly currentGem = { name: "Kite 2" };
 }
 
 async function main() {
@@ -1416,6 +1422,155 @@ async function main() {
     assert.equal(r.ok, false);
     assert.match(r.output, /tab blew up/);
     assert.match(r.output, /Carry on using the files/);
+  });
+
+  console.log("Tool protocol inside a Gem:");
+  await test("inside a Gem, the primer says the tool format outranks the Gem's style rules", () => {
+    const tools = [{ name: "list_files", description: "list_files() -> tree", run: async () => ({ ok: true, output: "" }) }];
+    const plain = buildSystemPrimer(tools, "solo");
+    const inGem = buildSystemPrimer(tools, "solo", { insideGem: "Kite 2" });
+    assert.doesNotMatch(plain, /INSIDE THE GEM/, "a plain thread gets no Gem rules");
+    assert.match(inGem, /INSIDE THE GEM "Kite 2"/);
+    assert.match(inGem, /do NOT apply to tool calls/);
+    assert.match(inGem, /never instead of a tool call/);
+    assert.match(buildProtocolReminder("Kite 2"), /inside the Gem "Kite 2"/);
+    assert.doesNotMatch(buildProtocolReminder(), /inside the Gem/);
+  });
+
+  await test("a session in a Gem tab sends the Gem rules, read from the driver", async () => {
+    const driver = new GemFakeDriver([{ text: "All done.", codeBlocks: [] }]);
+    // One tool turn first, so the idle backstop doesn't fire on the answer.
+    driver["replies"].unshift({ text: "", codeBlocks: ['{"name": "list_files", "args": {}}'] });
+    await new AgentSession(driver).runTask("tidy up");
+    assert.match(driver.sentMessages[0], /INSIDE THE GEM "Kite 2"/, "the primer must carry the Gem rules");
+
+    const plain = new FakeDriver([
+      { text: "", codeBlocks: ['{"name": "list_files", "args": {}}'] },
+      { text: "All done.", codeBlocks: [] },
+    ]);
+    await new AgentSession(plain).runTask("tidy up");
+    assert.doesNotMatch(plain.sentMessages[0], /INSIDE THE GEM/, "and only when the tab really is in one");
+  });
+
+  await test("inside a Gem the contract is restated sooner than in a plain thread", async () => {
+    const call = { text: "", codeBlocks: ['{"name": "list_files", "args": {}}'] };
+    const script = () => [call, call, call, call, { text: "All done.", codeBlocks: [] }];
+
+    const inGem = new GemFakeDriver(script());
+    await new AgentSession(inGem).runTask("tidy up");
+    assert.match(inGem.sentMessages[3], /^REMINDER/, "turn 3 restates the protocol inside a Gem");
+    assert.match(inGem.sentMessages[3], /inside the Gem "Kite 2"/, "with the Gem rule in it");
+
+    const plain = new FakeDriver(script());
+    await new AgentSession(plain).runTask("tidy up");
+    assert.doesNotMatch(plain.sentMessages[3], /^REMINDER/, "a plain thread keeps its slower cadence");
+  });
+
+  console.log("ask_gem resilience:");
+  /** A Gem tab whose consults succeed or throw on cue. */
+  const scriptedGemTab = (outcomes: ("ok" | "throw" | "empty")[], log: string[]) => {
+    let closed = false;
+    return {
+      async sendPrompt(q: string) {
+        log.push(`send:${q}`);
+      },
+      async waitForResponseComplete() {
+        if (outcomes[0] === "throw") {
+          outcomes.shift();
+          throw new Error("reply never started");
+        }
+      },
+      async getLastResponse() {
+        const o = outcomes.shift();
+        return { text: o === "empty" ? "" : "Use Pinia.", codeBlocks: [] };
+      },
+      async close() {
+        closed = true;
+        log.push("close");
+      },
+      get closed() {
+        return closed;
+      },
+    };
+  };
+
+  await test("a failed consult throws the tab away and retries once in a fresh one", async () => {
+    const log: string[] = [];
+    const tabs = [scriptedGemTab(["throw"], log), scriptedGemTab(["ok"], log)];
+    let opens = 0;
+    const consultant = createAskGemTool({
+      gem: { id: "a1", name: "Kite 2" },
+      openTab: async () => tabs[opens++] as never,
+    });
+    const r = await consultant.tool.run({ question: "Which store?" });
+    assert.equal(r.ok, true, r.output);
+    assert.match(r.output, /Use Pinia/);
+    assert.equal(opens, 2, "the retry must use a NEW tab, not the one that just failed");
+    assert.equal(tabs[0].closed, true, "the broken tab is closed, not left open");
+    await consultant.close();
+  });
+
+  await test("an empty Gem answer is retried, not returned as an answer", async () => {
+    const log: string[] = [];
+    const tabs = [scriptedGemTab(["empty"], log), scriptedGemTab(["ok"], log)];
+    let opens = 0;
+    const consultant = createAskGemTool({
+      gem: { id: "a1", name: "Kite 2" },
+      openTab: async () => tabs[opens++] as never,
+    });
+    const r = await consultant.tool.run({ question: "Which store?" });
+    assert.equal(r.ok, true, r.output);
+    assert.equal(opens, 2);
+    await consultant.close();
+  });
+
+  await test("a Gem that keeps failing is given up on, instead of costing every call", async () => {
+    let opens = 0;
+    const consultant = createAskGemTool({
+      gem: { id: "a1", name: "Kite 2" },
+      openTab: async () => {
+        opens++;
+        throw new Error("Gem is down");
+      },
+    });
+    const first = await consultant.tool.run({ question: "a" });
+    const second = await consultant.tool.run({ question: "b" });
+    assert.equal(first.ok, false);
+    assert.equal(second.ok, false);
+    assert.equal(opens, 4, "two calls, each with one retry");
+
+    const third = await consultant.tool.run({ question: "c" });
+    assert.equal(third.ok, false);
+    assert.match(third.output, /unavailable for the rest of this session/);
+    assert.match(third.output, /Do not call it again/);
+    assert.equal(opens, 4, "once given up on, it must not even try to open a tab");
+  });
+
+  await test("one success resets the failure count", async () => {
+    const log: string[] = [];
+    // call 1: both attempts fail; call 2: succeeds; calls 3+4: fail again.
+    const plan: ("ok" | "throw")[][] = [["throw"], ["throw"], ["ok"], ["throw"], ["throw"]];
+    const consultant = createAskGemTool({
+      gem: { id: "a1", name: "Kite 2" },
+      openTab: async () => scriptedGemTab(plan.shift() ?? ["throw"], log) as never,
+    });
+    assert.equal((await consultant.tool.run({ question: "1" })).ok, false);
+    assert.equal((await consultant.tool.run({ question: "2" })).ok, true);
+    const third = await consultant.tool.run({ question: "3" });
+    assert.doesNotMatch(third.output, /unavailable/, "a success in between means it isn't given up on yet");
+    await consultant.close();
+  });
+
+  await test("Gem ids are read from any shape of link to a Gem", () => {
+    assert.equal(gemIdFromHref("/gem/abc123"), "abc123");
+    assert.equal(gemIdFromHref("https://gemini.google.com/gem/abc123"), "abc123", "absolute URL");
+    assert.equal(gemIdFromHref("/u/1/gem/abc123"), "abc123", "multi-account prefix");
+    assert.equal(gemIdFromHref("/gem/abc123?usp=sharing"), "abc123", "query string");
+    assert.equal(gemIdFromHref("/gem/abc123/c_9f8e"), "abc123", "a conversation inside the Gem");
+    assert.equal(gemIdFromHref("/gem/coding-partner#top"), "coding-partner", "premade slug + fragment");
+    assert.equal(gemIdFromHref("/gems/view"), undefined, "the Gems list page is not a Gem");
+    assert.equal(gemIdFromHref("https://gemini.google.com/app"), undefined);
+    assert.equal(gemIdFromHref(""), undefined);
   });
 
   await test("--gem is read in both spellings", () => {

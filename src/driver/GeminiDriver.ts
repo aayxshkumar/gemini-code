@@ -18,6 +18,26 @@ export interface Gem {
 }
 
 /**
+ * Pulls a Gem's id out of a link to it, or undefined if it isn't one.
+ *
+ * Tolerant on purpose: the Gems page has been seen to use root-relative
+ * links, but an absolute URL, a multi-account prefix (/u/1/gem/...), a query
+ * string (?usp=sharing) or a trailing path segment must all still yield the
+ * bare id. A plain prefix strip turned those into no Gems at all, or into an
+ * id like "abc?usp=sharing" that the "did we land in the Gem" check could
+ * never match. Pure so it's testable without a browser.
+ */
+export function gemIdFromHref(href: string): string | undefined {
+  const m = /(?:^|\/)gem\/([^/?#\s]+)/.exec(href.trim());
+  if (!m) return undefined;
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    return m[1];
+  }
+}
+
+/**
  * Picks the Gem a user meant from what they typed: its id, its exact name, or
  * enough of its name to be unambiguous. Pure so it can be tested without a
  * browser — the matching, not the clicking, is where the mistakes are.
@@ -187,23 +207,27 @@ export class GeminiDriver implements IGeminiDriver {
       // first line that isn't a badge. This note lives out here on purpose:
       // the injected script is one line to the page, and an escaped newline
       // inside a // comment in it truncated everything after it.
+      // The page hands back raw hrefs; the id is parsed here in Node by
+      // gemIdFromHref, so the tested parser is the one that actually runs.
       const raw = await page.evaluate(`(() => {
         const out = [];
-        for (const a of document.querySelectorAll('a[href^="/gem/"]')) {
-          const id = (a.getAttribute("href") || "").replace("/gem/", "").trim();
+        for (const a of document.querySelectorAll(${JSON.stringify(selectors.gemLink)})) {
           const lines = (a.innerText || "")
             .split(String.fromCharCode(10))
             .map((l) => l.trim())
             .filter(Boolean)
             .filter((l) => !/^(experiment|new|premade)$/i.test(l));
-          if (id && lines.length) out.push({ id, name: lines[0] });
+          if (lines.length) out.push({ href: a.getAttribute("href") || "", name: lines[0] });
         }
         return out;
-      })()`) as Gem[];
+      })()`) as { href: string; name: string }[];
 
       // De-duplicate: a Gem can appear both as a card and in a shortcut row.
       const seen = new Map<string, Gem>();
-      for (const g of raw) if (!seen.has(g.id)) seen.set(g.id, g);
+      for (const { href, name } of raw) {
+        const id = gemIdFromHref(href);
+        if (id && !seen.has(id)) seen.set(id, { id, name });
+      }
       return [...seen.values()];
     } finally {
       await page.close().catch(() => undefined);
@@ -247,21 +271,29 @@ export class GeminiDriver implements IGeminiDriver {
     if (!context) throw new Error("Cannot open a Gem tab before attach()/launch().");
 
     const page = await context.newPage();
-    await page.goto(gemChatUrl(gem.id), { waitUntil: "domcontentloaded" });
+    // Close the tab if anything below fails. ask_gem reopens on its next
+    // call, so a tab abandoned here would be one more orphan per failed
+    // consult, each sitting in the user's window with nothing driving it.
+    try {
+      await page.goto(gemChatUrl(gem.id), { waitUntil: "domcontentloaded" });
 
-    const child = new GeminiDriver();
-    child.context = context;
-    child.page = page;
-    child.ownsBrowser = false;
-    child.ownsPage = true;
-    child.gem = gem;
-    await child.waitForAppShell();
-    await child.claimTab(page);
-    await child.markTab(`💎 gemini-code · gem: ${gem.name}`, { guardClose: true });
-    if (!page.url().includes(`/gem/${gem.id}`)) {
-      throw new Error(`Opened a tab for Gem "${gem.name}" but landed on ${page.url()}.`);
+      const child = new GeminiDriver();
+      child.context = context;
+      child.page = page;
+      child.ownsBrowser = false;
+      child.ownsPage = true;
+      child.gem = gem;
+      await child.waitForAppShell();
+      await child.claimTab(page);
+      await child.markTab(`💎 gemini-code · gem: ${gem.name}`, { guardClose: true });
+      if (!page.url().includes(`/gem/${gem.id}`)) {
+        throw new Error(`Opened a tab for Gem "${gem.name}" but landed on ${page.url()}.`);
+      }
+      return child;
+    } catch (err) {
+      await page.close().catch(() => undefined);
+      throw err;
     }
-    return child;
   }
 
   /** Leaves the Gem; later threads are ordinary Gemini chats again. */
@@ -1088,25 +1120,38 @@ export class GeminiDriver implements IGeminiDriver {
     if (!context) throw new Error("Cannot spawn a tab before attach()/launch().");
 
     const page = await context.newPage();
-    // Workers open inside the same Gem as the parent, or its expertise would
-    // apply to the planning tab and not to the tabs doing the work.
-    await page.goto(this.homeUrl(), { waitUntil: "domcontentloaded" });
+    // Same rule as spawnGemTab: a worker tab that fails to come up is closed,
+    // not left behind for the user to find.
+    try {
+      // Workers open inside the same Gem as the parent, or its expertise would
+      // apply to the planning tab and not to the tabs doing the work.
+      await page.goto(this.homeUrl(), { waitUntil: "domcontentloaded" });
 
-    const child = new GeminiDriver();
-    child.context = context;
-    child.page = page;
-    child.gem = this.gem;
-    child.ownsBrowser = false;
-    // We created this page, so this child closes the page — but never the
-    // shared browser or the CDP connection the parent owns.
-    child.ownsPage = true;
-    await child.waitForAppShell();
-    await child.claimTab(page);
-    // Brand worker tabs with a close guard: these are the ones a user is
-    // most likely to shut by accident mid-task, since they appear
-    // unannounced while the agent is working.
-    await child.markTab(`🤖 gemini-code · ${label ?? "worker"}`, { guardClose: true });
-    return child;
+      const child = new GeminiDriver();
+      child.context = context;
+      child.page = page;
+      child.gem = this.gem;
+      child.ownsBrowser = false;
+      // We created this page, so this child closes the page — but never the
+      // shared browser or the CDP connection the parent owns.
+      child.ownsPage = true;
+      await child.waitForAppShell();
+      await child.claimTab(page);
+      // Brand worker tabs with a close guard: these are the ones a user is
+      // most likely to shut by accident mid-task, since they appear
+      // unannounced while the agent is working.
+      await child.markTab(`🤖 gemini-code · ${label ?? "worker"}`, { guardClose: true });
+      // A worker meant to be in a Gem that landed outside it would quietly
+      // work without the Gem's expertise — and without the Gem rules in its
+      // primer matching where it really is.
+      if (this.gem && !page.url().includes(`/gem/${this.gem.id}`)) {
+        throw new Error(`Opened a worker tab for Gem "${this.gem.name}" but landed on ${page.url()}.`);
+      }
+      return child;
+    } catch (err) {
+      await page.close().catch(() => undefined);
+      throw err;
+    }
   }
 
   /**

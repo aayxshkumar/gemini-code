@@ -56,6 +56,13 @@ const TMP_DIR = ".gemini-code-tmp";
  * to chatting instead of calling tools.
  */
 const REMINDER_EVERY_TURNS = Math.max(0, Number(process.env.GEMINI_CODE_REMINDER_TURNS ?? 5));
+/**
+ * Inside a Gem the contract is restated more often. The Gem's own
+ * instructions are re-applied on every turn at system level while our primer
+ * only gets older, so a conversational Gem drifts back to prose much sooner
+ * than a plain thread does.
+ */
+const GEM_REMINDER_EVERY_TURNS = Math.max(0, Number(process.env.GEMINI_CODE_GEM_REMINDER_TURNS ?? 3));
 const MAX_DRIFT_NUDGES = Math.max(0, Number(process.env.GEMINI_CODE_DRIFT_NUDGES ?? 3));
 
 /**
@@ -117,6 +124,15 @@ export class AgentSession {
     this.toolNames = new Set(Object.keys(this.toolsByName));
   }
 
+  /**
+   * The Gem this session's tab is inside, read live from the driver rather
+   * than captured once: workers inherit their parent's Gem, and /gem can
+   * switch it between tasks.
+   */
+  private gemName(): string | undefined {
+    return this.driver.currentGem?.name;
+  }
+
   /** Runs one user task to completion, including any tool-call back-and-forth. Returns Gemini's final plain-text answer. */
   async runTask(
     userTask: string,
@@ -141,7 +157,7 @@ export class AgentSession {
 
     if (!this.primed) {
       this.primed = true;
-      const primer = buildSystemPrimer(this.tools, this.role);
+      const primer = buildSystemPrimer(this.tools, this.role, { insideGem: this.gemName() });
       const contextDoc = buildContextDocument(this.context);
 
       if (!contextDoc) {
@@ -175,8 +191,11 @@ export class AgentSession {
       // Periodically restate the contract before it drifts out of a long
       // thread's context — cheap insurance against the model reverting to
       // chatting instead of calling tools.
-      if (REMINDER_EVERY_TURNS > 0 && turn > 0 && turn % REMINDER_EVERY_TURNS === 0) {
-        message = `${buildProtocolReminder()}\n\n${message}`;
+      // Skipped when this turn's message already IS a reminder (a drift or
+      // idle nudge), or the model would get the same block twice in a row.
+      const every = this.gemName() ? GEM_REMINDER_EVERY_TURNS : REMINDER_EVERY_TURNS;
+      if (every > 0 && turn > 0 && turn % every === 0 && !message.startsWith("REMINDER")) {
+        message = `${buildProtocolReminder(this.gemName())}\n\n${message}`;
       }
 
       const reply = await this.exchange(message, attachFile, log);
@@ -194,7 +213,7 @@ export class AgentSession {
           driftNudges++;
           log(noteLine(`reply had code but no tool call — restating the protocol (${driftNudges}/${MAX_DRIFT_NUDGES})`));
           await this.journal?.log("protocol drift: reminded Gemini to use tools");
-          message = buildProtocolReminder();
+          message = buildProtocolReminder(this.gemName());
           continue;
         }
 
@@ -205,7 +224,7 @@ export class AgentSession {
           log(noteLine("answered without using any tool — asking it to act instead"));
           await this.journal?.log("idle nudge: reply used no tools");
           message =
-            `${buildProtocolReminder()}\n\n` +
+            `${buildProtocolReminder(this.gemName())}\n\n` +
             `You answered without using a single tool, so nothing has actually been done. ` +
             `If the task needs work in this project, start now with a tool call. ` +
             `If it was only a question and your answer is complete, say so in one line and stop.`;

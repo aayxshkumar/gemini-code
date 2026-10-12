@@ -4,6 +4,14 @@ import type { GeminiDriver, Gem } from "../driver/GeminiDriver.js";
 /** A Gem's answer is reference material, not a deliverable — keep it short. */
 const MAX_ANSWER_CHARS = 6_000;
 
+/**
+ * Consults that fail back to back before ask_gem stops trying for the rest of
+ * the session. Each failed consult can block for a full response timeout, and
+ * twice over with the retry, so a Gem that is down would otherwise cost the
+ * task minutes per call while the model keeps asking anyway.
+ */
+const MAX_CONSECUTIVE_FAILURES = 2;
+
 export interface AskGemDeps {
   /** The Gem being consulted, for the tool's description and its messages. */
   gem: Gem;
@@ -37,35 +45,73 @@ export function createAskGemTool(deps: AskGemDeps): {
   // workers share this tool, and two prompts typed into the same thread at once
   // would interleave and both come back wrong.
   let queue: Promise<unknown> = Promise.resolve();
+  let consecutiveFailures = 0;
+
+  /**
+   * Throws the tab away. A tab that failed mid-question may be wedged — still
+   * generating, navigated off the Gem, or holding a half-typed prompt — and
+   * keeping it would make every later consult fail the same way. The cost is
+   * the thread's history, so a follow-up question loses its earlier context.
+   */
+  async function resetTab(): Promise<void> {
+    const old = tab;
+    tab = undefined;
+    await old?.close().catch(() => undefined);
+  }
+
+  async function consult(question: string): Promise<string> {
+    if (!tab) {
+      deps.log?.(`  ⎿ opening a tab in the Gem "${deps.gem.name}"`);
+      tab = await deps.openTab();
+    }
+    await tab.sendPrompt(question);
+    await tab.waitForResponseComplete();
+    const answer = (await tab.getLastResponse()).text.trim();
+    // Empty is treated as a failure, not an answer: it's what a reply that
+    // hadn't rendered yet, or a refused one, reads as.
+    if (!answer) throw new Error(`the Gem "${deps.gem.name}" returned an empty answer`);
+    return answer;
+  }
 
   async function ask(question: string): Promise<{ ok: boolean; output: string }> {
-    try {
-      if (!tab) {
-        deps.log?.(`  ⎿ opening a tab in the Gem "${deps.gem.name}"`);
-        tab = await deps.openTab();
-      }
-      await tab.sendPrompt(question);
-      await tab.waitForResponseComplete();
-
-      const answer = (await tab.getLastResponse()).text.trim();
-      if (!answer) {
-        return { ok: false, output: `The Gem "${deps.gem.name}" returned an empty answer.` };
-      }
-      const clipped =
-        answer.length > MAX_ANSWER_CHARS
-          ? `${answer.slice(0, MAX_ANSWER_CHARS)}\n\n[truncated — ask something narrower for the rest]`
-          : answer;
-      return { ok: true, output: `The Gem "${deps.gem.name}" says:\n\n${clipped}` };
-    } catch (err) {
-      // A failed consult must not kill the task: the agent can carry on from
-      // the files, it just loses the background.
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
       return {
         ok: false,
         output:
-          `Couldn't ask the Gem "${deps.gem.name}": ${(err as Error).message.split("\n")[0]}\n` +
-          `Carry on using the files and tools instead of retrying this.`,
+          `ask_gem is unavailable for the rest of this session — the Gem "${deps.gem.name}" failed ` +
+          `${consecutiveFailures} times in a row. Do not call it again; carry on from the files and tools.`,
       };
     }
+
+    // One retry, in a FRESH tab. Re-asking in the tab that just failed would
+    // usually fail the same way; the common transient failures (a send that
+    // didn't land, a reply that never started) clear on a new thread.
+    let lastError: Error | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const answer = await consult(question);
+        consecutiveFailures = 0;
+        const clipped =
+          answer.length > MAX_ANSWER_CHARS
+            ? `${answer.slice(0, MAX_ANSWER_CHARS)}\n\n[truncated — ask something narrower for the rest]`
+            : answer;
+        return { ok: true, output: `The Gem "${deps.gem.name}" says:\n\n${clipped}` };
+      } catch (err) {
+        lastError = err as Error;
+        await resetTab();
+        if (attempt === 0) deps.log?.(`  ⎿ Gem consult failed (${lastError.message.split("\n")[0]}) — retrying in a fresh tab`);
+      }
+    }
+
+    // A failed consult must not kill the task: the agent can carry on from
+    // the files, it just loses the background.
+    consecutiveFailures++;
+    return {
+      ok: false,
+      output:
+        `Couldn't ask the Gem "${deps.gem.name}": ${lastError?.message.split("\n")[0]}\n` +
+        `Carry on using the files and tools instead of retrying this.`,
+    };
   }
 
   const tool: ToolDefinition = {
@@ -93,8 +139,7 @@ export function createAskGemTool(deps: AskGemDeps): {
     tool,
     /** Closes the Gem tab, if one was ever opened. */
     async close() {
-      await tab?.close().catch(() => undefined);
-      tab = undefined;
+      await resetTab();
     },
   };
 }

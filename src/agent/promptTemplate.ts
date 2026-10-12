@@ -86,7 +86,32 @@ You have been given one self-contained piece of a larger job by an orchestrator.
   return "";
 }
 
-export function buildSystemPrimer(toolList: ToolDefinition[], role: AgentRole = "solo"): string {
+/**
+ * Extra rules for a session that runs INSIDE a Gem.
+ *
+ * A Gem's instructions sit at system level, above anything we type, so a Gem
+ * built to chat ("explain things in a friendly, conversational way") pulls
+ * every reply towards prose — and prose where a tool call was needed reads as
+ * a final answer, so the task ends having done nothing. Saying explicitly
+ * which instructions govern what lets the model keep the Gem's knowledge and
+ * expertise while still answering in the format the program can execute.
+ */
+function gemInstructions(gemName: string): string {
+  return `
+YOU ARE RUNNING INSIDE THE GEM "${gemName}".
+Use the Gem's knowledge, conventions and expertise to decide WHAT to do. But the
+Gem's instructions about tone, style, length or format do NOT apply to tool calls:
+when you need to act, the reply is ONLY the JSON code block described above, with
+no greeting, explanation or follow-up question around it. If the Gem's own
+instructions ask you to explain, teach or converse, do that in your FINAL answer,
+after the work is done — never instead of a tool call.`;
+}
+
+export function buildSystemPrimer(
+  toolList: ToolDefinition[],
+  role: AgentRole = "solo",
+  opts: { insideGem?: string } = {}
+): string {
   const toolDocs = toolList.map((t) => `- ${t.description}`).join("\n");
 
   return `You are an autonomous coding agent working in a local project directory.
@@ -109,7 +134,7 @@ TOOL_RESULT >>>
 - Use the result to decide your next step: another tool call, or your final answer.
 - When you are done and have no more tools to call, reply normally in plain text/markdown with your final answer, with no JSON code block in it — that's what ends the conversation for this task.
 - If a tool result is an error, either fix your approach and retry, or explain the problem in your final answer.
-${roleInstructions(role)}`;
+${roleInstructions(role)}${opts.insideGem ? gemInstructions(opts.insideGem) : ""}`;
 }
 
 /**
@@ -182,7 +207,11 @@ export function formatToolResult(output: string): string {
  * Re-sent periodically, and whenever a reply looks like it abandoned the
  * protocol, because the full primer drifts out of a long thread's context.
  */
-export function buildProtocolReminder(): string {
+export function buildProtocolReminder(insideGem?: string): string {
+  const gemRule = insideGem
+    ? `\n- You are inside the Gem "${insideGem}": use its knowledge, but its style and format\n` +
+      `  instructions do not apply to tool calls. Act with the code block, not with prose.`
+    : "";
   return `REMINDER — you are driving tools, not chatting. To act, reply with ONLY a code block containing:
 {"name": "<tool_name>", "args": { ... }}
 and nothing else. For example, to change a file:
@@ -193,7 +222,7 @@ Rules that keep being broken:
 - Do NOT paste file contents for me to save; write them with write_file.
 - Do NOT ask for permission or offer to continue — you already have it, and the
   user is asked to approve writes and commands separately. Just make the call.
-- The JSON goes in a code block on its own, with no prose around it.
+- The JSON goes in a code block on its own, with no prose around it.${gemRule}
 
 Reply in plain prose with NO code block only when the work is genuinely finished.`;
 }
