@@ -113,7 +113,7 @@ export async function searchCode(opts: {
         if (info.size > MAX_FILE_BYTES) continue;
         const content = await readFile(full, "utf8");
         filesScanned++;
-        const lines = content.split("\n");
+        const lines = content.split(/\r?\n/);
         for (let i = 0; i < lines.length; i++) {
           if (re.test(lines[i])) {
             hits.push({ file: path.relative(root, full).split(path.sep).join("/"), line: i + 1, text: lines[i].trim().slice(0, 200) });

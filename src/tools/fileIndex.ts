@@ -90,7 +90,7 @@ export async function listFiles(root: string, opts: { glob?: string; max?: numbe
     if (scopedIntoIgnored) args.push("--no-ignore");
     else args.push("-g", "!node_modules");
     const { code, out } = await run("rg", args, root);
-    if (code === 0 || (code === 1 && out === "")) return finish(out.split("\n").filter(Boolean).map((f) => f.split(path.sep).join("/")), "rg");
+    if (code === 0 || (code === 1 && out === "")) return finish(out.split(/\r?\n/).filter(Boolean).map((f) => f.split(path.sep).join("/")), "rg");
   }
   if (!scopedIntoIgnored && (await isGitRepo(root))) {
     const { code, out } = await run("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], root);
@@ -132,9 +132,12 @@ export async function grep(
   opts: { glob?: string; caseSensitive?: boolean; max?: number } = {}
 ): Promise<{ hits: GrepHit[]; truncated: boolean; engine: string } | undefined> {
   const max = opts.max ?? 100;
+  // CRLF-aware: on a Windows checkout git grep's lines end in "\r", which is
+  // a line terminator "." won't cross, so every hit silently failed to parse.
   const parse = (out: string): GrepHit[] =>
     out
-      .split("\n")
+      .split(/\r?\n/)
+      .map((l) => l.replace(/\r$/, ""))
       .filter(Boolean)
       .flatMap((l) => {
         const m = /^(.*?):(\d+):(.*)$/.exec(l);
