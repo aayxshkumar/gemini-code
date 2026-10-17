@@ -668,9 +668,14 @@ async function main() {
     const id = String(result.output.match(/"(bg_[a-z0-9]+)"/)?.[1]);
     assert.ok(id.startsWith("bg_"), "returns a handle to read later");
 
-    // It should actually be serving.
-    await new Promise((r) => setTimeout(r, 1500));
-    const alive = await fetch("http://localhost:8911").then((r) => r.ok).catch(() => false);
+    // It should actually be serving. Poll: a Windows runner can take several
+    // seconds to start Python under Git Bash, and a fixed sleep made this flaky.
+    const up = async (): Promise<boolean> => fetch("http://localhost:8911").then((r) => r.ok).catch(() => false);
+    let alive = false;
+    for (let i = 0; i < 40 && !alive; i++) {
+      alive = await up();
+      if (!alive) await new Promise((r) => setTimeout(r, 250));
+    }
     assert.ok(alive, "the backgrounded server should really be running");
 
     const logs = await checkOutputTool.run({ id });
@@ -678,8 +683,11 @@ async function main() {
 
     // And killing it must take down the whole tree, not just the shell.
     await killProcessTool.run({ id });
-    await new Promise((r) => setTimeout(r, 1500));
-    const stillAlive = await fetch("http://localhost:8911").then((r) => r.ok).catch(() => false);
+    let stillAlive = true;
+    for (let i = 0; i < 20 && stillAlive; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      stillAlive = await up();
+    }
     assert.equal(stillAlive, false, "killing must stop the server, leaving no orphan holding the port");
   });
 
