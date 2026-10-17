@@ -57,6 +57,14 @@ export const readFileTool: ToolDefinition = {
       return { ok: false, output: `Error reading ${rel}: ${e.message}` };
     }
 
+    // A binary read is never useful and costs thousands of garbage tokens.
+    if (content.slice(0, 8_000).includes("\u0000")) {
+      return {
+        ok: false,
+        output: `Error: ${rel} is a binary file (${Buffer.byteLength(content)} bytes). Reading it as text won't help; use run_bash with a suitable tool (file, strings, unzip -l, …) if you need to inspect it.`,
+      };
+    }
+
     const lines = content.split("\n");
     const total = lines.length;
 

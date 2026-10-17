@@ -76,6 +76,24 @@ export class PlanJournal {
     return (this.state?.steps ?? []).filter((s) => !s.done).map((s) => s.title);
   }
 
+  /**
+   * What the journal alone can say about the task, for re-priming a fresh
+   * thread when the model couldn't write a handoff itself (the tab died).
+   */
+  summaryForHandoff(): string | undefined {
+    const s = this.state;
+    if (!s) return undefined;
+    const steps = s.steps.length
+      ? s.steps.map((st) => `- [${st.done ? "x" : " "}] ${st.title}`).join("\n")
+      : "(no plan was recorded)";
+    const recent = s.log.slice(-15).map((l) => `- ${l}`).join("\n") || "(nothing yet)";
+    return (
+      `## Goal\n${s.task}\n\n## Plan so far\n${steps}\n\n## Last actions (from the journal — the previous thread ` +
+      `died before it could write a note)\n${recent}\n\nFiles listed as written or edited above already contain ` +
+      `those changes; read them before touching them again.`
+    );
+  }
+
   async complete(summary: string): Promise<void> {
     if (!this.state) return;
     this.state.status = "completed";

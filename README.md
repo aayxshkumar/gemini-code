@@ -248,6 +248,7 @@ Semantic versioning, reported by `gemini-code --version`.
 
 | Version | Highlights |
 | --- | --- |
+| **0.11.0** | **Stalls and failures handled**: Ctrl+C cancels the task (twice quits); a stuck generation is stopped before a resend; a closed tab, dropped connection or dead Chrome is recovered and the thread re-primed from the journal; offline and signed-out pauses wait instead of burning retries; a tool that never returns is abandoned; identical or ping-pong calls and endless exploring are pointed out; "can't see the attachment" resends inline; optional wall-clock task cap; binary reads refused; advisory lock when two sessions share a project |
 | **0.10.0** | Agent threads run as Gemini **Temporary chats** (your history stays yours); messages over the composer's 32k limit are attached in full instead of silently cut; `ask_user` for genuine ambiguity; unattended runs decline instead of hanging on a y/N; structured handoff notes on compaction; coding-standards block in the primer; quota messages recognised |
 | **0.9.0** | **Built for big, multi-repo codebases.** `--add-dir` workspace roots (read, search, edit and run commands in dependency repos); read-before-edit and changed-on-disk gates; edits echo the changed region; `find_files`; ripgrep/git-grep search with a `path` scope; "did you mean" on wrong paths; answers are checked for paths that don't exist; Gemini's own error replies are retried; AGENTS.md / CLAUDE.md honoured as instructions; auto-compaction with a handoff note (`/compact`); `autoApprove=edits` |
 | **0.8.0** | **Model choice is yours at startup**: a live chooser on first run, `--model`, `/models`, picker labels like `3.8 Thinking` work directly; `thinking` is the default (the Thinking model where offered, else Auto with Thinking level High); locked models are skipped; several tool calls per reply; lenient tool-call JSON; `gemini-code doctor`, `gemini-code config` and a persistent config file; `setup.sh`/`setup.ps1` for clones; CI and tagged releases |
@@ -348,6 +349,10 @@ raw `GEMINI_CODE_*` name from the table.
 | `GEMINI_CODE_MAX_WORKERS` | `3` | parallel worker tabs |
 | `GEMINI_CODE_ADD_DIRS` | unset | extra workspace roots, PATH-style separated (same as `--add-dir`; config key `addDirs` takes a list) |
 | `GEMINI_CODE_AUTO_APPROVE` | unset | `edits` runs file writes/edits without asking (commands and requests still ask); `edits,commands` also runs commands; `1`/`all` skips everything |
+| `GEMINI_CODE_TOOL_TIMEOUT_MS` | `600000` | a single tool call that takes longer is abandoned with an error (foreground commands have their own shorter limit) |
+| `GEMINI_CODE_EXPLORE_NUDGE_TURNS` | `20` | consecutive read-only calls before the model is told to act or report; `0` disables |
+| `GEMINI_CODE_TASK_TIMEOUT_MIN` | `0` | wall-clock cap on one task, in minutes; `0` = none (the turn limit still applies) |
+| `GEMINI_CODE_OFFLINE_WAIT_MS` | `300000` | how long to wait for the network to return before giving a turn up |
 | `GEMINI_CODE_TEMPORARY_CHAT` | `1` | `0` keeps the agent's threads in your Gemini history instead of running them as Temporary chats |
 | `GEMINI_CODE_DEBUG_INPUT` | unset | `1` traces every keystroke and line readline receives, for a terminal where answers don't seem to arrive |
 | `GEMINI_CODE_PROMPT_UNATTENDED` | unset | `1` still asks y/N questions when stdin isn't a terminal (for scripts that pipe answers in); otherwise unattended runs decline unapproved actions at once |
@@ -622,6 +627,32 @@ Unattended runs also no longer hang on a y/N. Without a terminal, an action that
 isn't pre-approved is declined immediately with a message telling the model not to
 retry and to report what it skipped — and telling you which
 `GEMINI_CODE_AUTO_APPROVE` value would allow it.
+
+### When things stall or break
+
+Long unattended runs fail in boring ways, so each one has a specific answer:
+
+| What goes wrong | What happens |
+| --- | --- |
+| The task is stuck and you're watching | **Ctrl+C once** cancels it: generation is stopped, the journal is marked interrupted, the prompt comes back. Ctrl+C again quits |
+| Gemini never finishes a reply | After the response timeout the generation is **stopped**, then the turn is re-sent (not just waited on again) |
+| Gemini answers with its own error or a quota message | The turn is re-sent, attachments included, a few times before it's reported |
+| The model says it can't see an attachment | The attachment's content is re-sent inline, once or twice |
+| The tab is closed, the renderer crashes, the CDP connection drops, Chrome quits | A new tab is opened (or Chrome reconnected / relaunched), the thread is **re-primed from the journal** — task, plan, last actions — and the in-flight message is re-sent. The model is told to re-read files before editing |
+| The network drops | Waits for the tab to be online again (`GEMINI_CODE_OFFLINE_WAIT_MS`) without spending a retry |
+| The session signs out mid-task | Interactive: the window comes to the front and the run waits for you. Unattended: a clear failure, with the journal intact |
+| A tool never returns | Abandoned after `GEMINI_CODE_TOOL_TIMEOUT_MS` with an error the model can act on |
+| The same call three times in a row, or A-B-A-B | Noted inside the result, once per streak: "you already have this; take the next real step" |
+| Twenty read-only calls with no change | Noted inside the result: act, answer, or say what blocks you |
+| The same tool failing the same way, or nothing succeeding for several turns | Told plainly to change approach, with the ways out (already in 0.6) |
+| A reply with no tool call that isn't finished | Drift, idle, continue and hedge nudges push it on; a prose question is redirected to `ask_user` |
+| A task that runs too long | Turn limit (`GEMINI_CODE_MAX_TURNS`), thread compaction, and an optional wall-clock cap (`GEMINI_CODE_TASK_TIMEOUT_MIN`) |
+| The model reads a binary file | Refused with a hint, instead of thousands of garbage tokens |
+| Two sessions in one project | An advisory lock warns that both will write the journal and checkpoints |
+| The process is killed | The journal already says `in_progress`/`interrupted`; the next run offers to continue it. Background processes are killed on exit |
+
+Every one of these leaves `GEMINI-PLAN.md` telling the truth about how far the
+task got, which is what makes "run it again" safe.
 
 ### Protocol drift in long threads
 

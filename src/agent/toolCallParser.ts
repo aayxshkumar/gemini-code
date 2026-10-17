@@ -333,3 +333,18 @@ export function looksLikeGeminiError(response: GeminiResponse): boolean {
     text
   );
 }
+
+/**
+ * The model says it can't see a file we attached. Uploads land most of the
+ * time, but a long thread sometimes loses the chip or the model answers
+ * before the attachment is processed; either way the right move is to
+ * resend the content inline, not to argue.
+ */
+export function looksLikeUnseenAttachment(response: GeminiResponse): boolean {
+  const text = response.text.trim();
+  if (!text || text.length > 600 || response.codeBlocks.length) return false;
+  return /\b(can'?t|cannot|unable to|don'?t|do not|couldn'?t) (seem to )?(see|find|access|open|locate|view|read) (the |an |any |your )?(attach|file|document|upload|context\.md)/i.test(
+    text
+  ) || /\bno (file|attachment|document) (was|is|has been) (attached|provided|uploaded|included)\b/i.test(text) ||
+    /\b(please|could you) (re-?)?(attach|upload|share|provide) (the|that|it|a) /i.test(text);
+}

@@ -252,6 +252,8 @@ Rules that keep being broken:
 - Do NOT paste file contents for me to save; write them with write_file.
 - Do NOT ask for permission or offer to continue — you already have it, and the
   user is asked to approve writes and commands separately. Just make the call.
+- If you genuinely need the user's DECISION (not permission), call the ask_user
+  tool with options — a question in prose ends the task unanswered.
 - The JSON goes in a code block on its own, with no prose around it.
 
 Reply in plain prose with NO code block only when the work is genuinely finished.`;
