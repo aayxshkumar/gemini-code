@@ -30,6 +30,16 @@ export function gemModeFlag(argv: string[], env = process.env.GEMINI_CODE_GEM_MO
   return raw === "inside" ? "inside" : "reference";
 }
 
+/** Reads `--model <alias or picker label>`; `--model=` works too. */
+export function modelFlag(argv: string[]): string | undefined {
+  return flagValue(argv, "model");
+}
+
+/** `--choose-model` / `--pick`: show the live picker and ask, even if a model is configured. */
+export function chooseModelFlag(argv: string[]): boolean {
+  return argv.includes("--choose-model") || argv.includes("--pick") || argv.includes("--pick-model");
+}
+
 /** Reads `--gem <name>` / `--gem=<name>`. */
 export function gemFlag(argv: string[]): string | undefined {
   return flagValue(argv, "gem");

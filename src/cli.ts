@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 import { emitKeypressEvents } from "node:readline";
 import path from "node:path";
 import { GeminiDriver, type Gem } from "./driver/GeminiDriver.js";
-import { gemFlag, gemModeFlag, serveArgs } from "./args.js";
+import { gemFlag, gemModeFlag, modelFlag, chooseModelFlag, serveArgs } from "./args.js";
 import { startServer } from "./server/openai.js";
 import { installDialogRaceGuard } from "./driver/processGuards.js";
 import { AgentSession } from "./agent/loop.js";
@@ -17,8 +17,14 @@ import { ensureMemoryFile, readMemory, appendMemory, MEMORY_FILENAME } from "./c
 import {
   DEFAULT_MODEL_ALIAS,
   DEFAULT_EXTENDED_THINKING,
+  DEFAULT_THINKING_LEVEL,
+  THINKING_LEVELS,
   modelHelp,
+  resolveModel,
+  resolveThinkingLevel,
 } from "./driver/models.js";
+import { readConfigFile, userConfigPath, writeUserConfig } from "./config.js";
+import type { PickerEntry } from "./driver/GeminiDriver.js";
 import { tools } from "./tools/index.js";
 import { killAllBackgroundProcesses } from "./tools/bash.js";
 import { createDelegateTool, MAX_PARALLEL_WORKERS } from "./agent/workers.js";
@@ -58,7 +64,10 @@ ${modelHelp()
     .split("\n")
     .map((l) => "  " + l)
     .join("\n")}
-  ${c.cyan("/thinking on|off")}  extended thinking (slower, deeper)
+  ${c.cyan("/models")}           list the models in this account's picker (live)
+  ${c.cyan("/model <label>")}    pick one by its picker label, e.g. /model 3.8 Thinking
+  ${c.cyan("/level low|medium|high")}  thinking level (default high)
+  ${c.cyan("/thinking on|off")}  the Extended thinking toggle, where the picker has one
   ${c.cyan("/gems")}             list the Gems on your account
   ${c.cyan("/gem <name>")}       consult a Gem for project knowledge (ask_gem)
   ${c.cyan("/gem off")}          stop using a Gem
@@ -75,6 +84,76 @@ ${modelHelp()
   ${c.cyan("/exit")}             quit (or Ctrl+C)
 
 Anything else is sent to Gemini as a task.`;
+}
+
+/** Renders the live picker for the chooser and /models. */
+function pickerLines(entries: PickerEntry[]): string[] {
+  return entries
+    .filter((e) => !e.submenu)
+    .map((e, i) => {
+      const alias = resolveModelAliasFor(e.label);
+      return `  ${c.bold(String(i + 1).padStart(2))}) ${e.label.padEnd(16)} ${c.dim(e.description)}${
+        e.selected ? c.green("  ← selected") : ""
+      }${e.locked ? c.yellow("  (locked: needs a paid plan)") : ""}${alias.length ? c.dim(`  alias: ${alias[0]}`) : ""}`;
+    });
+}
+
+/** Which of our aliases, if any, would select this picker label. */
+function resolveModelAliasFor(label: string): string[] {
+  const { MODELS } = modelsModule;
+  const m = MODELS.find((m) => m.matches(label));
+  return m ? [m.aliases[0]] : [];
+}
+import * as modelsModule from "./driver/models.js";
+
+/**
+ * First start on a machine with no model configured (or --choose-model):
+ * show what THIS account's picker offers and let the user choose. Saved to
+ * the user config so it isn't asked again; /model and `config set model`
+ * change it later. Returns what to pass to setModel.
+ */
+async function chooseModelInteractively(driver: GeminiDriver, current: string | undefined): Promise<string | undefined> {
+  let entries: PickerEntry[];
+  try {
+    entries = await driver.listModels();
+  } catch (err) {
+    console.log(c.yellow(`Couldn't read the model picker: ${(err as Error).message.split("\n")[0]}`));
+    return current;
+  }
+  const selectable = entries.filter((e) => !e.submenu);
+  console.log(`\n${c.bold("Which model should gemini-code use?")} ${c.dim("(this account's picker, live)")}\n`);
+  for (const line of pickerLines(entries)) console.log(line);
+  console.log(
+    `\n  ${c.dim("Type a number or a name — e.g. 2, or thinking. Enter keeps")} ${c.bold(current ?? DEFAULT_MODEL_ALIAS)}${c.dim(".")}\n` +
+      `  ${c.dim(`Saved to ${userConfigPath()}; change later with /model or: gemini-code config set model <name>`)}\n`
+  );
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  let answer = "";
+  try {
+    answer = (await rl.question(c.magenta("model › "))).trim();
+  } catch {
+    // EOF / Ctrl+D: keep the default rather than dying before the banner.
+    answer = "";
+  } finally {
+    rl.close();
+  }
+  if (!answer) return current;
+  const byNumber = /^\d+$/.test(answer) ? selectable[Number(answer) - 1] : undefined;
+  if (/^\d+$/.test(answer) && !byNumber) {
+    console.log(c.yellow(`  no entry ${answer} — keeping ${current ?? DEFAULT_MODEL_ALIAS}`));
+    return current;
+  }
+  const chosen = byNumber ? byNumber.label : answer;
+  if (byNumber?.locked) {
+    console.log(c.yellow(`  "${byNumber.label}" is locked on this account — keeping ${current ?? DEFAULT_MODEL_ALIAS}`));
+    return current;
+  }
+  // Remember an alias when one covers the label, else the label itself, so
+  // the saved value keeps working across Google's version bumps.
+  const alias = resolveModel(chosen) ? chosen : (resolveModelAliasFor(chosen)[0] ?? chosen);
+  writeUserConfig({ ...readConfigFile(userConfigPath()), model: alias });
+  console.log(`  ${c.green("✓")} model saved: ${c.bold(alias)}\n`);
+  return alias;
 }
 
 async function main() {
@@ -134,7 +213,15 @@ async function main() {
   await driver.newConversation();
 
   // Default the model (env override: GEMINI_CODE_MODEL=pro npm run dev).
-  const startModel = process.env.GEMINI_CODE_MODEL ?? DEFAULT_MODEL_ALIAS;
+  const argv = process.argv.slice(2);
+  let startModel = modelFlag(argv) ?? process.env.GEMINI_CODE_MODEL;
+  // No model anywhere (fresh machine), or asked to: show the live picker.
+  if (process.stdin.isTTY && (chooseModelFlag(argv) || !startModel)) {
+    startModel = await chooseModelInteractively(driver, startModel);
+  }
+  startModel ??= DEFAULT_MODEL_ALIAS;
+  const wantLevel = resolveThinkingLevel(process.env.GEMINI_CODE_THINKING_LEVEL) ?? DEFAULT_THINKING_LEVEL;
+  let levelNote = "";
   const wantThinking = process.env.GEMINI_CODE_THINKING
     ? /^(on|true|yes|1)$/i.test(process.env.GEMINI_CODE_THINKING)
     : DEFAULT_EXTENDED_THINKING;
@@ -147,6 +234,14 @@ async function main() {
     // Extended thinking stacks on top of the base model and slows it down,
     // so it's off unless asked for (GEMINI_CODE_THINKING=on or /thinking on).
     await driver.setExtendedThinking(wantThinking).catch(() => undefined);
+    // The Thinking level submenu (where the picker has one) is what decides
+    // how hard Auto thinks; the account default is Low.
+    try {
+      const level = await driver.setThinkingLevel(wantLevel);
+      levelNote = `\n  ${c.dim("thinking")} level ${level}`;
+    } catch {
+      // No such submenu on this picker — nothing to set.
+    }
     const label = await driver.getCurrentModel().catch(() => "");
     if (label && label !== "unknown") modelName = `${modelName} ${c.dim(`(picker: ${label})`)}`;
   } catch (err) {
@@ -159,7 +254,7 @@ async function main() {
 ${c.magenta("✻")} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — Claude-Code-style agent on the Gemini web UI`)}
 
   ${c.dim("cwd")}     ${path.basename(process.cwd())}
-  ${c.dim("model")}   ${modelName}${
+  ${c.dim("model")}   ${modelName}${levelNote}${
     driver.currentGem
       ? `\n  ${c.dim("gem")}     ${driver.currentGem.name} ${c.dim("(the whole session runs inside it)")}`
       : referenceGem
@@ -387,10 +482,38 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
               if (!arg) {
                 console.log(`\n  current: ${c.bold(await driver.getCurrentModel())}\n\n${modelHelp()}\n`);
               } else {
-                const name = await driver.setModel(arg);
-                console.log(`  ${c.green("✓")} model: ${c.bold(name)}\n`);
+                let wanted = arg;
+                if (/^\d+$/.test(arg)) {
+                  const entry = (await driver.listModels()).filter((e) => !e.submenu)[Number(arg) - 1];
+                  if (!entry) throw new Error(`no model number ${arg} — /models lists them`);
+                  wanted = entry.label;
+                }
+                const name = await driver.setModel(wanted, {
+                  onFallback: (w, g) => console.log(c.yellow(`  ${w} isn't in this picker — using ${g}`)),
+                });
+                console.log(`  ${c.green("✓")} model: ${c.bold(name)} ${c.dim(`(picker: ${await driver.getCurrentModel()})`)}\n`);
               }
               break;
+
+            case "models": {
+              process.stdout.write(c.dim("  reading the picker...\r"));
+              const entries = await driver.listModels();
+              console.log(`  ${c.bold("Models in this account's picker")} ${c.dim("(/model <number or label>)")}`);
+              for (const line of pickerLines(entries)) console.log(line);
+              console.log("");
+              break;
+            }
+
+            case "level": {
+              const want = resolveThinkingLevel(arg);
+              if (arg && !want) {
+                console.log(`  usage: /level ${THINKING_LEVELS.join("|")}\n`);
+                break;
+              }
+              const level = await driver.setThinkingLevel(want);
+              console.log(`  ${c.green("✓")} thinking level: ${c.bold(level)}\n`);
+              break;
+            }
 
             case "thinking": {
               const want = /^(on|true|yes|1)$/i.test(arg);
@@ -577,6 +700,11 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
           // rather than sitting in the queue until the task is over.
           // Slash commands are left queued so they still run as commands.
           getSteering: () => {
+            // With piped stdin every line is already here, so "typed while
+            // the task ran" means nothing — they are the NEXT tasks, in
+            // order. Folding them in as steering hijacked the task in a
+            // real run.
+            if (!process.stdin.isTTY) return [];
             const steer: string[] = [];
             for (let i = queued.length - 1; i >= 0; i--) {
               const line = queued[i].trim();
@@ -611,6 +739,10 @@ const USAGE = `gemini-code — a Claude-Code-style agent on the Gemini web UI
 
 Usage:
   gemini-code                 start the agent in the current directory
+  gemini-code --model <name>  start on a model: an alias (thinking, fast, pro, auto…) or a
+                              label from your picker, e.g. --model "3.8 Thinking"
+  gemini-code --choose-model  list this account's live picker and choose (also asked on a
+                              machine with no model configured yet)
   gemini-code --gem <name>    consult one of your Gems for project knowledge (ask_gem)
   gemini-code --gem <name> --gem-mode inside
                               run the whole session inside the Gem instead
@@ -628,7 +760,8 @@ Usage:
 
 Settings (environment, or "gemini-code config set <key> <value>", or <project>/.gemini-code.json):
   GEMINI_CODE_MODEL           thinking (default) | fast | fastest | pro
-  GEMINI_CODE_THINKING        on | off — the Extended thinking toggle on top of the model
+  GEMINI_CODE_THINKING_LEVEL  low | medium | high (default) — the picker's Thinking level
+  GEMINI_CODE_THINKING        on | off — the Extended thinking toggle, where the picker has one
   GEMINI_CODE_GEM             Gem to start in, by name or id (same as --gem)
   GEMINI_CODE_MAX_WORKERS     parallel worker tabs (default 3)
   GEMINI_CODE_AUTO_APPROVE=1  skip y/N confirmations for writes, shell and network
@@ -698,6 +831,10 @@ async function cli(): Promise<void> {
     // Flags belong to the default (agent) mode, not to a subcommand.
     case "--gem":
     case "--gem-mode":
+    case "--model":
+    case "--choose-model":
+    case "--pick":
+    case "--pick-model":
       return main();
     case "serve":
       return serve();
@@ -720,7 +857,7 @@ async function cli(): Promise<void> {
       return;
     }
     default:
-      if (cmd.startsWith("--gem=") || cmd.startsWith("--gem-mode=")) return main();
+      if (cmd.startsWith("--gem=") || cmd.startsWith("--gem-mode=") || cmd.startsWith("--model=")) return main();
       console.error(`Unknown command "${cmd}"\n\n${USAGE}`);
       process.exitCode = 1;
   }

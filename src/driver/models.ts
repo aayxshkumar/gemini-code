@@ -28,7 +28,7 @@ export interface ModelChoice {
  * older "Standard thinking" / "High thinking" tiers and from the "Extended
  * thinking" toggle, which both also contain the word.
  */
-const THINKING_MODEL_RE = /^\s*(?:\d+(?:\.\d+)?\s+)?thinking\b/i;
+const THINKING_MODEL_RE = /^\s*(?:\d+(?:\.\d+)?\s+)?thinking\b(?!\s*level)/i;
 
 /**
  * Base models — mutually exclusive. Order matters: Flash-Lite must be
@@ -41,6 +41,13 @@ const THINKING_MODEL_RE = /^\s*(?:\d+(?:\.\d+)?\s+)?thinking\b/i;
  * e.g. "Flash Extended"), so it gets its own control. Verified live.
  */
 export const MODELS: ModelChoice[] = [
+  {
+    name: "Auto",
+    aliases: ["auto"],
+    hint: "lets Gemini pick among its current models",
+    // The 2026 picker's first entry: "Auto — Gemini 3 models".
+    matches: (t) => /^\s*auto\b/i.test(t.split("\n")[0]),
+  },
   {
     name: "Flash-Lite",
     aliases: ["fastest", "flash-lite", "lite"],
@@ -55,9 +62,10 @@ export const MODELS: ModelChoice[] = [
     // (currently "3.8 Thinking"). Matched on the first line only, so the
     // description under it can't accidentally satisfy another rule.
     matches: (t) => THINKING_MODEL_RE.test(t.split("\n")[0]) && !/standard|high|extended/i.test(t.split("\n")[0]),
-    // Older menus have no standalone Thinking model; "Pro" / "High thinking"
-    // is the closest reasoning tier there.
-    fallbacks: ["pro", "fast"],
+    // Pickers without a standalone Thinking model: Auto (whose depth the
+    // Thinking level setting controls — see THINKING_LEVELS) comes first,
+    // since Pro is often locked behind a paid tier there.
+    fallbacks: ["auto", "pro", "fast"],
   },
   {
     name: "Flash",
@@ -80,7 +88,38 @@ export const MODELS: ModelChoice[] = [
       /\bpro\b/i.test(t) || (/high thinking|complex problem/i.test(t) && !THINKING_MODEL_RE.test(t.split("\n")[0])),
     fallbacks: ["thinking"],
   },
+  {
+    name: "Argon",
+    aliases: ["argon", "4"],
+    hint: "Gemini 4 Argon — complex tasks (paid tiers)",
+    matches: (t) => /\bargon\b/i.test(t.split("\n")[0]),
+    fallbacks: ["pro", "thinking"],
+  },
 ];
+
+/**
+ * The picker's "Thinking level" submenu (Low / Medium / High), separate from
+ * the model. Google persists it per account, so setting it once in the main
+ * tab covers worker tabs too. Deep by default: the account's own default was
+ * Low, and this tool exists for work worth thinking about.
+ */
+export const THINKING_LEVELS = ["low", "medium", "high"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+export const DEFAULT_THINKING_LEVEL: ThinkingLevel = "high";
+
+export function resolveThinkingLevel(raw: string | undefined): ThinkingLevel | undefined {
+  const needle = (raw ?? "").trim().toLowerCase();
+  if (/^(hi|max|deep)/.test(needle)) return "high";
+  if (/^(med|mid|bal)/.test(needle)) return "medium";
+  if (/^(lo|min|quick|fast)/.test(needle)) return "low";
+  return THINKING_LEVELS.find((l) => l === needle);
+}
+
+/** The submenu entry that opens the levels, and how each level is labelled. */
+export const THINKING_LEVEL_MENU = {
+  entry: /thinking level/i,
+  item: (level: ThinkingLevel, text: string) => new RegExp(`^\\s*${level}(?![\\w-])`, "i").test(text.split("\n")[0]),
+};
 
 /** The separate on/off toggle that stacks on the base model. */
 export const EXTENDED_THINKING = {
@@ -91,7 +130,7 @@ export const EXTENDED_THINKING = {
   matches: (t: string) => {
     const first = t.split("\n")[0];
     if (/extended/i.test(first)) return true;
-    return /thinking/i.test(first) && !/standard|high/i.test(first) && !THINKING_MODEL_RE.test(first);
+    return /thinking/i.test(first) && !/standard|high|level/i.test(first) && !THINKING_MODEL_RE.test(first);
   },
   /** The picker's label appends this word while the toggle is on. */
   labelMarker: /extended/i,

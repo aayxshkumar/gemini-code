@@ -44,7 +44,7 @@ The version is 0.1.0.
 
 ## Install
 
-Three ways, all ending with a `gemini-code` command on your PATH. Pick the first
+Two ways, both ending with a `gemini-code` command on your PATH. Pick the first
 unless you want to hack on the source.
 
 **1. One command, nothing to clone** — macOS / Linux:
@@ -63,13 +63,7 @@ The installer checks Node and Chrome, fetches the latest release (or builds from
 source if none is published yet), installs to `~/.gemini-code/app`, puts
 `gemini-code` on your PATH and runs `gemini-code doctor`. No sudo, no admin rights.
 
-**2. Straight from GitHub with npm** (any OS with Node 20+):
-
-```bash
-npm install -g github:aayxshkumar/gemini-code
-```
-
-**3. Clone and run the setup script** — for hacking on it, or when you want
+**2. Clone and run the setup script** — for hacking on it, or when you want
 `git pull` to update it in place:
 
 ```bash
@@ -98,8 +92,13 @@ that the session is kept in `~/.gemini-code/profile`.
 2. Run one of the install commands above.
 3. `gemini-code doctor` — it tells you exactly what's still missing, if anything.
 4. `cd` into a project and run `gemini-code`; sign in when Chrome opens.
-5. Optional: `gemini-code config set model pro` (or any key in [Settings](#settings))
-   so your defaults travel with the machine, not with your shell profile.
+5. **Pick your model.** With nothing configured yet, the first start lists what
+   *this account's* picker actually offers — e.g. `3.8 Thinking`, `Auto`, `3.1 Pro`
+   (locked entries marked) — and asks you to choose by number or name. The choice is
+   saved to `~/.gemini-code/config.json`, so it isn't asked again. Any time later:
+   `gemini-code --model "3.8 Thinking"`, `gemini-code --choose-model`, `/models` and
+   `/model <name>` inside a session, or `gemini-code config set model thinking`.
+6. Optional: other defaults with `gemini-code config set <key> <value>` (see [Settings](#settings)).
 
 > Two installer files rather than one because `curl | bash` and `irm | iex` are
 > different shells that can't read the same script — Claude Code splits them the
@@ -124,8 +123,8 @@ On an older Node, [nvm](https://github.com/nvm-sh/nvm) is the quickest fix:
 
 ### Updating
 
-Re-run the installer (it replaces the installed copy), re-run `npm install -g github:aayxshkumar/gemini-code`,
-or in a clone: `git pull && npm run build`.
+Re-run the installer (it replaces the installed copy), or in a clone:
+`git pull && npm run build`.
 
 ### Uninstalling
 
@@ -215,7 +214,8 @@ next to anything wrong.
 
 | Symptom | Cause / fix |
 | --- | --- |
-| `Thinking isn't in this account's model picker — using Pro instead` | Google shows different pickers to different accounts. It fell back to the closest reasoning tier; `/model` shows what's selected. If the picker does have a Thinking entry under a new name, update the keyword rules in [`src/driver/models.ts`](src/driver/models.ts) |
+| `Thinking isn't in this account's model picker — using Auto instead` | Google shows different pickers to different accounts: some have a `3.8 Thinking` model, others `Auto` / `3.1 Pro` / `4 Argon` plus a Thinking level submenu. `thinking` means the Thinking model where there is one, else Auto with Thinking level High. `/models` shows your picker; `/model <label>` selects anything in it, no code change needed |
+| `"3.1 Pro" is locked on this account` | That entry needs a paid Gemini plan. Locked entries are never clicked (clicking only opens an upgrade prompt) |
 | `command not found: gemini-code` | `~/.local/bin` isn't on your PATH — the installer prints the line to add |
 | `Couldn't attach to Chrome on port 9222` | Chrome isn't up: `gemini-code open-chrome`, sign in, retry |
 | `Your Gemini session is signed out` | Session expired: `gemini-code login` and sign in |
@@ -248,7 +248,7 @@ Semantic versioning, reported by `gemini-code --version`.
 
 | Version | Highlights |
 | --- | --- |
-| **0.8.0** | **3.8 Thinking is the default model** (with a fallback chain when a picker lacks it); several tool calls per reply; lenient tool-call JSON; `gemini-code doctor`, `gemini-code config` and a persistent config file; `setup.sh`/`setup.ps1` for clones; `npm install -g github:…`; CI and tagged releases |
+| **0.8.0** | **Model choice is yours at startup**: a live chooser on first run, `--model`, `/models`, picker labels like `3.8 Thinking` work directly; `thinking` is the default (the Thinking model where offered, else Auto with Thinking level High); locked models are skipped; several tool calls per reply; lenient tool-call JSON; `gemini-code doctor`, `gemini-code config` and a persistent config file; `setup.sh`/`setup.ps1` for clones; CI and tagged releases |
 | **0.4.1** | Windows: commands run in the same console with output captured, Git Bash preferred over cmd, process trees killed properly |
 | **0.4.0** | command output saved to searchable logs; errors surfaced from anywhere in a long build |
 | **0.3.1** | stops the loop ending on a progress report; continuation nudging from the plan |
@@ -295,8 +295,10 @@ Type a task. `/help` lists commands. `exit` quits.
 | Command | What it does |
 | --- | --- |
 | `/model` | show current model |
-| `/model thinking\|fast\|fastest\|pro` | switch model (`thinking` = 3.8 Thinking, the default) |
-| `/thinking on\|off` | the Extended thinking toggle on top of the model (off by default; Thinking already reasons) |
+| `/models` | list the models in this account's picker, live, with locked ones marked |
+| `/model <name>` | switch model: an alias (`thinking`, `auto`, `fast`, `fastest`, `pro`, `argon`), a number from `/models`, or a picker label such as `3.8 Thinking` |
+| `/level low\|medium\|high` | the picker's Thinking level (default `high`; the account default is Low) |
+| `/thinking on\|off` | the Extended thinking toggle, on pickers that have one |
 | `/undo` | revert all file changes from the last task |
 | `/plan`, `/plan clear` | show / delete the progress journal |
 | `/memory`, `/remember <note>` | show / append durable project memory |
@@ -325,14 +327,15 @@ gemini-code config set autoApprove true
 gemini-code config unset model
 ```
 
-Friendly keys: `model`, `thinking`, `workers`, `orchestrator`, `autoApprove`, `maxTurns`,
+Friendly keys: `model`, `thinkingLevel`, `thinking`, `workers`, `orchestrator`, `autoApprove`, `maxTurns`,
 `shell`, `chrome`, `profile`, `gem`, `responseTimeoutMs`, `apiPort`, `apiKey` — or any
 raw `GEMINI_CODE_*` name from the table.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GEMINI_CODE_MODEL` | `thinking` | `thinking` (3.8 Thinking) \| `fast` \| `fastest` \| `pro` |
-| `GEMINI_CODE_THINKING` | `off` | `on` turns on the Extended thinking toggle on top of the model |
+| `GEMINI_CODE_MODEL` | `thinking` | an alias (`thinking` \| `auto` \| `fast` \| `fastest` \| `pro` \| `argon`) or a picker label (`"3.8 Thinking"`). Unset on an interactive first start → the chooser asks |
+| `GEMINI_CODE_THINKING_LEVEL` | `high` | `low` \| `medium` \| `high` — the picker's Thinking level submenu |
+| `GEMINI_CODE_THINKING` | `off` | `on` turns on the Extended thinking toggle, on pickers that have one |
 | `GEMINI_CODE_CHROME` | auto-detected | path to the Chrome executable |
 | `GEMINI_CODE_GEM` | unset | Gem to consult, by name or id (same as `--gem`) |
 | `GEMINI_CODE_GEM_MODE` | `reference` | `inside` runs the whole session in the Gem |
