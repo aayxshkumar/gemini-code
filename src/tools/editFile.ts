@@ -2,7 +2,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import type { ToolDefinition } from "../types.js";
 import { resolveInRoot, outsideWorkspace } from "./paths.js";
 import { checkEditable, markWritten } from "./fileState.js";
-import { confirmAction } from "./confirm.js";
+import { confirmAction, declinedMessage } from "./confirm.js";
 import { checkpoints } from "../context/checkpoint.js";
 import { detectEol, findSpans, nearestContext, normalizeEol, reindent } from "./matchText.js";
 
@@ -107,7 +107,7 @@ export const editFileTool: ToolDefinition = {
       `  - ${preview(oldText).split("\n").join("\n  - ")}\n` +
       `  + ${preview(newText).split("\n").join("\n  + ")}`;
     if (!(await confirmAction("Edit file?", detail, "edit"))) {
-      return { ok: false, output: "User declined this edit." };
+      return { ok: false, output: declinedMessage("make this edit", "edit") };
     }
 
     // Apply back-to-front so earlier spans' offsets stay valid.

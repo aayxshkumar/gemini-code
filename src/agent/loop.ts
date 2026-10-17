@@ -43,6 +43,14 @@ const REPEAT_FAILURE_LIMIT = Math.max(2, Number(process.env.GEMINI_CODE_REPEAT_F
 const MAX_INLINE_RESULT_CHARS = 4_000;
 
 /**
+ * The composer silently truncates at 32,000 characters (measured live:
+ * 50,000 pasted, 32,000 kept). A message over this would lose its tail —
+ * usually the TASK, which comes last — so anything longer is split: the
+ * head stays inline and the whole message also goes up as a file.
+ */
+const COMPOSER_MAX_CHARS = 30_000;
+
+/**
  * Context (tree + memory + project docs) longer than this is uploaded as a
  * file instead of pasted. Lower than the tool-result limit because the
  * primer's rules share the same first message and must stay inline.
@@ -422,11 +430,19 @@ export class AgentSession {
     let note = "";
     try {
       const reply = await this.exchange(
-        `CONTEXT RESET COMING. Reply with a HANDOFF NOTE for yourself in plain prose (no tool call, no code block), ` +
-          `under 600 words, covering: (1) the task and what the user actually wants; (2) what is DONE — each file ` +
-          `changed and how; (3) what REMAINS, as concrete next steps; (4) facts learned that you would otherwise have ` +
-          `to rediscover — exact paths, function names and signatures, commands that work, conventions, where things ` +
-          `live in other workspace roots; (5) open problems or doubts. Be specific; this note is all you will keep.`,
+        `CONTEXT RESET COMING. Do not call tools. Reply with ONLY a handoff note in exactly this Markdown ` +
+          `template, for another instance of you that will continue this work with none of this thread:\n\n` +
+          `## Goal\nWhat the user asked for and what they actually want, in two or three sentences.\n\n` +
+          `## Done\nEach file created or changed, with what changed and why. Commands that were run and their outcome.\n\n` +
+          `## Active\nWhat was in the middle of being done when the reset came, precisely.\n\n` +
+          `## Next\nThe remaining steps, in order, concrete enough to execute.\n\n` +
+          `## Key files\nAt most 15 paths another agent must open to continue, most important first, including paths ` +
+          `in other workspace roots. Not every file that was read.\n\n` +
+          `## Facts\nThings that cannot be rediscovered cheaply: exact function names and signatures, commands that ` +
+          `work (and ones that don't), conventions observed, decisions made and why. Or "(none)".\n\n` +
+          `## Open questions\nUnresolved doubts, blockers, things the user still needs to decide. Or "(none)".\n\n` +
+          `Leave out the tool protocol, the project instructions and the repository layout — the next instance ` +
+          `receives those separately. Under 700 words. Do not mention that the context was compacted.`,
         [],
         log
       );
@@ -466,6 +482,15 @@ export class AgentSession {
     log: (msg: string) => void
   ) {
     let lastError: Error | undefined;
+
+    if (message.length > COMPOSER_MAX_CHARS) {
+      const file = await this.writeAttachment("message", {}, message);
+      log(noteLine(`message is ${message.length} chars — over the composer's limit; attaching it in full as ${path.basename(file)}`));
+      attachFile = [...attachFile, file];
+      message =
+        `${message.slice(0, COMPOSER_MAX_CHARS - 600)}\n\n[... this message was too long for the composer. ` +
+        `The COMPLETE message, including everything cut here, is ATTACHED as "${path.basename(file)}" — read it before acting.]`;
+    }
 
     for (let attempt = 0; attempt <= TURN_RETRIES; attempt++) {
       try {

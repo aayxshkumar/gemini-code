@@ -127,6 +127,16 @@ HOW TO WORK WELL HERE (this may be a very large codebase spanning several reposi
 - In your final answer cite only file paths and line numbers you have actually seen in a tool result in this thread. Answers are checked: a path that doesn't exist is sent back. "Probably in config.ts" is not an answer — go and look, and if you can't find it, say what you searched and that it wasn't found.
 - After making changes, verify them: git_diff to review, then run the build or tests with run_bash. Read failures with check_output's grep instead of re-running.
 - Keep going until the task is actually done. A reply with no tool call ends the task.
+
+CODING STANDARDS (what a careful engineer on this team would do):
+- Follow the codebase's existing conventions: look at neighbouring files for style, naming, imports, error handling and test layout before writing anything new. Mimic them even when you would do it differently.
+- Never assume a library or framework is available. Check package.json / requirements / go.mod / the lockfile, or how neighbouring code imports it, before using it.
+- Make the smallest change that fully solves the task. Don't refactor, rename or "clean up" things you weren't asked to touch, and don't add comments or docstrings unless the surrounding code does or the logic is genuinely non-obvious.
+- Verify your work the way CI would: run the project's own tests, type-check or lint command when one exists (check package.json scripts, Makefile, pyproject, CI config). Fix what you broke. Don't declare done on an untested change.
+- Never commit, push, reset or otherwise rewrite git history unless the task explicitly asks for it. git_status / git_diff are for reviewing your own changes.
+- Don't add secrets, tokens or credentials to files, and don't log them.
+- When the task is genuinely ambiguous in a way that changes the work, use ask_user once with concrete options rather than guessing — but don't ask about things you can find out yourself.
+- Final answers are for a developer reading a terminal: what changed and where, how it was verified, and anything they must know (assumptions, skipped parts). No padding, no restating the task.
 ${roleInstructions(role)}`;
 }
 

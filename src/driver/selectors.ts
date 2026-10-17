@@ -101,6 +101,19 @@ export const selectors = {
    */
   gemLink: 'a[href^="/gem/"]',
 
+  /**
+   * Temporary chat: a thread Google doesn't save to the account's history
+   * or use for personalisation. The agent's dozens of tool-call threads
+   * otherwise bury the user's own chats in the sidebar. The first button
+   * turns it on; the second is only present while it is on.
+   */
+  temporaryChatButton: 'button[aria-label="Temporary chat" i]',
+  /**
+   * The state isn't on the button: a tooltip-like div next to it reads
+   * "Turn on temporary chat" or "Turn off temporary chat". Matched as text.
+   */
+  temporaryChatIsOnText: /turn off temporary chat/i,
+
   /** Opens the model/mode picker. Its aria-label also reports the current model. */
   modePicker: 'button[aria-label*="mode picker" i]',
 

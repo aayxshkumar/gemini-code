@@ -4,7 +4,7 @@ import type { ToolDefinition } from "../types.js";
 import { resolveInRoot, outsideWorkspace } from "./paths.js";
 import { hasSeen, markWritten } from "./fileState.js";
 import { existsSync } from "node:fs";
-import { confirmAction } from "./confirm.js";
+import { confirmAction, declinedMessage } from "./confirm.js";
 import { checkpoints } from "../context/checkpoint.js";
 
 export const writeFileTool: ToolDefinition = {
@@ -38,7 +38,7 @@ export const writeFileTool: ToolDefinition = {
 
     const approved = await confirmAction("Write file?", `${rel} (${content.length} bytes)`, "edit");
     if (!approved) {
-      return { ok: false, output: "User declined to write this file." };
+      return { ok: false, output: declinedMessage("write this file", "edit") };
     }
 
     try {

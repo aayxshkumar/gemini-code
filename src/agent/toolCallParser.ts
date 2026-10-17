@@ -329,7 +329,7 @@ export function looksUnfinished(response: GeminiResponse): boolean {
 export function looksLikeGeminiError(response: GeminiResponse): boolean {
   const text = response.text.trim();
   if (!text || text.length > 300 || response.codeBlocks.length) return false;
-  return /^(I encountered an error doing what you asked|Something went wrong|An internal error (has )?occurred|I'?m (currently )?(unable|not able) to (help|respond|process)[^.]*\. ?(Please )?try again|Sorry, something went wrong|I can'?t (help|do that) right now)/i.test(
+  return /^(I encountered an error doing what you asked|Something went wrong|An internal error (has )?occurred|I'?m (currently )?(unable|not able) to (help|respond|process)[^.]*\. ?(Please )?try again|Sorry, something went wrong|I can'?t (help|do that) right now|You'?ve reached your (daily |hourly )?(limit|quota)|You have reached (your|the) (limit|quota))/i.test(
     text
   );
 }

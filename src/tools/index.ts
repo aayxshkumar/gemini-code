@@ -10,6 +10,7 @@ import { listFilesTool } from "./listFiles.js";
 import { rememberTool } from "./remember.js";
 import { fetchUrlTool } from "./fetchUrl.js";
 import { webSearchTool } from "./webSearch.js";
+import { askUserTool } from "./askUser.js";
 
 export const tools: ToolDefinition[] = [
   readFileTool,
@@ -26,6 +27,7 @@ export const tools: ToolDefinition[] = [
   rememberTool,
   fetchUrlTool,
   webSearchTool,
+  askUserTool,
 ];
 
 export const toolsByName: Record<string, ToolDefinition> = Object.fromEntries(

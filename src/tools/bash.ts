@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { openSync, closeSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import type { ToolDefinition } from "../types.js";
-import { confirmAction } from "./confirm.js";
+import { confirmAction, declinedMessage } from "./confirm.js";
 import { resolveInRoot, outsideWorkspace } from "./paths.js";
 import { displayPath } from "../workspace.js";
 
@@ -346,7 +346,7 @@ export const bashTool: ToolDefinition = {
       command + inDir,
       "command"
     );
-    if (!approved) return { ok: false, output: "User declined to run this command." };
+    if (!approved) return { ok: false, output: declinedMessage("run this command", "command") };
 
     if (wantsBackground) {
       const result = runBackground(command, cwd);

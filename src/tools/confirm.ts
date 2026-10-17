@@ -47,6 +47,20 @@ export function autoApproved(kind: ActionKind, env = process.env.GEMINI_CODE_AUT
 export async function confirmAction(promptLabel: string, detail: string, kind: ActionKind = "command"): Promise<boolean> {
   if (autoApproved(kind)) return true;
 
+  // Unattended (piped stdin, CI, a script): nobody can type "y", so a
+  // question would hang the run until a timeout. Decline at once and say
+  // how to allow it — the model gets the same message and can adapt.
+  // GEMINI_CODE_PROMPT_UNATTENDED=1 keeps asking anyway, for callers that
+  // deliberately pipe answers in (and for the tests).
+  if (!process.stdin.isTTY && process.env.GEMINI_CODE_PROMPT_UNATTENDED !== "1") {
+    console.log(
+      `\n[gemini-code] ${promptLabel} — declined automatically: no terminal to confirm in.\n` +
+        `  ${detail.split("\n")[0]}\n` +
+        `  Allow this kind of action unattended with GEMINI_CODE_AUTO_APPROVE=${kind === "edit" ? "edits" : kind === "command" ? "edits,commands" : "all"}.`
+    );
+    return false;
+  }
+
   const run = queue.then(() => ask(promptLabel, detail));
   // Keep the chain alive even if one prompt rejects.
   queue = run.catch(() => undefined);
@@ -73,4 +87,17 @@ async function ask(promptLabel: string, detail: string): Promise<boolean> {
   } finally {
     rl.close();
   }
+}
+
+/** What the model is told when an action wasn't approved. */
+export function declinedMessage(what: string, kind: ActionKind): string {
+  if (!process.stdin.isTTY && process.env.GEMINI_CODE_PROMPT_UNATTENDED !== "1") {
+    return (
+      `Not allowed: this session is unattended (no terminal), so nobody could approve the request to ${what}, ` +
+      `and ${kind === "edit" ? "file changes" : kind === "command" ? "shell commands" : "network requests"} are not ` +
+      `pre-approved. Do not retry it. Finish what you can without it and state clearly in your final answer what ` +
+      `was skipped and why.`
+    );
+  }
+  return `User declined to ${what}. Don't repeat the same request; ask what they'd prefer, or continue without it.`;
 }
