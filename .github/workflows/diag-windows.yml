@@ -1,0 +1,30 @@
+# Manual diagnostic: how do the search engines behave on a Windows runner?
+name: diag-windows
+on:
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm run build
+      - shell: bash
+        run: |
+          echo "rg: $(command -v rg || echo none)"; rg --version | head -1 || true
+          echo "git: $(git --version)"
+          echo "--- git grep direct:"; git grep -n -I -E --no-color -i -e looksLikeAbandonedWork -- '*.ts' | head -3 || echo "git grep exit $?"
+          echo "--- rg direct:"; rg -n --no-heading --color never -e looksLikeAbandonedWork -i -g '**/*.ts' | head -3 || echo "rg exit $?"
+          echo "--- through fileIndex:"
+          GEMINI_CODE_SEARCH_DEBUG=1 node --input-type=module -e "
+            import { grep, listFiles } from './dist/tools/fileIndex.js';
+            const g = await grep(process.cwd(), 'looksLikeAbandonedWork', { glob: '*.ts' });
+            console.log('grep *.ts ->', JSON.stringify(g && { n: g.hits.length, engine: g.engine, first: g.hits[0] }));
+            const g2 = await grep(process.cwd(), 'looksLikeAbandonedWork', { glob: 'src/agent/*.ts' });
+            console.log('grep src/agent/*.ts ->', JSON.stringify(g2 && { n: g2.hits.length, engine: g2.engine, first: g2.hits[0] }));
+            const l = await listFiles(process.cwd(), { glob: '**/*.ts', max: 5 });
+            console.log('listFiles ->', JSON.stringify(l));
+          "
