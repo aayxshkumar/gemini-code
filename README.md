@@ -248,6 +248,7 @@ Semantic versioning, reported by `gemini-code --version`.
 
 | Version | Highlights |
 | --- | --- |
+| **0.9.0** | **Built for big, multi-repo codebases.** `--add-dir` workspace roots (read, search, edit and run commands in dependency repos); read-before-edit and changed-on-disk gates; edits echo the changed region; `find_files`; ripgrep/git-grep search with a `path` scope; "did you mean" on wrong paths; answers are checked for paths that don't exist; Gemini's own error replies are retried; AGENTS.md / CLAUDE.md honoured as instructions; auto-compaction with a handoff note (`/compact`); `autoApprove=edits` |
 | **0.8.0** | **Model choice is yours at startup**: a live chooser on first run, `--model`, `/models`, picker labels like `3.8 Thinking` work directly; `thinking` is the default (the Thinking model where offered, else Auto with Thinking level High); locked models are skipped; several tool calls per reply; lenient tool-call JSON; `gemini-code doctor`, `gemini-code config` and a persistent config file; `setup.sh`/`setup.ps1` for clones; CI and tagged releases |
 | **0.4.1** | Windows: commands run in the same console with output captured, Git Bash preferred over cmd, process trees killed properly |
 | **0.4.0** | command output saved to searchable logs; errors surfaced from anywhere in a long build |
@@ -302,6 +303,8 @@ Type a task. `/help` lists commands. `exit` quits.
 | `/undo` | revert all file changes from the last task |
 | `/plan`, `/plan clear` | show / delete the progress journal |
 | `/memory`, `/remember <note>` | show / append durable project memory |
+| `/roots`, `/add-dir <path>` | show the workspace roots / add another repository mid-session |
+| `/compact` | close the thread and continue in a fresh one from a handoff note the model writes for itself |
 | `/clear` | start a fresh Gemini thread |
 | `/gems` | list the Gems on your account |
 | `/gem <name>`, `/gem off` | consult a Gem for project knowledge, or stop using one |
@@ -327,7 +330,7 @@ gemini-code config set autoApprove true
 gemini-code config unset model
 ```
 
-Friendly keys: `model`, `thinkingLevel`, `thinking`, `workers`, `orchestrator`, `autoApprove`, `maxTurns`,
+Friendly keys: `model`, `thinkingLevel`, `thinking`, `addDirs`, `compactTurns`, `workers`, `orchestrator`, `autoApprove`, `maxTurns`,
 `shell`, `chrome`, `profile`, `gem`, `responseTimeoutMs`, `apiPort`, `apiKey` — or any
 raw `GEMINI_CODE_*` name from the table.
 
@@ -341,7 +344,9 @@ raw `GEMINI_CODE_*` name from the table.
 | `GEMINI_CODE_GEM_MODE` | `reference` | `inside` runs the whole session in the Gem |
 | `GEMINI_CODE_ORCHESTRATOR` | `1` | `0` = one tab does everything |
 | `GEMINI_CODE_MAX_WORKERS` | `3` | parallel worker tabs |
-| `GEMINI_CODE_AUTO_APPROVE` | unset | `1` skips all y/N confirmations |
+| `GEMINI_CODE_ADD_DIRS` | unset | extra workspace roots, PATH-style separated (same as `--add-dir`; config key `addDirs` takes a list) |
+| `GEMINI_CODE_AUTO_APPROVE` | unset | `edits` runs file writes/edits without asking (commands and requests still ask); `edits,commands` also runs commands; `1`/`all` skips everything |
+| `GEMINI_CODE_COMPACT_TURNS` | `40` | exchanges per thread before the thread is closed and continued fresh from a handoff note; `0` disables |
 | `GEMINI_CODE_IDLE_NUDGES` | `1` | times to push back on a task that ends with no tool call |
 | `GEMINI_CODE_MAX_TURNS` | `60` | tool-call turns one task may take |
 | `GEMINI_CODE_STALL_TURNS` | `8` | failing turns before it's told to change approach |
@@ -516,6 +521,68 @@ Gemini can see things, two ways:
 Files you supply are never deleted after sending; only images the agent generated
 in its own temp directory are cleaned up.
 
+### Big codebases and cross-repo work
+
+A real codebase is rarely one directory. Point the agent at every repository
+the task touches:
+
+```bash
+cd ~/src/checkout-service
+gemini-code --add-dir ../shared-lib --add-dir ../platform-sdk
+```
+
+or commit it per project in `.gemini-code.json`:
+
+```json
+{ "addDirs": ["../shared-lib", "../platform-sdk"] }
+```
+
+Every root is a place the agent can read, search, edit and run commands —
+`read_file("../shared-lib/src/money.js")`, `search_code` with `path: "../shared-lib"`,
+`run_bash` with `cwd: "../shared-lib"`, `git_diff` with `cwd` — and nowhere else
+is reachable, same as before. The primer carries a shallow tree of each extra
+root plus its README and `AGENTS.md`, and tells the model to read a
+dependency's real code rather than assume its API. In a live run against an
+app whose test failed because of a rounding bug in a sibling library, the
+agent found the cause in the library, fixed it there (as the app's `AGENTS.md`
+required), added a regression test beside it, and verified both repos' suites.
+
+What keeps it honest at scale, borrowed from Claude Code, OpenCode and Codex:
+
+- **Read before you edit.** `edit_file` and `write_file` refuse a file the model
+  hasn't read in this thread, and refuse one that changed on disk since (another
+  worker, a build step, you). The model is told exactly what to do instead. This
+  is the single biggest defence against "old_text from memory" and files silently
+  rewritten from a stale picture.
+- **Edits echo the result.** Every successful edit returns the changed region with
+  a few lines of context, so a misplaced edit is visible immediately.
+- **Find, don't guess.** `find_files` (glob) and `search_code` run on ripgrep or
+  `git grep` where available, honour `.gitignore`, and take a `path` scope — a
+  subdirectory, another root, or a vendored tree such as `node_modules/some-dep`
+  (ignore rules are dropped when the scope itself is ignored). A `read_file` on a
+  path that doesn't exist answers with the closest real paths.
+- **Answers are checked.** A final answer that cites a file which doesn't exist
+  anywhere in the workspace is sent back once with the list of missing paths, and
+  the model is told to locate the real ones or say it couldn't. Hedged answers
+  ("probably in config.ts", "let's look at…") count as unfinished and are pushed
+  to go and look. Verified live on the Vite monorepo: the first reply hedged, was
+  pushed back, and the final one cited the right default and enforcement lines.
+- **Gemini's own errors are retried.** "I encountered an error doing what you
+  asked" is the web UI failing, not an answer; the turn is re-sent.
+- **Project instructions are rules.** `AGENTS.md`, `CLAUDE.md`, `.cursorrules`,
+  `.github/copilot-instructions.md` and `CONTRIBUTING.md` are sent first, marked as
+  instructions that take precedence, and never cut by the context budget. Other
+  docs are capped and ranked (README and architecture notes before changelogs
+  and blog posts).
+- **Long tasks don't rot.** After `GEMINI_CODE_COMPACT_TURNS` exchanges (default
+  40) the model writes a handoff note — task, done, remaining, facts learned,
+  open problems — and the work continues in a fresh thread with that note and
+  the open plan steps. `/compact` does it on demand. The new thread has read
+  nothing, so the edit gate makes it re-read before it changes anything.
+- **Approve by kind.** `autoApprove=edits` is the practical setting on a real
+  project: edits run (reviewable with `git_diff`, reversible with `/undo`) while
+  shell commands and network requests still ask.
+
 ### Protocol drift in long threads
 
 Prompted tool-calling degrades as a thread grows: the primer falls out of a context
@@ -680,7 +747,9 @@ npm run dev          # run from source without building
 src/
   driver/     Playwright automation (selectors.ts is the DOM-coupled file)
   agent/      prompt contract, tool-call parsing, the agent loop, worker pool
-  tools/      read/edit/write/search/git/bash/fetch/search/browse/remember/update_plan
+  tools/      read/edit/write/find/search/git/bash/fetch/browse/remember/update_plan (+ fileState: read-before-edit)
+  workspace.ts  the roots the agent may touch (project + --add-dir)
+  agent/citations.ts  checks the paths a final answer cites
   context/    project tree, docs, GEMINI.md memory, plan journal
   server/     the OpenAI-compatible API
   scripts/    open-chrome, login, doctor, config subcommands

@@ -1,6 +1,9 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ToolDefinition } from "../types.js";
+import { resolveInRoot, outsideWorkspace } from "./paths.js";
+import { grep } from "./fileIndex.js";
+import { displayPath } from "../workspace.js";
 
 const IGNORED_DIRS = new Set([
   "node_modules",
@@ -133,10 +136,12 @@ export async function searchCode(opts: {
 export const searchCodeTool: ToolDefinition = {
   name: "search_code",
   description:
-    `search_code(args: {pattern: string, glob?: string, caseSensitive?: boolean, maxResults?: number}) -> searches ` +
-    `the project for a regular expression and returns file:line matches. Use this to FIND things before reading ` +
-    `them — it's far cheaper than reading whole files to look around. 'glob' filters by filename ("*.ts") or by path ("src/components/*.vue", "src/**/*.ts"). ` +
-    `Build/noise directories and binary files are skipped automatically.`,
+    `search_code(args: {pattern: string, path?: string, glob?: string, caseSensitive?: boolean, maxResults?: number}) -> ` +
+    `searches for a regular expression and returns file:line matches. Use this to FIND things before reading ` +
+    `them — it's far cheaper than reading whole files to look around. 'path' limits the search to a directory, ` +
+    `including another workspace root ("../shared-lib"); default is the project root. 'glob' filters by filename ` +
+    `("*.ts") or by path ("src/**/*.ts"). Uses ripgrep/git grep when available, so .gitignore'd and generated ` +
+    `files are skipped.`,
   async run(args) {
     const pattern = String(args.pattern ?? "");
     if (!pattern) return { ok: false, output: "Error: 'pattern' is required." };
@@ -147,27 +152,37 @@ export const searchCodeTool: ToolDefinition = {
       return { ok: false, output: `Error: invalid regular expression — ${(err as Error).message}` };
     }
 
-    try {
-      const { hits, filesScanned, truncated } = await searchCode({
-        pattern,
-        glob: typeof args.glob === "string" ? args.glob : undefined,
-        caseSensitive: Boolean(args.caseSensitive),
-        maxResults: Number(args.maxResults) || undefined,
-      });
+    const scope = String(args.path ?? ".").trim() || ".";
+    const resolved = resolveInRoot(scope);
+    if (!resolved.ok) return { ok: false, output: outsideWorkspace("search") };
+    const root = resolved.abs;
+    const glob = typeof args.glob === "string" && args.glob.trim() ? args.glob.trim() : undefined;
+    const max = Math.min(Math.max(Number(args.maxResults) || 100, 1), MAX_RESULTS);
+    const caseSensitive = Boolean(args.caseSensitive);
 
-      if (hits.length === 0) {
-        return { ok: true, output: `No matches for /${pattern}/ (searched ${filesScanned} files).` };
-      }
+    // Prefer the real tools (fast, honour .gitignore); the JS walk is the
+    // fallback for machines with neither rg nor git.
+    const fast = await grep(root, pattern, { glob, caseSensitive, max });
+    const prefix = displayPath(root) === "." ? "" : `${displayPath(root)}/`;
+    const result = fast ?? {
+      ...(await searchCode({ pattern, root, glob, caseSensitive, maxResults: max })),
+      engine: "walk",
+    };
+    const hits = result.hits.map((h) => ({ ...h, file: `${prefix}${h.file}` }));
+    const where = displayPath(root) === "." ? "the project" : displayPath(root);
 
-      const body = hits.map((h) => `${h.file}:${h.line}: ${h.text}`).join("\n");
+    if (hits.length === 0) {
       return {
         ok: true,
         output:
-          `${hits.length} match(es) in ${filesScanned} files:\n${body}` +
-          (truncated ? `\n\n[stopped at the result limit — narrow the pattern or use glob]` : ""),
+          `No matches for /${pattern}/ in ${where}${glob ? ` (glob ${glob})` : ""}. ` +
+          `Try a looser pattern, drop the glob, or search another root with 'path'.`,
       };
-    } catch (err) {
-      return { ok: false, output: `Error searching: ${(err as Error).message}` };
     }
+    const lines = hits.map((h) => `${h.file}:${h.line}: ${h.text}`);
+    const footer = result.truncated
+      ? `\n\n[showing the first ${hits.length} matches — narrow the pattern, add a glob or a path]`
+      : `\n\n[${hits.length} match${hits.length === 1 ? "" : "es"}]`;
+    return { ok: true, output: lines.join("\n") + footer };
   },
 };

@@ -27,4 +27,6 @@ export interface IGeminiDriver {
   sendPrompt(text: string, opts?: { attachFile?: string | string[] }): Promise<void>;
   waitForResponseComplete(opts?: { timeoutMs?: number; debounceMs?: number }): Promise<void>;
   getLastResponse(): Promise<GeminiResponse>;
+  /** Starts a fresh thread. Optional: fakes in tests may not implement it. */
+  newConversation?(): Promise<void>;
 }

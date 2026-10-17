@@ -12,7 +12,10 @@ import { startServer } from "./server/openai.js";
 import { installDialogRaceGuard } from "./driver/processGuards.js";
 import { AgentSession } from "./agent/loop.js";
 import { buildProjectTree } from "./context/projectTree.js";
-import { collectProjectDocs } from "./context/projectDocs.js";
+import { collectProjectDocs, collectRootSummaryDocs, type ProjectDoc } from "./context/projectDocs.js";
+import { addRoot, extraRoots, rootsFromArgs, displayPath } from "./workspace.js";
+import { forgetAll } from "./tools/fileState.js";
+import { autoApproved } from "./tools/confirm.js";
 import { ensureMemoryFile, readMemory, appendMemory, MEMORY_FILENAME } from "./context/memory.js";
 import {
   DEFAULT_MODEL_ALIAS,
@@ -71,6 +74,9 @@ ${modelHelp()
   ${c.cyan("/gems")}             list the Gems on your account
   ${c.cyan("/gem <name>")}       consult a Gem for project knowledge (ask_gem)
   ${c.cyan("/gem off")}          stop using a Gem
+  ${c.cyan("/roots")}            the workspace roots (project + --add-dir repos)
+  ${c.cyan("/add-dir <path>")}   add another repository to the workspace (fresh thread)
+  ${c.cyan("/compact")}          close the thread and continue in a fresh one with a handoff note
   ${c.cyan("/clear")}            start a fresh conversation thread
   ${c.cyan("/paste")} or ${c.cyan("Ctrl+V")}  attach an image from the clipboard
   ${c.cyan("/image <path>")}     attach an image file (or just drag one in)
@@ -166,12 +172,30 @@ async function main() {
   await driver.attach();
   await driver.ensureLoggedIn();
 
+  // Extra workspace roots: the sibling repositories a big codebase depends on.
+  for (const dir of rootsFromArgs(process.argv.slice(2))) {
+    const added = addRoot(dir);
+    if (!added.ok) console.log(c.yellow(`--add-dir ${dir}: ${added.error}`));
+  }
+
   // Gather durable context BEFORE starting the thread, so the primer can
   // carry it in one shot instead of costing tool calls later.
   const tree = await buildProjectTree();
   const created = await ensureMemoryFile(tree);
   const memory = await readMemory();
-  const docs = await collectProjectDocs();
+  const gatherRoots = async () => {
+    const roots: { name: string; display: string; dir: string; tree: string }[] = [];
+    const rootDocs: ProjectDoc[] = [];
+    for (const r of extraRoots()) {
+      // Shallow: the model finds its way with find_files / search_code.
+      const display = displayPath(r.dir);
+      roots.push({ name: r.name, display, dir: r.dir, tree: await buildProjectTree({ root: r.dir, maxEntries: 120, maxDepth: 3 }) });
+      rootDocs.push(...(await collectRootSummaryDocs(r.dir, display)));
+    }
+    return { roots, rootDocs };
+  };
+  let { roots, rootDocs } = await gatherRoots();
+  const docs = [...(await collectProjectDocs()), ...rootDocs];
   // An unfinished plan means the last run was cut short — carry it into
   // context so this session continues rather than starting over.
   const resumable = await findResumablePlan();
@@ -263,7 +287,16 @@ ${c.magenta("✻")} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — Claude-Cod
   }
   ${c.dim("context")} project tree (${tree.split("\n").length} lines)${memory ? `, ${MEMORY_FILENAME}` : ""}${docs.length ? `, ${docs.length} doc${docs.length > 1 ? "s" : ""} (${docs.map((d) => d.path).join(", ")})` : ""}
   ${c.dim("tools")}   ${[...tools.map((t) => t.name), "delegate_tasks", "update_plan", "screenshot_page", "read_page", "browser_open", "browser_do", ...(gemConsultant ? ["ask_gem"] : [])].join(", ")}
-  ${c.dim("workers")} up to ${MAX_PARALLEL_WORKERS} parallel Gemini tabs
+  ${c.dim("workers")} up to ${MAX_PARALLEL_WORKERS} parallel Gemini tabs${
+    roots.length ? `\n  ${c.dim("roots")}   + ${roots.map((r) => r.display).join(", ")} ${c.dim("(--add-dir)")}` : ""
+  }
+  ${c.dim("approve")} ${
+    autoApproved("edit") && autoApproved("command") && autoApproved("network")
+      ? c.yellow("everything runs without asking (autoApprove=all)")
+      : autoApproved("edit")
+        ? `edits run; ${autoApproved("command") ? "commands run; " : "commands ask; "}network ${autoApproved("network") ? "runs" : "asks"}`
+        : "y/N before every edit, command and request"
+  }
   ${c.dim("mode")}    ${ORCHESTRATOR_MODE ? "orchestrator — main tab plans & validates, workers implement" : "solo — one tab does everything"}
 ${created ? `\n  ${c.green("✓")} created ${MEMORY_FILENAME} for durable project memory` : ""}${
     resumable
@@ -279,10 +312,10 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
    */
   const journal = new PlanJournal();
   const makeMainSession = (mem: string | undefined, resumePlan?: string) => {
-    const ctx = { tree, memory: mem, docs, resumePlan };
+    const ctx = { tree, memory: mem, docs: [...docs.filter((d) => !rootDocs.includes(d)), ...rootDocs], resumePlan, roots };
     const delegate = createDelegateTool({
       parent: driver,
-      context: { tree, memory: mem, docs },
+      context: { tree, memory: mem, docs: ctx.docs, roots },
       modelAlias: startModel,
       log: (msg) => console.log(msg),
       createSession: (workerDriver, workerContext) =>
@@ -598,9 +631,51 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
               break;
             }
 
+            case "roots": {
+              console.log(`  ${c.bold("project")} ${process.cwd()}`);
+              for (const r of extraRoots()) console.log(`  ${c.cyan(displayPath(r.dir).padEnd(20))} ${r.dir}`);
+              console.log(`  ${c.dim("add one with /add-dir <path>, or start with --add-dir")}\n`);
+              break;
+            }
+
+            case "add-dir":
+            case "adddir": {
+              if (!arg) {
+                console.log("  usage: /add-dir <path-to-another-repo>\n");
+                break;
+              }
+              const added = addRoot(arg);
+              if (!added.ok) {
+                console.log(`  ${c.red("can't add")}: ${added.error}\n`);
+                break;
+              }
+              if (!added.added) {
+                console.log(`  ${c.dim(`${displayPath(added.root.dir)} is already in the workspace`)}\n`);
+                break;
+              }
+              ({ roots, rootDocs } = await gatherRoots());
+              // The primer describes the roots, so the next task needs a fresh thread.
+              await driver.newConversation();
+              forgetAll();
+              session = makeMainSession(await readMemory());
+              console.log(`  ${c.green("✓")} added ${c.bold(displayPath(added.root.dir))} ${c.dim(`(${added.root.dir}; fresh thread)`)}\n`);
+              break;
+            }
+
+            case "compact": {
+              const note = await session.compactNow((m) => console.log(m));
+              if (note === undefined) {
+                console.log(`  ${c.dim("nothing to compact yet — the thread hasn't started")}\n`);
+              } else {
+                console.log(`  ${c.green("✓")} fresh thread; handoff note kept (${note.length} chars). Next task continues from it.\n`);
+              }
+              break;
+            }
+
             case "clear":
             case "new":
               await driver.newConversation();
+              forgetAll();
               // A fresh thread has no memory of the primer, so the next task
               // must re-send it — that's what a new AgentSession does.
               session = makeMainSession(await readMemory());
@@ -743,6 +818,8 @@ Usage:
                               label from your picker, e.g. --model "3.8 Thinking"
   gemini-code --choose-model  list this account's live picker and choose (also asked on a
                               machine with no model configured yet)
+  gemini-code --add-dir <p>   include another repository in the workspace (repeatable):
+                              the agent can read, search, edit and run commands there too
   gemini-code --gem <name>    consult one of your Gems for project knowledge (ask_gem)
   gemini-code --gem <name> --gem-mode inside
                               run the whole session inside the Gem instead
@@ -764,7 +841,9 @@ Settings (environment, or "gemini-code config set <key> <value>", or <project>/.
   GEMINI_CODE_THINKING        on | off — the Extended thinking toggle, where the picker has one
   GEMINI_CODE_GEM             Gem to start in, by name or id (same as --gem)
   GEMINI_CODE_MAX_WORKERS     parallel worker tabs (default 3)
-  GEMINI_CODE_AUTO_APPROVE=1  skip y/N confirmations for writes, shell and network
+  GEMINI_CODE_ADD_DIRS        extra workspace roots, PATH-style separated (same as --add-dir)
+  GEMINI_CODE_AUTO_APPROVE    edits | edits,commands | all — what runs without a y/N (default: ask for all)
+  GEMINI_CODE_COMPACT_TURNS   exchanges per thread before a context reset with handoff (default 40)
   GEMINI_CODE_PROFILE         Chrome profile dir (default ~/.gemini-code/profile)
   GEMINI_CODE_API_KEY         same as serve --api-key
   GEMINI_CODE_API_PORT, GEMINI_CODE_API_HOST, GEMINI_CODE_API_TABS, GEMINI_CODE_API_CORS
@@ -832,6 +911,7 @@ async function cli(): Promise<void> {
     case "--gem":
     case "--gem-mode":
     case "--model":
+    case "--add-dir":
     case "--choose-model":
     case "--pick":
     case "--pick-model":
@@ -857,7 +937,7 @@ async function cli(): Promise<void> {
       return;
     }
     default:
-      if (cmd.startsWith("--gem=") || cmd.startsWith("--gem-mode=") || cmd.startsWith("--model=")) return main();
+      if (cmd.startsWith("--gem=") || cmd.startsWith("--gem-mode=") || cmd.startsWith("--model=") || cmd.startsWith("--add-dir=")) return main();
       console.error(`Unknown command "${cmd}"\n\n${USAGE}`);
       process.exitCode = 1;
   }

@@ -39,7 +39,7 @@ export function createScreenshotTool(driver: GeminiDriver): ToolDefinition {
       // the SAME browser as your logged-in session, so the user should see
       // exactly where it's pointing before it opens.
       const detail = `${url}${args.selector ? `\n  element: ${String(args.selector)}` : ""}`;
-      if (!(await confirmAction("Open page and screenshot it?", detail))) {
+      if (!(await confirmAction("Open page and screenshot it?", detail, "network"))) {
         return { ok: false, output: "User declined to open this page." };
       }
 

@@ -44,7 +44,7 @@ export function createBrowsePageTool(driver: GeminiDriver): ToolDefinition {
         url +
         (args.selector ? `\n  reading: ${String(args.selector)}` : "") +
         (args.clickSelector ? `\n  clicking first: ${String(args.clickSelector)}` : "");
-      if (!(await confirmAction("Open page and read it?", detail))) {
+      if (!(await confirmAction("Open page and read it?", detail, "network"))) {
         return { ok: false, output: "User declined to open this page." };
       }
 

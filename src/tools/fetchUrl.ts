@@ -33,7 +33,7 @@ export const fetchUrlTool: ToolDefinition = {
       `${method} ${url}` +
       (Object.keys(headers).length ? `\n  headers: ${Object.keys(headers).join(", ")}` : "") +
       (body ? `\n  body: ${body.length} bytes` : "");
-    if (!(await confirmAction("Send network request?", detail))) {
+    if (!(await confirmAction("Send network request?", detail, "network"))) {
       return { ok: false, output: "User declined this request." };
     }
 

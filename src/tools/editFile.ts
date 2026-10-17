@@ -1,6 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import type { ToolDefinition } from "../types.js";
-import { resolveInRoot } from "./paths.js";
+import { resolveInRoot, outsideWorkspace } from "./paths.js";
+import { checkEditable, markWritten } from "./fileState.js";
 import { confirmAction } from "./confirm.js";
 import { checkpoints } from "../context/checkpoint.js";
 import { detectEol, findSpans, nearestContext, normalizeEol, reindent } from "./matchText.js";
@@ -20,7 +21,9 @@ export const editFileTool: ToolDefinition = {
     `existing file: you only send the part that changes, instead of regenerating the whole file (which is slow, ` +
     `and risks silently losing any part you don't reproduce exactly). old_text must match the file's text and must ` +
     `be unique unless you set replace_all — differences in line endings, trailing spaces or indentation are ` +
-    `tolerated, but nothing else is. Read the file first if unsure.`,
+    `tolerated, but nothing else is. You MUST have read the file (read_file) in this session, and re-read it if it ` +
+    `changed since — the edit is refused otherwise, because old_text written from memory is the classic way to ` +
+    `break a file. The result shows the edited region so you can check it landed where you meant.`,
   async run(args) {
     const rel = String(args.path ?? "");
     const oldText = String(args.old_text ?? "");
@@ -40,9 +43,22 @@ export const editFileTool: ToolDefinition = {
 
     const resolved = resolveInRoot(rel);
     if (!resolved.ok) {
-      return { ok: false, output: "Error: path escapes the project root, refusing to edit it." };
+      return { ok: false, output: outsideWorkspace("edit") };
     }
     const abs = resolved.abs;
+
+    const gate = await checkEditable(abs);
+    if (!gate.ok) {
+      return {
+        ok: false,
+        output:
+          gate.reason === "unread"
+            ? `Error: you haven't read ${rel} in this session, so I won't edit it from memory. Call read_file on it ` +
+              `(a window around the target is enough), copy old_text from what comes back, then edit.`
+            : `Error: ${rel} changed on disk after you last read it (another worker, a build step or the user). ` +
+              `Read it again before editing, so old_text matches what is really there now.`,
+      };
+    }
 
     let content: string;
     try {
@@ -90,7 +106,7 @@ export const editFileTool: ToolDefinition = {
       `${rel} — ${replaceAll ? `${occurrences} occurrence(s)` : "1 occurrence"}\n` +
       `  - ${preview(oldText).split("\n").join("\n  - ")}\n` +
       `  + ${preview(newText).split("\n").join("\n  + ")}`;
-    if (!(await confirmAction("Edit file?", detail))) {
+    if (!(await confirmAction("Edit file?", detail, "edit"))) {
       return { ok: false, output: "User declined this edit." };
     }
 
@@ -106,11 +122,23 @@ export const editFileTool: ToolDefinition = {
     try {
       await checkpoints.recordBeforeWrite(abs);
       await writeFile(abs, updated, "utf8");
+      await markWritten(abs);
     } catch (err) {
       return { ok: false, output: `Error writing ${rel}: ${(err as Error).message}` };
     }
 
     const delta = edited.split("\n").length - normalized.split("\n").length;
+    // Show the first edited region with a little context, as Claude Code
+    // does, so a misplaced edit is visible immediately rather than three
+    // tool calls later. No line numbers: this text may be copied into the
+    // next old_text.
+    const firstSpan = replaceAll ? match.spans[match.spans.length - 1] : match.spans[0];
+    const before = normalized.slice(0, firstSpan.start).split("\n").length;
+    const editedLines = edited.split("\n");
+    const newLen = (match.how === "indentation" ? reindent(replacement, firstSpan.indent) : replacement).split("\n").length;
+    const from = Math.max(1, before - 2);
+    const to = Math.min(editedLines.length, before + newLen - 1 + 2);
+    const snippet = editedLines.slice(from - 1, to).join("\n");
     return {
       ok: true,
       output:
@@ -118,7 +146,8 @@ export const editFileTool: ToolDefinition = {
         `${delta === 0 ? "" : `, ${delta > 0 ? "+" : ""}${delta} lines`}` +
         // Say when the match wasn't exact, so a wrong-looking edit is
         // traceable rather than mysterious.
-        `${match.how === "exact" ? "" : `, matched ignoring ${match.how}`}).`,
+        `${match.how === "exact" ? "" : `, matched ignoring ${match.how}`}).\n` +
+        `Lines ${from}-${to} now read:\n${snippet}`,
     };
   },
 };

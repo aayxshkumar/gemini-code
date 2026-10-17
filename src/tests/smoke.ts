@@ -10,13 +10,16 @@
 import assert from "node:assert/strict";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { parseGeminiReply, looksLikeAbandonedWork, looksUnfinished } from "../agent/toolCallParser.js";
+import { parseGeminiReply, looksLikeAbandonedWork, looksUnfinished, looksLikeGeminiError } from "../agent/toolCallParser.js";
 import { formatToolResult, buildContextDocument, buildSystemPrimer } from "../agent/promptTemplate.js";
 import { AgentSession } from "../agent/loop.js";
 import type { IGeminiDriver, GeminiResponse } from "../driver/IGeminiDriver.js";
 import { readFileTool } from "../tools/readFile.js";
 import { editFileTool } from "../tools/editFile.js";
 import { searchCodeTool, globToRegExp } from "../tools/searchCode.js";
+import { findFilesTool } from "../tools/findFiles.js";
+import { addRoot, displayPath, resolveInWorkspace, rootsFromArgs } from "../workspace.js";
+import { autoApproved } from "../tools/confirm.js";
 import { detectEol, findSpans, reindent, nearestContext } from "../tools/matchText.js";
 import { gitStatusTool, gitDiffTool } from "../tools/git.js";
 import { writeFileTool } from "../tools/writeFile.js";
@@ -144,6 +147,42 @@ async function main() {
     if (result.kind === "tool_call") assert.equal(result.call.name, "run_bash");
   });
 
+  await test("recognises Gemini's own error replies, and nothing else", () => {
+    assert.ok(looksLikeGeminiError(finalResponse("I encountered an error doing what you asked. Could you try again?")));
+    assert.ok(looksLikeGeminiError(finalResponse("Something went wrong. Please try again.")));
+    assert.ok(!looksLikeGeminiError(finalResponse("The build failed: something went wrong in webpack. I fixed the loader config.")));
+    assert.ok(!looksLikeGeminiError(finalResponse("I encountered an error doing what you asked — the file was read-only — so I changed permissions first and the edit then succeeded. Details follow.\n\n" + "x".repeat(300))));
+    assert.ok(!looksLikeGeminiError(toolCallResponse("read_file", { path: "a" })));
+  });
+
+  await test("the loop retries a turn that Gemini answered with its own error", async () => {
+    const replies: GeminiResponse[] = [
+      finalResponse("I encountered an error doing what you asked. Could you try again?"),
+      finalResponse("Forty-two."),
+    ];
+    const sent: string[] = [];
+    const driver: IGeminiDriver = {
+      async sendPrompt(text) {
+        sent.push(text);
+      },
+      async waitForResponseComplete() {},
+      async getLastResponse() {
+        return replies.shift() ?? finalResponse("(no more)");
+      },
+    };
+    const before = process.env.GEMINI_CODE_IDLE_NUDGES;
+    process.env.GEMINI_CODE_IDLE_NUDGES = "0";
+    try {
+      const session = new AgentSession(driver, {});
+      const answer = await session.runTask("What is the answer?");
+      assert.equal(answer, "Forty-two.");
+      assert.equal(sent.length, 2, "the same turn was sent again");
+      assert.equal(sent[0], sent[1], "resent verbatim");
+    } finally {
+      process.env.GEMINI_CODE_IDLE_NUDGES = before;
+    }
+  });
+
   await test("collects several independent calls from one reply, as blocks or an array", () => {
     const known = new Set(["read_file", "search_code", "git_status"]);
     const a = JSON.stringify({ name: "read_file", args: { path: "a.py" } });
@@ -255,7 +294,7 @@ async function main() {
   await test("write_file/read_file refuse to escape the project root", async () => {
     const result = await writeFileTool.run({ path: "../outside.txt", content: "nope" });
     assert.equal(result.ok, false);
-    assert.match(result.output, /escapes the project root/);
+    assert.match(result.output, /outside the workspace/);
   });
 
   await test("run_bash executes and returns stdout (auto-approved)", async () => {
@@ -818,6 +857,7 @@ async function main() {
     // line with LF, and every edit is rejected until the turn limit is hit.
     const crlf = path.join(".tmp-test", "crlf.js");
     await writeFile(crlf, "function a() {\r\n  return 1;\r\n}\r\n", "utf8");
+    await readFileTool.run({ path: crlf });
     const r = await editFileTool.run({ path: crlf, old_text: "function a() {\n  return 1;\n}", new_text: "function a() {\n  return 2;\n}" });
     assert.equal(r.ok, true, r.output);
     const after = await readFile(path.resolve(crlf), "utf8");
@@ -827,6 +867,7 @@ async function main() {
   await test("edit_file tolerates trailing spaces and indentation, and says so", async () => {
     const f = path.join(".tmp-test", "ws.py");
     await writeFile(f, "def f():\n        value = 1\n        return value\n", "utf8");
+    await readFileTool.run({ path: f });
 
     // The model's copy carries trailing spaces the file doesn't have.
     const trailing = await editFileTool.run({ path: f, old_text: "        value = 1   ", new_text: "        value = 2" });
@@ -841,9 +882,91 @@ async function main() {
     assert.equal(after, "def f():\n        value = 3\n        return value * 2\n", "re-indented to the file, not the model");
   });
 
+  await test("edit_file and write_file refuse files the model never read, or that changed since", async () => {
+    const f = path.join(".tmp-test", "gate.ts");
+    await writeFile(f, "export const a = 1;\n", "utf8");
+    const unread = await editFileTool.run({ path: f, old_text: "a = 1", new_text: "a = 2" });
+    assert.equal(unread.ok, false);
+    assert.match(unread.output, /haven't read/);
+    const blind = await writeFileTool.run({ path: f, content: "export const a = 9;\n" });
+    assert.equal(blind.ok, false);
+    assert.match(blind.output, /already exists and you haven't read/);
+
+    await readFileTool.run({ path: f });
+    const ok = await editFileTool.run({ path: f, old_text: "a = 1", new_text: "a = 2" });
+    assert.equal(ok.ok, true, ok.output);
+    assert.match(ok.output, /now read:\n[\s\S]*a = 2/, "the result shows the edited region");
+
+    // Someone else changes it: the next edit must re-read first.
+    await new Promise((r) => setTimeout(r, 20));
+    await writeFile(f, "export const a = 2;\nexport const b = 3;\n", "utf8");
+    const stale = await editFileTool.run({ path: f, old_text: "b = 3", new_text: "b = 4" });
+    assert.equal(stale.ok, false);
+    assert.match(stale.output, /changed on disk/);
+    await readFileTool.run({ path: f });
+    assert.equal((await editFileTool.run({ path: f, old_text: "b = 3", new_text: "b = 4" })).ok, true);
+  });
+
+  await test("read_file suggests the right path when the model guesses wrong", async () => {
+    await mkdir(path.join(".tmp-test", "deep", "er"), { recursive: true });
+    await writeFile(path.join(".tmp-test", "deep", "er", "config_loader.py"), "x = 1\n", "utf8");
+    const miss = await readFileTool.run({ path: ".tmp-test/config_loader.py" });
+    assert.equal(miss.ok, false);
+    assert.match(miss.output, /Did you mean[\s\S]*deep\/er\/config_loader\.py/);
+  });
+
+  await test("find_files globs the workspace; search_code takes a path scope", async () => {
+    const found = await findFilesTool.run({ glob: "**/config_loader.py", path: ".tmp-test" });
+    assert.equal(found.ok, true);
+    assert.match(found.output, /\.tmp-test\/deep\/er\/config_loader\.py/);
+    const scoped = await searchCodeTool.run({ pattern: "x = 1", path: ".tmp-test/deep" });
+    assert.equal(scoped.ok, true, scoped.output);
+    assert.match(scoped.output, /\.tmp-test\/deep\/er\/config_loader\.py:1/);
+    const outside = await searchCodeTool.run({ pattern: "x", path: "../../" });
+    assert.equal(outside.ok, false);
+    assert.match(outside.output, /outside the workspace/);
+  });
+
+  await test("workspace roots: paths resolve into added roots and nowhere else", async () => {
+    const sibling = path.resolve(process.cwd(), "..", ".tmp-test-sibling");
+    await mkdir(sibling, { recursive: true });
+    await writeFile(path.join(sibling, "lib.py"), "def dep(): return 42\n", "utf8");
+    try {
+      assert.equal(resolveInWorkspace("../.tmp-test-sibling/lib.py").ok, false, "not a root yet");
+      const added = addRoot(sibling);
+      assert.ok(added.ok && added.added);
+      const r = resolveInWorkspace("../.tmp-test-sibling/lib.py");
+      assert.ok(r.ok && r.root.name === ".tmp-test-sibling");
+      assert.equal(displayPath(path.join(sibling, "lib.py")), "../.tmp-test-sibling/lib.py");
+      assert.equal(resolveInWorkspace("../.tmp-test-sibling-evil/x").ok, false, "a sibling with a longer name is not inside");
+      const read = await readFileTool.run({ path: "../.tmp-test-sibling/lib.py" });
+      assert.equal(read.ok, true);
+      assert.match(read.output, /def dep/);
+      const hits = await searchCodeTool.run({ pattern: "def dep", path: "../.tmp-test-sibling" });
+      assert.match(hits.output, /\.\.\/\.tmp-test-sibling\/lib\.py:1/);
+      const ran = await bashTool.run({ command: "pwd", cwd: "../.tmp-test-sibling" });
+      assert.ok(ran.output.includes(".tmp-test-sibling"), ran.output);
+      assert.deepEqual(rootsFromArgs(["--add-dir", "a", "--add-dir=b"], { GEMINI_CODE_ADD_DIRS: `c${path.delimiter}d` }), ["a", "b", "c", "d"]);
+    } finally {
+      await rm(sibling, { recursive: true, force: true });
+    }
+  });
+
+  await test("approval levels: edits can run while commands and requests still ask", () => {
+    assert.equal(autoApproved("edit", ""), false);
+    assert.equal(autoApproved("edit", "0"), false);
+    assert.equal(autoApproved("edit", "1"), true);
+    assert.equal(autoApproved("network", "all"), true);
+    assert.equal(autoApproved("edit", "edits"), true);
+    assert.equal(autoApproved("command", "edits"), false);
+    assert.equal(autoApproved("command", "edits,commands"), true);
+    assert.equal(autoApproved("network", "edits,commands"), false);
+  });
+
   await test("edit_file still refuses a wrong or ambiguous edit, with the nearest lines", async () => {
     const f = path.join(".tmp-test", "miss.js");
     await writeFile(f, "const timeout = 30;\nconst retries = 3;\n", "utf8");
+    await readFileTool.run({ path: f });
 
     const wrong = await editFileTool.run({ path: f, old_text: "const timeout = 99;", new_text: "const timeout = 60;" });
     assert.equal(wrong.ok, false);
@@ -851,6 +974,7 @@ async function main() {
     assert.match(wrong.output, /const timeout = 30;/, "shows the real line so it can correct itself");
 
     await writeFile(f, "a = 1;\na = 1;\n", "utf8");
+    await readFileTool.run({ path: f });
     const ambiguous = await editFileTool.run({ path: f, old_text: "a = 1;", new_text: "a = 2;" });
     assert.equal(ambiguous.ok, false);
     assert.match(ambiguous.output, /appears 2 times/);

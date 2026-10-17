@@ -11,8 +11,10 @@ import {
   type PrimerContext,
   type AgentRole,
 } from "./promptTemplate.js";
-import { parseGeminiReply, looksLikeAbandonedWork, looksUnfinished } from "./toolCallParser.js";
+import { parseGeminiReply, looksLikeAbandonedWork, looksUnfinished, looksLikeGeminiError } from "./toolCallParser.js";
 import { toolCallLine, toolResultLine, noteLine } from "../ui/format.js";
+import { forgetAll } from "../tools/fileState.js";
+import { missingCitedPaths } from "./citations.js";
 import type { PlanJournal } from "../context/plan.js";
 
 /**
@@ -78,6 +80,15 @@ function maxIdleNudges(): number {
  */
 const MAX_CONTINUE_NUDGES = Math.max(0, Number(process.env.GEMINI_CODE_CONTINUE_NUDGES ?? 3));
 
+/**
+ * After this many exchanges in one thread, the thread is closed and a fresh
+ * one opened with a handoff note the model writes for itself — the same
+ * idea as Claude Code's auto-compact. The web UI silently truncates long
+ * threads, and what falls off first is the primer and the early reads, so
+ * a long task on a big codebase degrades into guesses. 0 disables.
+ */
+const COMPACT_TURNS = Math.max(0, Number(process.env.GEMINI_CODE_COMPACT_TURNS ?? 40));
+
 /** Transient driver failures (send/response) are retried this many times. */
 const TURN_RETRIES = Math.max(0, Number(process.env.GEMINI_CODE_TURN_RETRIES ?? 2));
 
@@ -95,6 +106,10 @@ export interface RunTaskOptions {
 
 export class AgentSession {
   private primed = false;
+  /** Exchanges sent in the current thread, for compaction. */
+  private exchanges = 0;
+  /** The task in flight, so a compaction mid-task can restate it. */
+  private currentTask = "";
   /** Static tools plus any session-scoped ones (e.g. delegate_tasks). */
   private readonly tools: ToolDefinition[];
   private readonly toolsByName: Record<string, ToolDefinition>;
@@ -102,7 +117,7 @@ export class AgentSession {
 
   constructor(
     private readonly driver: IGeminiDriver,
-    private readonly context: PrimerContext = {},
+    private context: PrimerContext = {},
     extraTools: ToolDefinition[] = [],
     /**
      * Written to after every step so an interrupted run can be resumed.
@@ -132,6 +147,8 @@ export class AgentSession {
     let driftNudges = 0;
     let continueNudges = 0;
     let idleNudges = 0;
+    let citationNudges = 0;
+    let geminiErrorRetries = 0;
     let toolCallsMade = 0;
     // Progress tracking, so a task that is stuck can be told so instead of
     // quietly repeating itself until the turn limit.
@@ -139,25 +156,15 @@ export class AgentSession {
     let lastFailure = "";
     let sameFailureCount = 0;
 
+    this.currentTask = userTask;
+    if (COMPACT_TURNS > 0 && this.exchanges >= COMPACT_TURNS && !this.primed) {
+      // Thread already long from earlier tasks: start this one fresh.
+      await this.compact("thread is long", log);
+    }
     if (!this.primed) {
-      this.primed = true;
-      const primer = buildSystemPrimer(this.tools, this.role);
-      const contextDoc = buildContextDocument(this.context);
-
-      if (!contextDoc) {
-        message = `${primer}\n\n---\n\nTASK:\n${userTask}`;
-      } else if (contextDoc.length <= MAX_INLINE_CONTEXT_CHARS) {
-        message = `${primer}\n\n---\n\n${contextDoc}\n\n---\n\nTASK:\n${userTask}`;
-      } else {
-        // Too big for the composer — send the rules inline (they must not
-        // depend on Gemini opening a file) and attach the knowledge.
-        attachFile.push(await this.writeContextFile(contextDoc));
-        log(noteLine(`context is ${contextDoc.length} chars — attaching context.md`));
-        message =
-          `${primer}\n\n---\n\nProject context (structure, memory, and the project's own docs) ` +
-          `is ATTACHED to this message as "context.md". Read it first.\n\n` +
-          `---\n\nTASK:\n${userTask}`;
-      }
+      const primed = await this.buildPrimedMessage(userTask, log);
+      message = primed.message;
+      if (primed.attach) attachFile.push(primed.attach);
     }
 
     for (let turn = 0; turn < MAX_TOOL_TURNS_PER_TASK; turn++) {
@@ -179,7 +186,31 @@ export class AgentSession {
         message = `${buildProtocolReminder()}\n\n${message}`;
       }
 
+      if (COMPACT_TURNS > 0 && this.exchanges >= COMPACT_TURNS && this.primed) {
+        const note = await this.compact(`${this.exchanges} exchanges in this thread`, log);
+        if (note !== undefined) {
+          const primed = await this.buildPrimedMessage(
+            `CONTINUE the task below — it is already in progress; your handoff note in the context says where you ` +
+              `got to.\n\nORIGINAL TASK:\n${userTask}\n\nThe last tool result before the reset was:\n${message}`,
+            log
+          );
+          message = primed.message;
+          if (primed.attach) attachFile.push(primed.attach);
+        }
+      }
+
       const reply = await this.exchange(message, attachFile, log);
+
+      // "I encountered an error doing what you asked" is Gemini failing, not
+      // answering. Re-send the same message (attachments included — they are
+      // only cleaned up once a real reply is in hand).
+      if (looksLikeGeminiError(reply) && geminiErrorRetries < TURN_RETRIES + 1) {
+        geminiErrorRetries++;
+        log(noteLine(`Gemini returned its own error ("${reply.text.trim().slice(0, 60)}") — resending (${geminiErrorRetries}/${TURN_RETRIES + 1})`));
+        await this.journal?.log(`gemini error reply, retrying: ${reply.text.trim().slice(0, 80)}`);
+        await new Promise((r) => setTimeout(r, 4_000 * geminiErrorRetries));
+        continue;
+      }
       await this.cleanupAttachments(attachFile);
       attachFile = [];
 
@@ -234,6 +265,20 @@ export class AgentSession {
             `Carry on now with the next action. Reply with a tool call (a code block containing ` +
             `{"name": ..., "args": ...}) and keep going until every step is actually done. ` +
             `Only answer in plain prose when the work is genuinely complete — and say so explicitly.`;
+          continue;
+        }
+        // A final answer that names files which don't exist is wrong in the
+        // way nobody reading a terminal can detect. Check mechanically, once.
+        const missing = citationNudges < 1 ? missingCitedPaths(parsed.text) : [];
+        if (missing.length) {
+          citationNudges++;
+          log(noteLine(`answer cites ${missing.length} path(s) that don't exist (${missing.slice(0, 3).join(", ")}) — asking it to verify`));
+          await this.journal?.log(`citation check: missing ${missing.join(", ")}`);
+          message =
+            `Your answer cites files that do NOT exist in this workspace:\n${missing.map((p) => `- ${p}`).join("\n")}\n\n` +
+            `Do not guess paths. Use find_files / search_code to locate the real files (or establish that they don't ` +
+            `exist), read them, then give the answer again citing only paths and lines you have actually seen in a ` +
+            `tool result in this thread. If something could not be found, say so plainly instead of naming a likely place.`;
           continue;
         }
         await this.journal?.complete(parsed.text);
@@ -338,6 +383,73 @@ export class AgentSession {
     );
   }
 
+  /** The first message of a thread: rules inline, knowledge attached when big. */
+  private async buildPrimedMessage(
+    taskText: string,
+    log: (msg: string) => void
+  ): Promise<{ message: string; attach?: string }> {
+    this.primed = true;
+    const primer = buildSystemPrimer(this.tools, this.role);
+    const contextDoc = buildContextDocument(this.context);
+
+    if (!contextDoc) {
+      return { message: `${primer}\n\n---\n\nTASK:\n${taskText}` };
+    }
+    if (contextDoc.length <= MAX_INLINE_CONTEXT_CHARS) {
+      return { message: `${primer}\n\n---\n\n${contextDoc}\n\n---\n\nTASK:\n${taskText}` };
+    }
+    // Too big for the composer — send the rules inline (they must not
+    // depend on Gemini opening a file) and attach the knowledge.
+    const attach = await this.writeContextFile(contextDoc);
+    log(noteLine(`context is ${contextDoc.length} chars — attaching context.md`));
+    return {
+      message:
+        `${primer}\n\n---\n\nProject context (structure, memory, and the project's own docs) ` +
+        `is ATTACHED to this message as "context.md". Read it first.\n\n` +
+        `---\n\nTASK:\n${taskText}`,
+      attach,
+    };
+  }
+
+  /**
+   * Closes the current thread and opens a fresh one, carrying a handoff note
+   * the model writes for itself. Returns the note, or undefined when the
+   * driver can't start threads (tests) or nothing has been sent yet.
+   */
+  async compact(reason: string, log: (msg: string) => void = () => {}): Promise<string | undefined> {
+    if (!this.driver.newConversation || !this.primed) return undefined;
+    log(noteLine(`compacting — ${reason}: asking for a handoff note, then starting a fresh thread`));
+    let note = "";
+    try {
+      const reply = await this.exchange(
+        `CONTEXT RESET COMING. Reply with a HANDOFF NOTE for yourself in plain prose (no tool call, no code block), ` +
+          `under 600 words, covering: (1) the task and what the user actually wants; (2) what is DONE — each file ` +
+          `changed and how; (3) what REMAINS, as concrete next steps; (4) facts learned that you would otherwise have ` +
+          `to rediscover — exact paths, function names and signatures, commands that work, conventions, where things ` +
+          `live in other workspace roots; (5) open problems or doubts. Be specific; this note is all you will keep.`,
+        [],
+        log
+      );
+      note = reply.text.trim();
+    } catch (err) {
+      log(noteLine(`couldn't get a handoff note (${(err as Error).message.split("\n")[0]}) — using the plan journal only`));
+    }
+    const plan = this.journal?.pendingSteps() ?? [];
+    const journalPart = plan.length ? `\n\nOpen plan steps:\n${plan.map((p) => `- [ ] ${p}`).join("\n")}` : "";
+    this.context.handoff = `${note || "(no note was produced)"}${journalPart}`;
+    await this.driver.newConversation();
+    forgetAll(); // the new thread has read nothing yet
+    this.primed = false;
+    this.exchanges = 0;
+    await this.journal?.log(`compacted thread (${reason})`);
+    return this.context.handoff;
+  }
+
+  /** `/compact`: the same, at the user's request, between tasks. */
+  async compactNow(log: (msg: string) => void = () => {}): Promise<string | undefined> {
+    return this.compact("requested with /compact", log);
+  }
+
   /**
    * Sends one message and returns Gemini's reply, retrying the WHOLE
    * exchange on failure.
@@ -384,6 +496,7 @@ export class AgentSession {
         }
 
         await this.driver.waitForResponseComplete();
+        this.exchanges++;
         return await this.driver.getLastResponse();
       } catch (err) {
         lastError = err as Error;
