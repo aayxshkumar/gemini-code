@@ -1,10 +1,18 @@
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright";
 import path from "node:path";
 import { homedir } from "node:os";
 import { existsSync, mkdirSync } from "node:fs";
 import { selectors } from "./selectors.js";
 import type { IGeminiDriver, GeminiResponse } from "./IGeminiDriver.js";
-import { resolveModel, modelHelp, modelWithFallbacks, EXTENDED_THINKING } from "./models.js";
+import {
+  resolveModel,
+  modelHelp,
+  modelWithFallbacks,
+  EXTENDED_THINKING,
+  THINKING_LEVELS,
+  THINKING_LEVEL_MENU,
+  type ThinkingLevel,
+} from "./models.js";
 import { HTML_TO_MARKDOWN } from "./markdown.js";
 
 const GEMINI_URL = "https://gemini.google.com/app";
@@ -71,12 +79,42 @@ export const TIMEOUTS = {
  * doesn't silently orphan a session you already signed into.
  * GEMINI_CODE_PROFILE overrides both.
  */
+/**
+ * What a picker row IS, read from Angular Material's own markers: the
+ * selected row carries a "check" icon and a `selected` class, a row that
+ * needs a paid plan carries a "lock" icon, and a submenu row has
+ * aria-haspopup. Reading these beats guessing from the label text.
+ */
+async function menuItemState(item: Locator): Promise<{ selected: boolean; locked: boolean; submenu: boolean }> {
+  return item
+    .evaluate((el) => {
+      const icons = Array.from(el.querySelectorAll("mat-icon, [data-mat-icon-name]")).map((i) =>
+        (i.getAttribute("data-mat-icon-name") || i.getAttribute("fonticon") || i.textContent || "").trim().toLowerCase()
+      );
+      return {
+        selected: el.classList.contains("selected") || icons.includes("check") || el.getAttribute("aria-checked") === "true",
+        locked: icons.includes("lock"),
+        submenu: el.getAttribute("aria-haspopup") === "true" || icons.includes("arrow_right"),
+      };
+    })
+    .catch(() => ({ selected: false, locked: false, submenu: false }));
+}
+
 export function resolveProfileDir(cwd = process.cwd()): string {
   if (process.env.GEMINI_CODE_PROFILE) return path.resolve(process.env.GEMINI_CODE_PROFILE);
   const local = path.resolve(cwd, ".gemini-code-profile");
   if (existsSync(local)) return local;
   // GEMINI_CODE_HOME moves everything (app, profile, config) together.
   return path.join(process.env.GEMINI_CODE_HOME || path.join(homedir(), ".gemini-code"), "profile");
+}
+
+/** One row of the live model picker. */
+export interface PickerEntry {
+  label: string;
+  description: string;
+  selected: boolean;
+  locked: boolean;
+  submenu: boolean;
 }
 
 export interface GeminiDriverOptions {
@@ -446,13 +484,41 @@ export class GeminiDriver implements IGeminiDriver {
    * keywords rather than exact labels so Google's version bumps
    * ("3.5 Flash" → "3.6 Flash") don't break it.
    */
+  /**
+   * The picker's entries as this account sees them right now — labels,
+   * blurbs, which is selected, which need a paid plan. The chooser at
+   * startup and /models show exactly this, so a new model Google adds is
+   * selectable by its label before anyone updates models.ts.
+   */
+  async listModels(): Promise<PickerEntry[]> {
+    const page = this.requirePage();
+    await page.locator(`${selectors.modePicker} >> visible=true`).first().click({ timeout: 10_000 });
+    const items = page.locator(`${selectors.modeMenuItem} >> visible=true`);
+    await items.first().waitFor({ timeout: 10_000 }).catch(() => {
+      throw new Error("Model picker didn't open — recalibrate selectors.modePicker/modeMenuItem.");
+    });
+    await page.waitForTimeout(400);
+    const out: PickerEntry[] = [];
+    const count = await items.count();
+    for (let i = 0; i < count; i++) {
+      const item = items.nth(i);
+      const text = (await item.innerText().catch(() => "")).trim();
+      if (!text) continue;
+      const [label, ...rest] = text.split("\n").map((l) => l.trim());
+      const state = await menuItemState(item);
+      out.push({ label, description: rest.join(" "), ...state });
+    }
+    await page.keyboard.press("Escape").catch(() => {});
+    return out;
+  }
+
   async setModel(alias: string, opts: { onFallback?: (wanted: string, got: string) => void } = {}): Promise<string> {
     const page = this.requirePage();
     const choice = resolveModel(alias);
     if (!choice) {
-      throw new Error(
-        `Unknown model "${alias}". Options:\n${modelHelp()}`
-      );
+      // Not one of our aliases: take it as (part of) a label in the live
+      // picker, e.g. "3.8 Thinking" or "argon".
+      return this.setModelByLabel(alias);
     }
 
     await page.locator(`${selectors.modePicker} >> visible=true`).first().click({ timeout: 10_000 });
@@ -472,6 +538,7 @@ export class GeminiDriver implements IGeminiDriver {
     // so a slow-rendering menu can't make us settle for second best.
     const chain = modelWithFallbacks(choice);
     const seen: string[] = [];
+    const locked: string[] = [];
     for (const candidate of chain) {
       const deadline = Date.now() + (candidate === choice ? 5_000 : 1_500);
       while (Date.now() < deadline) {
@@ -481,13 +548,25 @@ export class GeminiDriver implements IGeminiDriver {
           if (!(await item.isVisible().catch(() => false))) continue;
           const text = (await item.innerText().catch(() => "")).trim();
           if (text && !seen.includes(text)) seen.push(text);
-          if (candidate.matches(text)) {
+          if (!candidate.matches(text)) continue;
+          const state = await menuItemState(item);
+          // A submenu entry ("Thinking level ▸") is a setting, not a model,
+          // and a locked entry only opens an upgrade prompt.
+          if (state.submenu) continue;
+          if (state.locked) {
+            const label = text.split("\n")[0];
+            if (!locked.includes(label)) locked.push(label);
+            continue;
+          }
+          if (state.selected) {
+            await page.keyboard.press("Escape").catch(() => {});
+          } else {
             await item.click();
             await page.waitForTimeout(800);
-            if (candidate !== choice) opts.onFallback?.(choice.name, candidate.name);
-            await this.getCurrentModel().catch(() => undefined);
-            return candidate.name;
           }
+          if (candidate !== choice) opts.onFallback?.(choice.name, candidate.name);
+          await this.getCurrentModel().catch(() => undefined);
+          return candidate.name;
         }
         await page.waitForTimeout(250);
       }
@@ -495,11 +574,110 @@ export class GeminiDriver implements IGeminiDriver {
 
     // Nothing matched — close the menu rather than leaving it open over the UI.
     await page.keyboard.press("Escape").catch(() => {});
+    const lockedWanted = locked.filter((l) => choice.matches(l));
+    if (lockedWanted.length) {
+      throw new Error(
+        `"${lockedWanted[0]}" is locked on this account (it needs a paid Gemini plan), and no unlocked fallback ` +
+          `(${chain.slice(1).map((m) => m.name).join(", ") || "none"}) is in this picker. /models lists what's available.`
+      );
+    }
+    const offered = [...new Set(seen.map((t) => t.split("\n")[0]))].map((l) => (locked.includes(l) ? `"${l}" (locked)` : `"${l}"`));
     throw new Error(
       `Couldn't find "${choice.name}"${chain.length > 1 ? ` (or ${chain.slice(1).map((m) => m.name).join(", ")})` : ""} ` +
-        `in the model picker. The menu offered: ${seen.map((t) => JSON.stringify(t.split("\n")[0])).join(", ") || "nothing visible"}. ` +
-        `Google may have renamed the entries — see the keyword rules in src/driver/models.ts.`
+        `in the model picker. The menu offered: ${offered.join(", ") || "nothing visible"}. ` +
+        `/model <label> selects any of those directly; the keyword rules live in src/driver/models.ts.`
     );
+  }
+
+  /** Selects a picker entry by its visible label (case-insensitive substring). */
+  private async setModelByLabel(wanted: string): Promise<string> {
+    const page = this.requirePage();
+    const needle = wanted.trim().toLowerCase();
+    const entries = await this.listModels();
+    const candidates = entries.filter((e) => !e.submenu && e.label.toLowerCase().includes(needle));
+    const available = entries.filter((e) => !e.submenu).map((e) => `"${e.label}"${e.locked ? " (locked)" : ""}`);
+    if (candidates.length !== 1) {
+      throw new Error(
+        candidates.length === 0
+          ? `No model matching "${wanted}". The picker offers: ${available.join(", ")}.\nAliases:\n${modelHelp()}`
+          : `"${wanted}" matches several models: ${candidates.map((c) => `"${c.label}"`).join(", ")} — be more specific.`
+      );
+    }
+    const target = candidates[0];
+    if (target.locked) throw new Error(`"${target.label}" is locked on this account (needs a paid plan).`);
+    if (target.selected) return target.label;
+
+    await page.locator(`${selectors.modePicker} >> visible=true`).first().click({ timeout: 10_000 });
+    const items = page.locator(`${selectors.modeMenuItem} >> visible=true`);
+    await items.first().waitFor({ timeout: 10_000 });
+    const count = await items.count();
+    for (let i = 0; i < count; i++) {
+      const item = items.nth(i);
+      const text = (await item.innerText().catch(() => "")).trim();
+      if (text.split("\n")[0].trim() === target.label) {
+        await item.click();
+        await page.waitForTimeout(800);
+        await this.getCurrentModel().catch(() => undefined);
+        return target.label;
+      }
+    }
+    await page.keyboard.press("Escape").catch(() => {});
+    throw new Error(`Couldn't click "${target.label}" — the menu changed while opening it. Try again.`);
+  }
+
+  /**
+   * Reads the picker's "Thinking level" (Low / Medium / High) and, when
+   * `level` is given, selects it. The level isn't in the picker's label, so
+   * it's read from the submenu's selected item. Throws when this picker
+   * has no such submenu — older menus don't — so callers can treat that as
+   * "nothing to set" rather than a failure.
+   */
+  async setThinkingLevel(level?: ThinkingLevel): Promise<ThinkingLevel> {
+    const page = this.requirePage();
+    await page.locator(`${selectors.modePicker} >> visible=true`).first().click({ timeout: 10_000 });
+    const items = page.locator(`${selectors.modeMenuItem} >> visible=true`);
+    await items.first().waitFor({ timeout: 10_000 }).catch(() => {
+      throw new Error("Model picker didn't open — recalibrate selectors.modePicker/modeMenuItem.");
+    });
+    const entry = items.filter({ hasText: THINKING_LEVEL_MENU.entry }).first();
+    if ((await entry.count()) === 0) {
+      await page.keyboard.press("Escape").catch(() => {});
+      throw new Error("This model picker has no Thinking level setting.");
+    }
+    // Hovering opens the submenu without committing anything.
+    await entry.hover();
+    const levelItems = page.locator(`${selectors.modeMenuItem} >> visible=true`);
+    const deadline = Date.now() + 5_000;
+    let found: { level: ThinkingLevel; item: Locator; selected: boolean }[] = [];
+    while (Date.now() < deadline && found.length < THINKING_LEVELS.length) {
+      found = [];
+      const count = await levelItems.count();
+      for (let i = 0; i < count; i++) {
+        const item = levelItems.nth(i);
+        const text = (await item.innerText().catch(() => "")).trim();
+        const match = THINKING_LEVELS.find((l) => THINKING_LEVEL_MENU.item(l, text));
+        if (match) found.push({ level: match, item, selected: (await menuItemState(item)).selected });
+      }
+      if (found.length < THINKING_LEVELS.length) await page.waitForTimeout(200);
+    }
+    if (!found.length) {
+      await page.keyboard.press("Escape").catch(() => {});
+      throw new Error("The Thinking level submenu didn't open — recalibrate selectors.modeMenuItem.");
+    }
+    const current = found.find((f) => f.selected)?.level ?? found[0].level;
+    if (!level || level === current) {
+      await page.keyboard.press("Escape").catch(() => {});
+      await page.keyboard.press("Escape").catch(() => {});
+      return current;
+    }
+    const wanted = found.find((f) => f.level === level);
+    if (!wanted) {
+      await page.keyboard.press("Escape").catch(() => {});
+      throw new Error(`No "${level}" entry under Thinking level (saw: ${found.map((f) => f.level).join(", ")}).`);
+    }
+    await wanted.item.click();
+    await page.waitForTimeout(500);
+    return level;
   }
 
   /**
@@ -916,27 +1094,27 @@ export class GeminiDriver implements IGeminiDriver {
     // tool call, and send again — the duplicate-send bug.
     await this.waitForNewResponse(timeoutMs);
 
-    const stopButtonGone = stop
-      .waitFor({ state: "hidden", timeout: timeoutMs })
-      .catch(() => undefined);
-
-    const textStabilized = (async () => {
-      const deadline = Date.now() + timeoutMs;
-      let lastText = "";
-      let stableSince = Date.now();
-      while (Date.now() < deadline) {
-        const text = await this.peekLastResponseText().catch(() => "");
-        if (text !== lastText) {
-          lastText = text;
-          stableSince = Date.now();
-        } else if (text && Date.now() - stableSince >= debounceMs) {
-          return;
-        }
-        await page.waitForTimeout(250);
+    // BOTH signals, not a race. Measured live: the stop button disappears
+    // about a second before the rendered text stops growing, so returning
+    // on the button alone handed the agent a reply cut off mid-sentence.
+    // And an absent button counts as "hidden", so if the selector ever
+    // drifts the button alone would return the instant streaming starts.
+    // Text stability is the backstop for that; the button keeps us waiting
+    // through a long pause in the stream (a thinking phase, say).
+    const deadline = Date.now() + timeoutMs;
+    let lastText = "";
+    let stableSince = Date.now();
+    while (Date.now() < deadline) {
+      const text = await this.peekLastResponseText().catch(() => "");
+      if (text !== lastText) {
+        lastText = text;
+        stableSince = Date.now();
       }
-    })();
-
-    await Promise.race([stopButtonGone, textStabilized]);
+      const generating = await stop.isVisible().catch(() => false);
+      if (!generating && text && Date.now() - stableSince >= debounceMs) return;
+      await page.waitForTimeout(250);
+    }
+    throw new Error(`Gemini was still generating after ${Math.round(timeoutMs / 1000)}s.`);
   }
 
   /**

@@ -24,7 +24,7 @@ import { listFilesTool } from "../tools/listFiles.js";
 import { bashTool, checkOutputTool, killProcessTool, looksLongRunning, resolveShell } from "../tools/bash.js";
 import { fetchUrlTool } from "../tools/fetchUrl.js";
 import { webSearchTool, parseResults } from "../tools/webSearch.js";
-import { resolveModel, modelWithFallbacks, DEFAULT_MODEL_ALIAS, EXTENDED_THINKING } from "../driver/models.js";
+import { resolveModel, modelWithFallbacks, resolveThinkingLevel, THINKING_LEVEL_MENU, DEFAULT_MODEL_ALIAS, EXTENDED_THINKING } from "../driver/models.js";
 import { resolveGem } from "../driver/GeminiDriver.js";
 import { createAskGemTool } from "../tools/askGem.js";
 import { gemFlag, gemModeFlag, serveArgs } from "../args.js";
@@ -1367,7 +1367,20 @@ async function main() {
     assert.ok(!thinking.matches("Extended thinking"));
     assert.ok(!resolveModel("pro")!.matches("3.8 Thinking\nComplex problem solving"), "pro's blurb rule must not steal Thinking");
     assert.ok(!EXTENDED_THINKING.matches("3.8 Thinking\nReasons before answering"), "the toggle must not click the Thinking model");
-    assert.deepEqual(modelWithFallbacks(thinking).map((m) => m.name), ["Thinking", "Pro", "Flash"]);
+    assert.deepEqual(modelWithFallbacks(thinking).map((m) => m.name), ["Thinking", "Auto", "Pro", "Flash"]);
+    // The 2026 picker seen live: Auto / 3.1 Pro / 4 Argon / a "Thinking level" submenu.
+    assert.ok(!thinking.matches("Thinking level"), "the submenu entry is a setting, not the Thinking model");
+    assert.ok(!EXTENDED_THINKING.matches("Thinking level"));
+    assert.equal(resolveModel("auto")?.name, "Auto");
+    assert.ok(resolveModel("auto")!.matches("Auto\nGemini 3 models"));
+    assert.ok(resolveModel("argon")!.matches("4 Argon\nComplex tasks"));
+    assert.ok(!resolveModel("pro")!.matches("4 Argon\nComplex tasks"));
+    assert.equal(resolveThinkingLevel("High"), "high");
+    assert.equal(resolveThinkingLevel("med"), "medium");
+    assert.equal(resolveThinkingLevel(undefined), undefined);
+    assert.equal(resolveThinkingLevel("nope"), undefined);
+    assert.ok(THINKING_LEVEL_MENU.item("high", "High\nExtra thorough"));
+    assert.ok(!THINKING_LEVEL_MENU.item("low", "Low-latency mode"));
   });
 
   await test("matches live menu labels despite version-number drift", () => {

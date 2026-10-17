@@ -17,8 +17,9 @@ import path from "node:path";
 
 /** Friendly key -> environment variable it sets. */
 export const CONFIG_KEYS: Record<string, { env: string; hint: string }> = {
-  model: { env: "GEMINI_CODE_MODEL", hint: "thinking (default) | fast | fastest | pro" },
-  thinking: { env: "GEMINI_CODE_THINKING", hint: "on | off — the Extended thinking toggle on top of the model" },
+  model: { env: "GEMINI_CODE_MODEL", hint: "thinking (default) | auto | fast | fastest | pro | argon, or a picker label like \"3.8 Thinking\"" },
+  thinkingLevel: { env: "GEMINI_CODE_THINKING_LEVEL", hint: "low | medium | high (default) — the picker's Thinking level submenu" },
+  thinking: { env: "GEMINI_CODE_THINKING", hint: "on | off — the Extended thinking toggle, where the picker has one" },
   workers: { env: "GEMINI_CODE_MAX_WORKERS", hint: "parallel worker tabs (default 3)" },
   orchestrator: { env: "GEMINI_CODE_ORCHESTRATOR", hint: "true (default) | false — one tab does everything when false" },
   autoApprove: { env: "GEMINI_CODE_AUTO_APPROVE", hint: "true | false (default) — skip y/N confirmations" },
