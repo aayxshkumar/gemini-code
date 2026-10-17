@@ -38,10 +38,17 @@ $chromePaths = @(
   "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
   "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
 )
+$edgePaths = @(
+  "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+  "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+  "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe"
+)
 if ($chromePaths | Where-Object { Test-Path $_ }) {
   Write-Ok "Google Chrome"
+} elseif ($edgePaths | Where-Object { Test-Path $_ }) {
+  Write-Ok "Microsoft Edge (used in place of Chrome - same engine)"
 } else {
-  Write-Warn "Google Chrome not found - install it before running: https://google.com/chrome"
+  Write-Warn "Neither Google Chrome nor Microsoft Edge found - install one before running"
 }
 
 # ---------------------------------------------------------------- install
@@ -111,7 +118,7 @@ Write-Host "Next steps" -ForegroundColor Cyan
 Write-Host "  1. Open a NEW terminal (so the PATH change applies)"
 Write-Host "  2. cd into any project"
 Write-Host "  3. run: gemini-code"
-Write-Host "  4. Chrome opens - sign in to Gemini by hand the first time (just once)"
+Write-Host "  4. Your browser (Chrome or Edge) opens - sign in to Gemini by hand the first time (just once)"
 Write-Host "     defaults: gemini-code config set model pro   (3.8 Thinking is the default)"
 Write-Host ""
 Write-Host "  Docs: https://github.com/$Repo"
