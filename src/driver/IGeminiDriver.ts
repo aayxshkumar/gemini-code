@@ -29,4 +29,26 @@ export interface IGeminiDriver {
   getLastResponse(): Promise<GeminiResponse>;
   /** Starts a fresh thread. Optional: fakes in tests may not implement it. */
   newConversation?(): Promise<void>;
+
+  // --- Recovery surface. All optional: the fake driver in tests implements
+  // only what a given test exercises, and the loop degrades gracefully.
+
+  /** Clicks "Stop" if Gemini is still generating. */
+  stopGenerating?(): Promise<boolean>;
+  /** Is the tab and its browser connection still usable? */
+  isAlive?(): Promise<boolean>;
+  /**
+   * After the tab, the CDP connection or Chrome itself went away: get a
+   * usable tab again (reattach or relaunch). The THREAD is lost — the
+   * caller re-primes. Returns false when it couldn't.
+   */
+  recover?(log: (msg: string) => void): Promise<boolean>;
+  /** navigator.onLine is false in the tab. */
+  isOffline?(): Promise<boolean>;
+  /** Waits for the tab to be online again; false if it never came back. */
+  waitForOnline?(maxMs: number, log: (msg: string) => void): Promise<boolean>;
+  /** Signed in? (the sign-in button is NOT showing) */
+  isLoggedIn?(): Promise<boolean>;
+  /** Blocks until signed in (interactive) or throws (unattended). */
+  ensureLoggedIn?(): Promise<void>;
 }

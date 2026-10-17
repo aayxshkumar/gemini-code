@@ -2,7 +2,7 @@ import { mkdir, writeFile, rm, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { IGeminiDriver } from "../driver/IGeminiDriver.js";
 import { tools } from "../tools/index.js";
-import type { ToolDefinition } from "../types.js";
+import type { ToolDefinition, ToolResult } from "../types.js";
 import {
   buildSystemPrimer,
   buildContextDocument,
@@ -11,7 +11,13 @@ import {
   type PrimerContext,
   type AgentRole,
 } from "./promptTemplate.js";
-import { parseGeminiReply, looksLikeAbandonedWork, looksUnfinished, looksLikeGeminiError } from "./toolCallParser.js";
+import {
+  parseGeminiReply,
+  looksLikeAbandonedWork,
+  looksUnfinished,
+  looksLikeGeminiError,
+  looksLikeUnseenAttachment,
+} from "./toolCallParser.js";
 import { toolCallLine, toolResultLine, noteLine } from "../ui/format.js";
 import { forgetAll } from "../tools/fileState.js";
 import { missingCitedPaths } from "./citations.js";
@@ -100,6 +106,49 @@ const COMPACT_TURNS = Math.max(0, Number(process.env.GEMINI_CODE_COMPACT_TURNS ?
 /** Transient driver failures (send/response) are retried this many times. */
 const TURN_RETRIES = Math.max(0, Number(process.env.GEMINI_CODE_TURN_RETRIES ?? 2));
 
+/**
+ * No single tool call may block the loop for longer than this. A foreground
+ * command has its own shorter timeout; this is the backstop for everything
+ * else (a browser page that never settles, a network call with no timeout,
+ * a worker pool that wedged). The call keeps running in the background;
+ * the model just gets an error and moves on.
+ */
+const toolTimeoutMs = () => Math.max(1_000, Number(process.env.GEMINI_CODE_TOOL_TIMEOUT_MS ?? 600_000));
+
+/**
+ * After this many consecutive READ-ONLY calls the model is reminded that
+ * exploring is not the task. Generous: a big codebase legitimately needs a
+ * lot of reading. 0 disables.
+ */
+const exploreNudgeTurns = () => Math.max(0, Number(process.env.GEMINI_CODE_EXPLORE_NUDGE_TURNS ?? 20));
+
+/** Hard wall-clock cap on one task, in minutes. 0 = none (the turn limit still applies). */
+const taskTimeoutMin = () => Math.max(0, Number(process.env.GEMINI_CODE_TASK_TIMEOUT_MIN ?? 0));
+
+/** How long to wait for the network to come back before giving up a turn. */
+const OFFLINE_WAIT_MS = Math.max(0, Number(process.env.GEMINI_CODE_OFFLINE_WAIT_MS ?? 5 * 60_000));
+
+/** Tools that only look. Used by the exploring-forever nudge. */
+const READ_ONLY_TOOLS = new Set([
+  "read_file", "search_code", "find_files", "list_files", "git_status", "git_diff", "check_output",
+  "web_search", "fetch_url", "read_page", "browser_open", "browser_do", "browser_close", "screenshot_page",
+  "ask_gem", "update_plan",
+]);
+
+/** Thrown inside exchange() when the tab was lost and replaced: the thread must be re-primed. */
+class ThreadLostError extends Error {
+  constructor() {
+    super("the Gemini tab was lost and replaced; the thread needs re-priming");
+  }
+}
+
+/** Thrown when the user cancelled the task (Ctrl+C once). */
+export class TaskCancelledError extends Error {
+  constructor() {
+    super("cancelled by the user");
+  }
+}
+
 export interface RunTaskOptions {
   onEvent?: (msg: string) => void;
   /**
@@ -110,6 +159,12 @@ export interface RunTaskOptions {
   getSteering?: () => string[];
   /** Images/files the user attached to this task (e.g. a pasted screenshot). */
   attachments?: string[];
+  /**
+   * Aborting this cancels the task at the next safe point: between turns,
+   * or mid-wait (generation is stopped). The journal is marked interrupted
+   * so the next task can resume.
+   */
+  cancelSignal?: AbortSignal;
 }
 
 export class AgentSession {
@@ -157,7 +212,16 @@ export class AgentSession {
     let idleNudges = 0;
     let citationNudges = 0;
     let geminiErrorRetries = 0;
+    let attachmentResends = 0;
     let toolCallsMade = 0;
+    const taskStartedAt = Date.now();
+    // Loop detection: the last few call signatures, and how many read-only
+    // calls in a row.
+    const recentCalls: string[] = [];
+    let repeatNoted = "";
+    let readOnlyStreak = 0;
+    let exploreNoted = false;
+    const cancelled = () => options.cancelSignal?.aborted === true;
     // Progress tracking, so a task that is stuck can be told so instead of
     // quietly repeating itself until the turn limit.
     let turnsSinceProgress = 0;
@@ -176,6 +240,16 @@ export class AgentSession {
     }
 
     for (let turn = 0; turn < MAX_TOOL_TURNS_PER_TASK; turn++) {
+      if (cancelled()) {
+        await this.journal?.markInterrupted("cancelled by the user");
+        return "(Cancelled. The plan was journalled; your next task can continue it.)";
+      }
+      const limitMin = taskTimeoutMin();
+      if (limitMin > 0 && Date.now() - taskStartedAt > limitMin * 60_000) {
+        await this.journal?.markInterrupted(`hit the ${limitMin}-minute task limit`);
+        return `(Stopped: this task ran for more than ${limitMin} minutes (GEMINI_CODE_TASK_TIMEOUT_MIN). The plan was journalled; asking me to continue picks it up.)`;
+      }
+
       // Fold in anything the user typed since the last turn, so they can
       // steer a running task rather than wait for it to finish.
       const steering = options.getSteering?.() ?? [];
@@ -207,7 +281,55 @@ export class AgentSession {
         }
       }
 
-      const reply = await this.exchange(message, attachFile, log);
+      let reply;
+      try {
+        reply = await this.exchange(message, attachFile, log, options.cancelSignal);
+      } catch (err) {
+        if (err instanceof TaskCancelledError) {
+          await this.journal?.markInterrupted("cancelled by the user");
+          return "(Cancelled. The plan was journalled; your next task can continue it.)";
+        }
+        if (err instanceof ThreadLostError) {
+          // The tab is back but the conversation isn't. Re-prime from the
+          // journal and resend the message that was in flight.
+          log(noteLine("thread lost — re-priming a fresh thread from the journal and resending"));
+          await this.journal?.log("thread lost: re-primed from the journal");
+          this.context.handoff = this.journal?.summaryForHandoff() ?? this.context.handoff;
+          forgetAll();
+          this.primed = false;
+          this.exchanges = 0;
+          const primed = await this.buildPrimedMessage(
+            `CONTINUE the task below — it was in progress when the browser tab was lost; the handoff in the ` +
+              `context says where it got to.\n\nORIGINAL TASK:\n${userTask}\n\nThe message that was about to be ` +
+              `sent (a tool result or instruction) was:\n${message}`,
+            log
+          );
+          message = primed.message;
+          attachFile = primed.attach ? [...attachFile, primed.attach] : attachFile;
+          continue;
+        }
+        throw err;
+      }
+
+      // The model says it can't see what we attached: send it inline.
+      if (attachFile.length && attachmentResends < 2 && looksLikeUnseenAttachment(reply)) {
+        attachmentResends++;
+        log(noteLine(`Gemini says it can't see the attachment — resending the content inline (${attachmentResends}/2)`));
+        await this.journal?.log("attachment not seen: resent inline");
+        const parts: string[] = [];
+        for (const file of attachFile) {
+          const text = await readFile(file, "utf8").catch(() => "");
+          if (!text) continue;
+          const cap = 12_000;
+          parts.push(`===== ${path.basename(file)} =====\n${text.slice(0, cap)}${text.length > cap ? `\n[truncated after ${cap} of ${text.length} characters — ask for a specific part if you need more]` : ""}`);
+        }
+        await this.cleanupAttachments(attachFile);
+        attachFile = [];
+        message =
+          `The attachment didn't reach you, so here is its content inline. Continue with the task using this:\n\n` +
+          (parts.join("\n\n") || "(the file was binary or empty — proceed without it)");
+        continue;
+      }
 
       // "I encountered an error doing what you asked" is Gemini failing, not
       // answering. Re-send the same message (attachments included — they are
@@ -314,11 +436,50 @@ export class AgentSession {
         toolCallsMade++;
         log(toolCallLine(name, args));
         const tool = this.toolsByName[name];
-        const result = tool
-          ? await tool.run(args)
+        const result: ToolResult = tool
+          ? await this.runWithWatchdog(tool, args)
           : { ok: false, output: `Error: unknown tool "${name}". Available: ${Object.keys(this.toolsByName).join(", ")}` };
 
         log(toolResultLine(result.ok, result.output));
+
+        // Loop detection. Two shapes seen in long runs: the same call with
+        // the same args over and over (re-reading a file it already has),
+        // and ping-pong between two calls. Say so once per streak, inside
+        // the result, so the model can't miss it.
+        const signature = `${name}:${JSON.stringify(args).slice(0, 400)}`;
+        recentCalls.push(signature);
+        if (recentCalls.length > 6) recentCalls.shift();
+        const n = recentCalls.length;
+        const identical = n >= 3 && recentCalls.slice(-3).every((c) => c === signature);
+        const pingPong =
+          n >= 4 && recentCalls[n - 1] === recentCalls[n - 3] && recentCalls[n - 2] === recentCalls[n - 4] && recentCalls[n - 1] !== recentCalls[n - 2];
+        const streakKey = identical ? `same:${signature}` : pingPong ? `pingpong:${recentCalls[n - 1]}|${recentCalls[n - 2]}` : "";
+        if (streakKey && streakKey !== repeatNoted && result.ok) {
+          repeatNoted = streakKey;
+          log(noteLine(identical ? "same call three times in a row — pointing it out" : "alternating between two calls — pointing it out"));
+          await this.journal?.log(`loop detected: ${identical ? "identical call x3" : "ping-pong"} (${name})`);
+          result.output +=
+            `\n\n[NOTE: ${identical ? `this is the third identical ${name} call in a row, and the result has not changed` : `you are alternating between the same two calls`}. ` +
+            `You already have this information. Use it to take the next real step — an edit, a command, or your final answer — ` +
+            `or, if you are stuck, say what is blocking you.]`;
+        } else if (!streakKey) {
+          repeatNoted = "";
+        }
+
+        // Exploring forever is its own kind of stall.
+        if (READ_ONLY_TOOLS.has(name)) readOnlyStreak++;
+        else {
+          readOnlyStreak = 0;
+          exploreNoted = false;
+        }
+        if (exploreNudgeTurns() > 0 && readOnlyStreak >= exploreNudgeTurns() && !exploreNoted) {
+          exploreNoted = true;
+          log(noteLine(`${readOnlyStreak} read-only calls in a row — asking it to act or report`));
+          await this.journal?.log(`explore nudge after ${readOnlyStreak} read-only calls`);
+          result.output +=
+            `\n\n[NOTE: that is ${readOnlyStreak} consecutive read-only calls. If you now have what you need, make the ` +
+            `change. If the task only needed an answer, give it. If something blocks you, say exactly what.]`;
+        }
 
         if (result.ok) {
           turnsSinceProgress = 0;
@@ -389,6 +550,32 @@ export class AgentSession {
       `The plan was journalled, so asking me to continue picks up where it left off. ` +
       `If this keeps happening on the same step, that step is looping rather than progressing.)`
     );
+  }
+
+  /** Runs a tool with a hard timeout, so one wedged call can't stall the loop. */
+  private async runWithWatchdog(tool: ToolDefinition, args: Record<string, unknown>): Promise<ToolResult> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<ToolResult>((resolve) => {
+      timer = setTimeout(
+        () =>
+          resolve({
+            ok: false,
+            output:
+              `Error: ${tool.name} did not finish within ${Math.round(toolTimeoutMs() / 1000)}s and was abandoned. ` +
+              `If it was a long-running command, run it with background: true and read it with check_output; ` +
+              `otherwise try a narrower call.`,
+          }),
+        toolTimeoutMs()
+      );
+    });
+    try {
+      return await Promise.race([
+        tool.run(args).catch((err): ToolResult => ({ ok: false, output: `Error: ${tool.name} threw: ${(err as Error).message}` })),
+        timeout,
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /** The first message of a thread: rules inline, knowledge attached when big. */
@@ -479,7 +666,8 @@ export class AgentSession {
   private async exchange(
     message: string,
     attachFile: string[],
-    log: (msg: string) => void
+    log: (msg: string) => void,
+    cancelSignal?: AbortSignal
   ) {
     let lastError: Error | undefined;
 
@@ -492,42 +680,102 @@ export class AgentSession {
         `The COMPLETE message, including everything cut here, is ATTACHED as "${path.basename(file)}" — read it before acting.]`;
     }
 
+    // Cancellation can arrive while we wait minutes for a reply: race the
+    // wait against it, and stop the generation so the tab is reusable.
+    let onAbort: (() => void) | undefined;
+    const cancelled = new Promise<never>((_, reject) => {
+      if (!cancelSignal) return;
+      if (cancelSignal.aborted) reject(new TaskCancelledError());
+      onAbort = () => reject(new TaskCancelledError());
+      cancelSignal.addEventListener("abort", onAbort, { once: true });
+    });
+    // Promise.race observes the rejection, so no unhandled rejection; but the
+    // listener must not pile up turn after turn on one signal.
+    const detach = () => {
+      if (cancelSignal && onAbort) cancelSignal.removeEventListener("abort", onAbort);
+    };
+
+    // Attempts that hit a recoverable environment problem (offline, signed
+    // out) don't count against the retry budget — they aren't Gemini's fault.
+    let environmentPauses = 0;
     for (let attempt = 0; attempt <= TURN_RETRIES; attempt++) {
       try {
-        if (attachFile.length && attempt === 0) {
-          try {
-            await this.driver.sendPrompt(message, { attachFile });
-          } catch (err) {
-            // Uploading is best-effort: fall back to pasting a truncated
-            // version rather than killing the task. Losing some context
-            // beats losing the run.
-            log(noteLine(`attachment failed (${(err as Error).message.split("\n")[0]}) — pasting truncated text instead`));
-            const inlineFallback = await readFile(attachFile[0], "utf8").catch(() => "");
-            // The message above already told Gemini to read an attachment
-            // that isn't there. Say plainly that it doesn't exist, or the
-            // reply is "I can't see any attachment" and the task stalls
-            // re-asking for it.
-            await this.driver.sendPrompt(
-              `${message}\n\nCORRECTION: that attachment FAILED to upload — there is no file to open, ` +
-                `so ignore the instruction to read one. The content itself follows inline:\n\n` +
-                inlineFallback.slice(0, MAX_INLINE_RESULT_CHARS) +
-                (inlineFallback.length > MAX_INLINE_RESULT_CHARS ? "\n\n[truncated]" : "")
-            );
+        const send = async () => {
+          if (attachFile.length && attempt === 0) {
+            try {
+              await this.driver.sendPrompt(message, { attachFile });
+            } catch (err) {
+              // Uploading is best-effort: fall back to pasting a truncated
+              // version rather than killing the task. Losing some context
+              // beats losing the run.
+              log(noteLine(`attachment failed (${(err as Error).message.split("\n")[0]}) — pasting truncated text instead`));
+              const inlineFallback = await readFile(attachFile[0], "utf8").catch(() => "");
+              await this.driver.sendPrompt(
+                `${message}\n\nCORRECTION: that attachment FAILED to upload — there is no file to open, ` +
+                  `so ignore the instruction to read one. The content itself follows inline:\n\n` +
+                  inlineFallback.slice(0, MAX_INLINE_RESULT_CHARS) +
+                  (inlineFallback.length > MAX_INLINE_RESULT_CHARS ? "\n\n[truncated]" : "")
+              );
+            }
+          } else {
+            // Retries re-send as plain text: if the upload already landed it's
+            // still in the thread, and re-uploading would just duplicate it.
+            await this.driver.sendPrompt(message);
           }
-        } else {
-          // Retries re-send as plain text: if the upload already landed it's
-          // still in the thread, and re-uploading would just duplicate it.
-          await this.driver.sendPrompt(message);
+          await this.driver.waitForResponseComplete();
+          this.exchanges++;
+          return await this.driver.getLastResponse();
+        };
+        const reply = await (cancelSignal ? Promise.race([send(), cancelled]) : send());
+        detach();
+        return reply;
+      } catch (err) {
+        detach();
+        if (err instanceof TaskCancelledError) {
+          await this.driver.stopGenerating?.().catch(() => false);
+          throw err;
+        }
+        lastError = err as Error;
+        const first = lastError.message.split("\n")[0];
+
+        // Is the tab even there any more? Closed tab, crashed renderer,
+        // dropped CDP connection, Chrome quit.
+        const alive = this.driver.isAlive ? await this.driver.isAlive().catch(() => false) : true;
+        if (!alive) {
+          log(noteLine(`the browser tab is gone (${first}) — recovering`));
+          await this.journal?.log(`browser tab lost: ${first}`);
+          const recovered = this.driver.recover ? await this.driver.recover(log) : false;
+          if (recovered) throw new ThreadLostError();
+          throw new Error(`Lost the browser and couldn't get it back: ${first}. Start Chrome (gemini-code open-chrome) and run the task again; the plan was journalled.`);
         }
 
-        await this.driver.waitForResponseComplete();
-        this.exchanges++;
-        return await this.driver.getLastResponse();
-      } catch (err) {
-        lastError = err as Error;
+        // Offline: wait for the network rather than burning retries.
+        if (environmentPauses < 3 && this.driver.isOffline && (await this.driver.isOffline().catch(() => false))) {
+          environmentPauses++;
+          log(noteLine("the browser is offline — waiting for the network to come back"));
+          const back = this.driver.waitForOnline ? await this.driver.waitForOnline(OFFLINE_WAIT_MS, log) : false;
+          if (!back) throw new Error(`Still offline after ${Math.round(OFFLINE_WAIT_MS / 60_000)} minutes. The plan was journalled; run the task again when the network is back.`);
+          attempt--;
+          continue;
+        }
+
+        // Signed out mid-task (session expiry): the interactive path brings
+        // the window up and waits; unattended it throws a clear message.
+        if (environmentPauses < 3 && this.driver.isLoggedIn && !(await this.driver.isLoggedIn().catch(() => true))) {
+          environmentPauses++;
+          log(noteLine("the Gemini session is signed out — waiting for sign-in"));
+          await this.journal?.log("signed out mid-task");
+          await this.driver.ensureLoggedIn?.();
+          attempt--;
+          continue;
+        }
+
         if (attempt < TURN_RETRIES) {
-          log(noteLine(`no reply (${lastError.message.split("\n")[0]}) — resending, attempt ${attempt + 2}/${TURN_RETRIES + 1}`));
-          await this.journal?.log(`retrying turn: ${lastError.message.split("\n")[0]}`);
+          // A reply that never finished is the common case: stop it so the
+          // composer is usable, then resend.
+          const stopped = await this.driver.stopGenerating?.().catch(() => false);
+          log(noteLine(`no reply (${first})${stopped ? " — stopped the stuck generation" : ""} — resending, attempt ${attempt + 2}/${TURN_RETRIES + 1}`));
+          await this.journal?.log(`retrying turn: ${first}`);
           await new Promise((r) => setTimeout(r, 3_000 * (attempt + 1)));
         }
       }

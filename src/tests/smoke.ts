@@ -13,7 +13,9 @@ import path from "node:path";
 import { parseGeminiReply, looksLikeAbandonedWork, looksUnfinished, looksLikeGeminiError } from "../agent/toolCallParser.js";
 import { formatToolResult, buildContextDocument, buildSystemPrimer } from "../agent/promptTemplate.js";
 import { AgentSession } from "../agent/loop.js";
+import { looksLikeUnseenAttachment } from "../agent/toolCallParser.js";
 import type { IGeminiDriver, GeminiResponse } from "../driver/IGeminiDriver.js";
+import type { ToolDefinition } from "../types.js";
 import { readFileTool } from "../tools/readFile.js";
 import { editFileTool } from "../tools/editFile.js";
 import { searchCodeTool, globToRegExp } from "../tools/searchCode.js";
@@ -91,14 +93,14 @@ function finalResponse(text: string): GeminiResponse {
 // --- A fake driver that stands in for a real Gemini web session ---------
 class FakeDriver implements IGeminiDriver {
   public sentMessages: string[] = [];
-  public attachedFiles: (string | undefined)[] = [];
+  public attachedFiles: (string | string[] | undefined)[] = [];
   private replies: GeminiResponse[];
 
   constructor(scriptedReplies: GeminiResponse[]) {
     this.replies = [...scriptedReplies];
   }
 
-  async sendPrompt(text: string, opts?: { attachFile?: string }): Promise<void> {
+  async sendPrompt(text: string, opts?: { attachFile?: string | string[] }): Promise<void> {
     this.sentMessages.push(text);
     this.attachedFiles.push(opts?.attachFile);
   }
@@ -146,6 +148,156 @@ async function main() {
     });
     assert.equal(result.kind, "tool_call");
     if (result.kind === "tool_call") assert.equal(result.call.name, "run_bash");
+  });
+
+  console.log("Stalls and edge cases:");
+  await test("the same call three times in a row, and ping-pong, are pointed out inside the result", async () => {
+    const f = path.join(".tmp-test", "loop.txt");
+    await writeFile(f, "hello\n", "utf8");
+    const same = toolCallResponse("read_file", { path: f });
+    const other = toolCallResponse("list_files", {});
+    const driver = new FakeDriver([same, same, same, same, other, same, other, same, finalResponse("done")]);
+    await new AgentSession(driver).runTask("loop");
+    const notes = driver.sentMessages.filter((m) => /third identical read_file call/.test(m));
+    assert.equal(notes.length, 1, "noted once per streak, not on every repeat");
+    assert.ok(driver.sentMessages.some((m) => /alternating between the same two calls/.test(m)), "ping-pong noted");
+  });
+
+  await test("a tool that never returns is abandoned by the watchdog", async () => {
+    process.env.GEMINI_CODE_TOOL_TIMEOUT_MS = "1000";
+    try {
+      const hang: ToolDefinition = { name: "hang", description: "hang()", run: () => new Promise(() => {}) };
+      const driver = new FakeDriver([toolCallResponse("hang", {}), finalResponse("ok")]);
+      const t0 = Date.now();
+      await new AgentSession(driver, {}, [hang]).runTask("hang");
+      assert.ok(Date.now() - t0 < 5_000, "didn't wait forever");
+      assert.match(driver.sentMessages[1], /did not finish within 1s and was abandoned/);
+    } finally {
+      delete process.env.GEMINI_CODE_TOOL_TIMEOUT_MS;
+    }
+  });
+
+  await test("exploring forever gets a nudge after N read-only calls", async () => {
+    process.env.GEMINI_CODE_EXPLORE_NUDGE_TURNS = "3";
+    try {
+      const driver = new FakeDriver([
+        toolCallResponse("list_files", {}),
+        toolCallResponse("git_status", {}),
+        toolCallResponse("list_files", { path: "src" }),
+        toolCallResponse("git_status", {}),
+        finalResponse("done"),
+      ]);
+      await new AgentSession(driver).runTask("explore");
+      const nudges = driver.sentMessages.filter((m) => /consecutive read-only calls/.test(m));
+      assert.equal(nudges.length, 1);
+      assert.match(nudges[0], /3 consecutive/);
+    } finally {
+      delete process.env.GEMINI_CODE_EXPLORE_NUDGE_TURNS;
+    }
+  });
+
+  await test("cancelling stops the task at the next safe point and journals it", async () => {
+    const ac = new AbortController();
+    const slow: ToolDefinition = {
+      name: "slow",
+      description: "slow()",
+      run: async () => {
+        ac.abort(); // the user hits Ctrl+C while a tool runs
+        return { ok: true, output: "did a thing" };
+      },
+    };
+    const driver = new FakeDriver([toolCallResponse("slow", {}), finalResponse("never reached")]);
+    const answer = await new AgentSession(driver, {}, [slow]).runTask("x", { cancelSignal: ac.signal });
+    assert.match(answer, /Cancelled/);
+    assert.equal(driver.sentMessages.length, 1, "the tool result was not sent after cancellation");
+  });
+
+  await test("when Gemini says it can't see the attachment, the content is resent inline", async () => {
+    const big = "line\n".repeat(2_000); // > 4,000 chars -> attached
+    const bigTool: ToolDefinition = { name: "big", description: "big()", run: async () => ({ ok: true, output: big }) };
+    assert.ok(looksLikeUnseenAttachment(finalResponse("I can't see the attached file. Could you upload it again?")));
+    assert.ok(!looksLikeUnseenAttachment(finalResponse("The file is attached to the ticket; I read it and here is the fix.")));
+    const driver = new FakeDriver([
+      toolCallResponse("big", {}),
+      finalResponse("I'm unable to open the attachment you mentioned."),
+      finalResponse("Got it, thanks."),
+    ]);
+    await new AgentSession(driver, {}, [bigTool]).runTask("x");
+    assert.ok(driver.attachedFiles[1], "first the result was attached");
+    assert.match(driver.sentMessages[2], /didn't reach you, so here is its content inline/);
+    assert.match(driver.sentMessages[2], /line\nline/);
+  });
+
+  await test("a lost tab is recovered and the thread re-primed from the journal", async () => {
+    const f = path.join(".tmp-test", "recover.txt");
+    await writeFile(f, "x\n", "utf8");
+    let dead = true;
+    let recovered = 0;
+    const base = new FakeDriver([toolCallResponse("read_file", { path: f }), finalResponse("finished")]);
+    const driver: IGeminiDriver = {
+      async sendPrompt(text, opts) {
+        if (dead) throw new Error("Target page, context or browser has been closed");
+        return base.sendPrompt(text, opts);
+      },
+      waitForResponseComplete: () => base.waitForResponseComplete(),
+      getLastResponse: () => base.getLastResponse(),
+      isAlive: async () => !dead,
+      recover: async () => {
+        recovered++;
+        dead = false;
+        return true;
+      },
+      newConversation: async () => {},
+    };
+    const journal = new PlanJournal(".tmp-test");
+    const session = new AgentSession(driver, { tree: "t" }, [], journal);
+    // Prime the thread first so the loss happens mid-task.
+    const answer = await session.runTask("read the file and finish");
+    assert.equal(answer, "finished");
+    assert.equal(recovered, 1);
+    assert.match(base.sentMessages[0], /HANDOFF FROM YOUR PREVIOUS CONTEXT|from the journal/, "re-primed with a handoff");
+    assert.match(base.sentMessages[0], /CONTINUE the task below/);
+  });
+
+  await test("offline and signed-out pauses don't consume retries", async () => {
+    let offline = true;
+    let signedOut = true;
+    const base = new FakeDriver([finalResponse("back online")]);
+    let sends = 0;
+    const driver: IGeminiDriver = {
+      async sendPrompt(text, opts) {
+        sends++;
+        if (offline) throw new Error("net::ERR_INTERNET_DISCONNECTED");
+        if (signedOut) throw new Error("composer not found");
+        return base.sendPrompt(text, opts);
+      },
+      waitForResponseComplete: () => base.waitForResponseComplete(),
+      getLastResponse: () => base.getLastResponse(),
+      isAlive: async () => true,
+      isOffline: async () => offline,
+      waitForOnline: async () => {
+        offline = false;
+        return true;
+      },
+      isLoggedIn: async () => !signedOut,
+      ensureLoggedIn: async () => {
+        signedOut = false;
+      },
+    };
+    const answer = await new AgentSession(driver).runTask("hi");
+    assert.equal(answer, "back online");
+    assert.equal(sends, 3, "two environment pauses, then success");
+  });
+
+  await test("the journal can describe the task on its own for a handoff", async () => {
+    const j = new PlanJournal(".tmp-test");
+    await j.begin("build the thing");
+    await j.setSteps([{ title: "a", done: true }, { title: "b", done: false }]);
+    await j.log("write_file(x.py) -> ok");
+    const note = j.summaryForHandoff()!;
+    assert.match(note, /## Goal\nbuild the thing/);
+    assert.match(note, /\[x\] a[\s\S]*\[ \] b/);
+    assert.match(note, /write_file\(x\.py\)/);
   });
 
   await test("recognises Gemini's own error replies, and nothing else", () => {

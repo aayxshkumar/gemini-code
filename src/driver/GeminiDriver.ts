@@ -505,6 +505,83 @@ export class GeminiDriver implements IGeminiDriver {
     await page.evaluate(script).catch(() => undefined);
   }
 
+  /** Clicks "Stop" if Gemini is still generating. True if it was. */
+  async stopGenerating(): Promise<boolean> {
+    const page = this.page;
+    if (!page || page.isClosed()) return false;
+    const stop = page.locator(`${selectors.stopButton} >> visible=true`).first();
+    if (!(await stop.isVisible().catch(() => false))) return false;
+    await stop.click({ timeout: 3_000 }).catch(() => undefined);
+    await page.waitForTimeout(500);
+    return true;
+  }
+
+  /** Is the tab, and the browser behind it, still usable? */
+  async isAlive(): Promise<boolean> {
+    const page = this.page;
+    if (!page || page.isClosed()) return false;
+    if (this.connection && !this.connection.isConnected()) return false;
+    // A cheap round trip: fails if the renderer or the CDP session is gone.
+    return page.evaluate(() => true).then(() => true, () => false);
+  }
+
+  /** navigator.onLine as the tab sees it. */
+  async isOffline(): Promise<boolean> {
+    const page = this.page;
+    if (!page || page.isClosed()) return false;
+    return page.evaluate(() => !navigator.onLine).catch(() => false);
+  }
+
+  /** Polls until the tab reports being online again. */
+  async waitForOnline(maxMs: number, log: (msg: string) => void): Promise<boolean> {
+    const deadline = Date.now() + maxMs;
+    let lastNotice = 0;
+    while (Date.now() < deadline) {
+      if (!(await this.isOffline())) return true;
+      const waited = Math.round((deadline - Date.now()) / 1000);
+      if (Date.now() - lastNotice > 30_000) {
+        lastNotice = Date.now();
+        log(`[gemini-code] the browser is offline — waiting for the network (up to ${waited}s more)`);
+      }
+      await new Promise((r) => setTimeout(r, 2_000));
+    }
+    return false;
+  }
+
+  /**
+   * Gets a usable tab back after the current one — or Chrome, or the CDP
+   * connection — went away. Tries, in order: a new tab in the still-open
+   * browser; a fresh CDP connection to a still-running Chrome; relaunching
+   * Chrome. The conversation is gone either way; the loop re-primes from
+   * its journal. Never throws.
+   */
+  async recover(log: (msg: string) => void): Promise<boolean> {
+    try {
+      // 1. Browser still connected: just need a new tab.
+      if (this.context && this.connection?.isConnected()) {
+        log("[gemini-code] the Gemini tab was closed — opening a new one");
+        this.page = await this.context.newPage();
+        this.ownsPage = this.ownsPage; // a worker keeps owning its (new) page
+        await this.page.goto(this.homeUrl(), { waitUntil: "domcontentloaded" });
+        await this.claimTab(this.page);
+        await this.waitForAppShell();
+        if (this.temporaryChats) await this.ensureTemporaryChat();
+        return true;
+      }
+      // 2./3. Connection lost: is Chrome still there? If not, launch it.
+      const { ensureChromeRunning } = await import("../scripts/openChrome.js");
+      log("[gemini-code] lost the connection to Chrome — reconnecting");
+      const launched = await ensureChromeRunning(log);
+      if (launched) log("[gemini-code] Chrome was gone; relaunched it (you may need to sign in again)");
+      await this.attach();
+      if (this.temporaryChats) await this.ensureTemporaryChat();
+      return true;
+    } catch (err) {
+      log(`[gemini-code] couldn't recover the browser: ${(err as Error).message.split("\n")[0]}`);
+      return false;
+    }
+  }
+
   /** Reads the currently selected model from the picker's aria-label. */
   async getCurrentModel(): Promise<string> {
     const page = this.requirePage();

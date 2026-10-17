@@ -15,6 +15,7 @@ import { buildProjectTree } from "./context/projectTree.js";
 import { collectProjectDocs, collectRootSummaryDocs, type ProjectDoc } from "./context/projectDocs.js";
 import { addRoot, extraRoots, rootsFromArgs, displayPath } from "./workspace.js";
 import { forgetAll } from "./tools/fileState.js";
+import { acquireInstanceLock, releaseInstanceLock } from "./context/lock.js";
 import { autoApproved } from "./tools/confirm.js";
 import { ensureMemoryFile, readMemory, appendMemory, MEMORY_FILENAME } from "./context/memory.js";
 import {
@@ -190,6 +191,16 @@ async function main() {
   if (launched) console.log(c.dim("Chrome is up, attaching..."));
   await driver.attach();
   await driver.ensureLoggedIn();
+
+  const lock = acquireInstanceLock();
+  if (lock.other) {
+    console.log(
+      c.yellow(
+        `Another gemini-code (pid ${lock.other.pid}, since ${lock.other.since.slice(11, 19)}) is already running in this ` +
+          `project. Both will write GEMINI-PLAN.md and take checkpoints here — fine if that's intended.`
+      )
+    );
+  }
 
   // Extra workspace roots: the sibling repositories a big codebase depends on.
   for (const dir of rootsFromArgs(process.argv.slice(2))) {
@@ -392,11 +403,25 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
 
   // Leave the journal marked interrupted if we're killed mid-task, so the
   // next run knows there's work to pick up.
+  /**
+   * Ctrl+C: once cancels the running task (Gemini is told to stop, the
+   * journal is marked interrupted, the prompt comes back); twice — or with
+   * no task running — quits. Same shape as Claude Code, and the only way
+   * out of a task that is stuck without losing the session.
+   */
+  let taskAbort: AbortController | undefined;
   const onSignal = async () => {
+    if (taskAbort && !taskAbort.signal.aborted) {
+      taskAbort.abort();
+      console.log(c.yellow("\n  cancelling the task… (Ctrl+C again to quit)"));
+      await driver.stopGenerating().catch(() => false);
+      return;
+    }
     await journal.markInterrupted("session terminated");
     await gemConsultant?.close();
     // Don't leave a dev server holding its port after we're gone.
     killAllBackgroundProcesses();
+    releaseInstanceLock();
     process.exit(130);
   };
   process.on("SIGINT", onSignal);
@@ -799,8 +824,10 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
         const attachments = stagedImages;
         stagedImages = [];
         checkpoints.begin(task);
+        taskAbort = new AbortController();
         const answer = await session.runTask(task, {
           attachments,
+          cancelSignal: taskAbort.signal,
           onEvent: (msg) => console.log(msg),
           // Anything typed while the task runs steers it on the next turn,
           // rather than sitting in the queue until the task is over.
@@ -822,9 +849,11 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
             return steer;
           },
         });
+        taskAbort = undefined;
         await checkpoints.commit();
         console.log(`\n${answer}\n`);
       } catch (err) {
+        taskAbort = undefined;
         await checkpoints.commit(); // keep snapshots from a failed run too
         // One failed task shouldn't kill the whole REPL session — report it
         // and keep the prompt alive so the browser/thread stays usable.
@@ -837,6 +866,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
     await gemConsultant?.close();
     rl.close();
     killAllBackgroundProcesses();
+    releaseInstanceLock();
     await driver.close();
   }
 }
