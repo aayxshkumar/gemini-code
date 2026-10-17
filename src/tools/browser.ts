@@ -30,8 +30,8 @@ async function ensureOriginApproved(session: BrowserSession, url: string): Promi
   if (!origin || session.approvedOrigins.has(origin)) return true;
   const approved = await confirmAction(
     "Let the agent browse this site?",
-    `${origin}\n  (it will be able to click and type there, using this browser's signed-in session)`
-  );
+    `${origin}\n  (it will be able to click and type there, using this browser's signed-in session)`,
+    "network");
   if (approved) session.approvedOrigins.add(origin);
   return approved;
 }

@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ToolDefinition } from "../types.js";
+import { resolveInRoot, outsideWorkspace } from "./paths.js";
 
 const run = promisify(execFile);
 
@@ -14,9 +15,9 @@ const MAX_DIFF_CHARS = 15_000;
  * confirmation), these take model-supplied paths, and there's no reason to
  * let one of them turn into shell syntax.
  */
-async function git(args: string[]): Promise<{ ok: boolean; out: string }> {
+async function git(args: string[], cwd = process.cwd()): Promise<{ ok: boolean; out: string }> {
   try {
-    const { stdout } = await run("git", args, { cwd: process.cwd(), maxBuffer: 20 * 1024 * 1024, windowsHide: true });
+    const { stdout } = await run("git", args, { cwd, maxBuffer: 20 * 1024 * 1024, windowsHide: true });
     return { ok: true, out: stdout };
   } catch (err) {
     const e = err as { stdout?: string; stderr?: string; message: string };
@@ -33,14 +34,18 @@ function truncate(text: string): string {
 export const gitStatusTool: ToolDefinition = {
   name: "git_status",
   description:
-    `git_status() -> what's changed in the working tree: modified, added, deleted and untracked files, plus the ` +
-    `current branch. Use it to see the shape of your own changes before reviewing them in detail.`,
-  async run() {
-    const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"]);
+    `git_status(args: {cwd?: string}) -> what's changed in the working tree: modified, added, deleted and untracked files, plus the ` +
+    `current branch. Use it to see the shape of your own changes before reviewing them in detail. 'cwd' picks another ` +
+    `workspace root's repository ("../shared-lib").`,
+  async run(args) {
+    const scope = resolveInRoot(String(args?.cwd ?? ".").trim() || ".");
+    if (!scope.ok) return { ok: false, output: outsideWorkspace("inspect") };
+    const cwd = scope.abs;
+    const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
     if (!branch.ok && /not a git repository/i.test(branch.out)) {
       return { ok: false, output: "Not a git repository." };
     }
-    const status = await git(["status", "--porcelain=v1"]);
+    const status = await git(["status", "--porcelain=v1"], cwd);
     if (!status.ok) return { ok: false, output: `git status failed: ${status.out.trim()}` };
 
     const lines = status.out.trim().split("\n").filter(Boolean);
@@ -57,17 +62,21 @@ export const gitStatusTool: ToolDefinition = {
 export const gitDiffTool: ToolDefinition = {
   name: "git_diff",
   description:
-    `git_diff(args: {path?: string, staged?: boolean, stat?: boolean}) -> the diff of your changes. Use it to ` +
+    `git_diff(args: {path?: string, cwd?: string, staged?: boolean, stat?: boolean}) -> the diff of your changes. Use it to ` +
     `review what you actually changed before declaring a task done — far cheaper and more reliable than re-reading ` +
-    `whole files. 'stat' gives just the summary of files and line counts, 'path' limits it to one file or directory.`,
+    `whole files. 'stat' gives just the summary of files and line counts, 'path' limits it to one file or directory, ` +
+    `'cwd' picks another workspace root's repository.`,
   async run(args) {
+    const scope = resolveInRoot(String(args.cwd ?? ".").trim() || ".");
+    if (!scope.ok) return { ok: false, output: outsideWorkspace("inspect") };
+    const cwd = scope.abs;
     const argv = ["diff"];
     if (args.staged) argv.push("--staged");
     if (args.stat) argv.push("--stat");
     const p = typeof args.path === "string" && args.path.trim() ? args.path.trim() : undefined;
     if (p) argv.push("--", p);
 
-    const result = await git(argv);
+    const result = await git(argv, cwd);
     if (!result.ok) {
       if (/not a git repository/i.test(result.out)) return { ok: false, output: "Not a git repository." };
       return { ok: false, output: `git diff failed: ${result.out.trim()}` };

@@ -308,7 +308,28 @@ export function looksUnfinished(response: GeminiResponse): boolean {
     return false;
   }
 
-  return /\b(is|are) (currently )?(underway|in progress|ongoing)\b|\bnext steps?\b|\bi('| a)?m going to (now )?\b|\bi will (now |next )?(continue|proceed|start|begin|update|create|modify)\b|\b(remaining|still (need|to do|pending))\b|\blet me (now )?(continue|proceed)\b|\bso far[,:]/i.test(
+  return /\b(is|are) (currently )?(underway|in progress|ongoing)\b|\bnext steps?\b|\bi('| a)?m going to (now )?\b|\bi will (now |next )?(continue|proceed|start|begin|update|create|modify|verify|check|confirm)\b|\b(remaining|still (need|to do|pending))\b|\blet me (now )?(continue|proceed)\b|\bso far[,:]/i.test(
+    text
+  ) ||
+    // Hedged investigation: the model names a place it hasn't looked at and
+    // promises to look. "Let's look at X" / "(or the config module)" / "I
+    // would need to verify" is an answer that stopped before the evidence.
+    /\blet'?s (look|check|verify|see|examine|inspect)\b|\bi (would |will |should )?need to (verify|check|confirm|look)\b|\b(not|un)(?: yet)? ?(verified|confirmed)\b|\blikely (located|defined|in)\b|\bprobably (in|at|defined)\b|\(or (the|a|an) [^)]{3,60}\)/i.test(
+      text
+    );
+}
+
+/**
+ * Gemini's OWN failure replies — the web UI answers these when a turn fails
+ * on Google's side (overload, a too-large message, a filtered response).
+ * They are not the model's answer to the task, so the loop must retry the
+ * turn rather than hand them to the user as a result. Kept to short, exact
+ * phrasings so a genuine answer that mentions an error isn't mistaken.
+ */
+export function looksLikeGeminiError(response: GeminiResponse): boolean {
+  const text = response.text.trim();
+  if (!text || text.length > 300 || response.codeBlocks.length) return false;
+  return /^(I encountered an error doing what you asked|Something went wrong|An internal error (has )?occurred|I'?m (currently )?(unable|not able) to (help|respond|process)[^.]*\. ?(Please )?try again|Sorry, something went wrong|I can'?t (help|do that) right now)/i.test(
     text
   );
 }

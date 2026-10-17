@@ -3,6 +3,8 @@ import { openSync, closeSync, readFileSync, writeFileSync, existsSync, mkdirSync
 import path from "node:path";
 import type { ToolDefinition } from "../types.js";
 import { confirmAction } from "./confirm.js";
+import { resolveInRoot, outsideWorkspace } from "./paths.js";
+import { displayPath } from "../workspace.js";
 
 const TMP_DIR = ".gemini-code-tmp";
 const IS_WINDOWS = process.platform === "win32";
@@ -194,7 +196,7 @@ function killGroup(pid: number): void {
   }, 3_000).unref();
 }
 
-function runForeground(command: string): Promise<{ ok: boolean; output: string }> {
+function runForeground(command: string, cwd = process.cwd()): Promise<{ ok: boolean; output: string }> {
   const id = `fg_${Date.now().toString(36)}`;
   const logPath = path.join(tmpDir(), `${id}.log`);
 
@@ -202,7 +204,7 @@ function runForeground(command: string): Promise<{ ok: boolean; output: string }
     // Intentionally shell-based: the point of this tool is running real
     // command lines, pipes and redirects included, exactly like Claude
     // Code's Bash tool. The control is the confirm() gate, not arg escaping.
-    const child = spawn(command, spawnOptions());
+    const child = spawn(command, spawnOptions({ cwd }));
     let out = "";
     let killed = false;
 
@@ -282,12 +284,12 @@ function runForeground(command: string): Promise<{ ok: boolean; output: string }
   });
 }
 
-function runBackground(command: string): { ok: boolean; output: string } {
+function runBackground(command: string, cwd = process.cwd()): { ok: boolean; output: string } {
   const id = `bg_${Date.now().toString(36)}`;
   const logPath = path.join(tmpDir(), `${id}.log`);
   const fd = openSync(logPath, "a");
 
-  const child = spawn(command, spawnOptions({ stdio: ["ignore", fd, fd] }));
+  const child = spawn(command, spawnOptions({ stdio: ["ignore", fd, fd], cwd }));
   child.unref();
   closeSync(fd);
 
@@ -319,7 +321,8 @@ function runBackground(command: string): { ok: boolean; output: string } {
 export const bashTool: ToolDefinition = {
   name: "run_bash",
   description:
-    `run_bash(args: {command: string, background?: boolean}) -> runs a shell command in the project root ` +
+    `run_bash(args: {command: string, cwd?: string, background?: boolean}) -> runs a shell command in the project root ` +
+    `('cwd' runs it in a subdirectory or another workspace root instead, e.g. "../shared-lib") ` +
     `(shell: ${SHELL_NAME} on ${process.platform}). ` +
     `Returns its output, or times out after ${FOREGROUND_TIMEOUT_MS / 1000}s. ` +
     `Set background: true for anything that does NOT exit on its own — dev servers, watchers, tails — ` +
@@ -331,15 +334,22 @@ export const bashTool: ToolDefinition = {
     if (!command) return { ok: false, output: "Error: 'command' is required." };
 
     const wantsBackground = Boolean(args.background) || looksLongRunning(command);
+    const cwdArg = String(args.cwd ?? "").trim();
+    const cwdResolved = resolveInRoot(cwdArg || ".");
+    if (!cwdResolved.ok) return { ok: false, output: outsideWorkspace("run a command in") };
+    const cwd = cwdResolved.abs;
+    if (!existsSync(cwd)) return { ok: false, output: `Error: cwd ${cwdArg} does not exist.` };
+    const inDir = displayPath(cwd) === "." ? "" : `  (in ${displayPath(cwd)})`;
 
     const approved = await confirmAction(
       wantsBackground ? "Run shell command (in background)?" : "Run shell command?",
-      command
+      command + inDir,
+      "command"
     );
     if (!approved) return { ok: false, output: "User declined to run this command." };
 
     if (wantsBackground) {
-      const result = runBackground(command);
+      const result = runBackground(command, cwd);
       if (result.ok && !args.background) {
         result.output =
           `This looks like a long-running process, so it was started in the background ` +
@@ -348,7 +358,7 @@ export const bashTool: ToolDefinition = {
       return result;
     }
 
-    return runForeground(command);
+    return runForeground(command, cwd);
   },
 };
 

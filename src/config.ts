@@ -20,9 +20,11 @@ export const CONFIG_KEYS: Record<string, { env: string; hint: string }> = {
   model: { env: "GEMINI_CODE_MODEL", hint: "thinking (default) | auto | fast | fastest | pro | argon, or a picker label like \"3.8 Thinking\"" },
   thinkingLevel: { env: "GEMINI_CODE_THINKING_LEVEL", hint: "low | medium | high (default) — the picker's Thinking level submenu" },
   thinking: { env: "GEMINI_CODE_THINKING", hint: "on | off — the Extended thinking toggle, where the picker has one" },
+  addDirs: { env: "GEMINI_CODE_ADD_DIRS", hint: "extra workspace roots (dependency repos), e.g. [\"../shared-lib\"]" },
+  compactTurns: { env: "GEMINI_CODE_COMPACT_TURNS", hint: "exchanges per thread before a context reset with handoff (default 40, 0 = off)" },
   workers: { env: "GEMINI_CODE_MAX_WORKERS", hint: "parallel worker tabs (default 3)" },
   orchestrator: { env: "GEMINI_CODE_ORCHESTRATOR", hint: "true (default) | false — one tab does everything when false" },
-  autoApprove: { env: "GEMINI_CODE_AUTO_APPROVE", hint: "true | false (default) — skip y/N confirmations" },
+  autoApprove: { env: "GEMINI_CODE_AUTO_APPROVE", hint: "false (default) | edits | edits,commands | all — what runs without a y/N" },
   maxTurns: { env: "GEMINI_CODE_MAX_TURNS", hint: "tool-call turns one task may take (default 60)" },
   shell: { env: "GEMINI_CODE_SHELL", hint: "shell for run_bash (default: Git Bash on Windows, else sh)" },
   chrome: { env: "GEMINI_CODE_CHROME", hint: "path to the Chrome executable, if it isn't found automatically" },
@@ -45,7 +47,7 @@ export function projectConfigPath(root = process.cwd()): string {
   return path.join(root, ".gemini-code.json");
 }
 
-export type ConfigFile = Record<string, string | number | boolean>;
+export type ConfigFile = Record<string, string | number | boolean | string[]>;
 
 export function readConfigFile(file: string): ConfigFile {
   if (!existsSync(file)) return {};
@@ -68,7 +70,8 @@ export function envNameFor(key: string): string | undefined {
 }
 
 /** How a config value is spelt in the environment the code already reads. */
-export function envValueFor(key: string, value: string | number | boolean): string {
+export function envValueFor(key: string, value: string | number | boolean | string[]): string {
+  if (Array.isArray(value)) return value.map(String).join(path.delimiter);
   if (typeof value === "boolean") {
     // Booleans in the existing env contract: ORCHESTRATOR is "0" to turn off,
     // AUTO_APPROVE is "1" to turn on, THINKING is on/off.
@@ -76,6 +79,8 @@ export function envValueFor(key: string, value: string | number | boolean): stri
     return value ? "1" : "0";
   }
   const text = String(value).trim();
+  // autoApprove takes words (edits, commands, all); the other booleans are 1/0.
+  if (key === "autoApprove") return text;
   if (key !== "thinking" && /^(true|yes|on)$/i.test(text)) return "1";
   if (key !== "thinking" && /^(false|no|off)$/i.test(text)) return "0";
   return text;

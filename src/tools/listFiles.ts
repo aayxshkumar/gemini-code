@@ -1,5 +1,5 @@
 import type { ToolDefinition } from "../types.js";
-import { resolveInRoot } from "./paths.js";
+import { resolveInRoot, outsideWorkspace } from "./paths.js";
 import { buildProjectTree } from "../context/projectTree.js";
 
 export const listFilesTool: ToolDefinition = {
@@ -9,7 +9,7 @@ export const listFilesTool: ToolDefinition = {
     const rel = String(args.path ?? ".");
     const resolved = resolveInRoot(rel);
     if (!resolved.ok) {
-      return { ok: false, output: "Error: path escapes the project root, refusing to list it." };
+      return { ok: false, output: outsideWorkspace("list") };
     }
     const abs = resolved.abs;
     try {

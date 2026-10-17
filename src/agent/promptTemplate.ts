@@ -11,6 +11,10 @@ export interface PrimerContext {
   docs?: ProjectDoc[];
   /** An unfinished plan from a previous run, for resuming interrupted work. */
   resumePlan?: string;
+  /** Extra workspace roots (dependency repos) with a shallow tree each. */
+  roots?: { name: string; display: string; dir: string; tree: string }[];
+  /** A handoff note from the previous thread, after a context reset (/compact). */
+  handoff?: string;
 }
 
 /**
@@ -115,9 +119,12 @@ TOOL_RESULT >>>
 - When you are done and have no more tools to call, reply normally in plain text/markdown with your final answer, with no JSON code block in it — that's what ends the conversation for this task.
 - If a tool result is an error, either fix your approach and retry, or explain the problem in your final answer.
 
-HOW TO WORK WELL HERE:
-- Orient first, cheaply: search_code / list_files / read_file windows (offset+limit), batched. Don't read whole large files.
-- Change existing files with edit_file (exact old_text copied from what you read); write_file is for new files.
+HOW TO WORK WELL HERE (this may be a very large codebase spanning several repositories):
+- Never guess a path, a function signature or how a dependency behaves — find it: find_files for files, search_code for symbols and usages (use 'path' to search another workspace root), then read_file a window (offset+limit). Batch these.
+- Change existing files with edit_file, with old_text copied from a read_file result in THIS thread. Edits to files you haven't read, or that changed since, are refused — that is deliberate.
+- When a change touches a dependency in another root, read its real code there; do not assume its API from its name or from memory.
+- If something is unknown or ambiguous, say so and check, rather than inventing a plausible answer.
+- In your final answer cite only file paths and line numbers you have actually seen in a tool result in this thread. Answers are checked: a path that doesn't exist is sent back. "Probably in config.ts" is not an answer — go and look, and if you can't find it, say what you searched and that it wasn't found.
 - After making changes, verify them: git_diff to review, then run the build or tests with run_bash. Read failures with check_output's grep instead of re-running.
 - Keep going until the task is actually done. A reply with no tool call ends the task.
 ${roleInstructions(role)}`;
@@ -132,8 +139,29 @@ ${roleInstructions(role)}`;
 export function buildContextDocument(context: PrimerContext): string | undefined {
   const sections: string[] = [];
 
+  const instructionDocs = context.docs?.filter((d) => d.instructions) ?? [];
+  if (instructionDocs.length) {
+    sections.push(
+      `## PROJECT INSTRUCTIONS — follow these\n\n` +
+        `The project's own rules for coding agents. They take precedence over your defaults.\n\n` +
+        instructionDocs.map((d) => `### ${d.path}\n\n${d.content}`).join("\n\n---\n\n")
+    );
+  }
+
   if (context.tree) {
     sections.push(`## Project structure\n\n\`\`\`\n${context.tree}\n\`\`\``);
+  }
+
+  if (context.roots?.length) {
+    sections.push(
+      `## Other workspace roots\n\n` +
+        `These repositories are part of this workspace (dependencies of the project). Reach them with the paths ` +
+        `shown — e.g. read_file("${context.roots[0].display}/README.md"), search_code with path "${context.roots[0].display}", ` +
+        `run_bash with cwd "${context.roots[0].display}". Don't guess how their code works: search and read it.\n\n` +
+        context.roots
+          .map((r) => `### ${r.display}  (${r.dir})\n\n\`\`\`\n${r.tree}\n\`\`\``)
+          .join("\n\n")
+    );
   }
 
   if (context.memory) {
@@ -144,14 +172,24 @@ export function buildContextDocument(context: PrimerContext): string | undefined
     );
   }
 
-  if (context.docs?.length) {
-    const docSections = context.docs
+  const plainDocs = context.docs?.filter((d) => !d.instructions) ?? [];
+  if (plainDocs.length) {
+    const docSections = plainDocs
       .map((d) => `### ${d.path}\n\n${d.content}`)
       .join("\n\n---\n\n");
     sections.push(
       `## Project documentation\n\n` +
         `The project's own markdown files, as initial knowledge about intent and conventions.\n\n` +
         docSections
+    );
+  }
+
+  if (context.handoff) {
+    sections.push(
+      `## HANDOFF FROM YOUR PREVIOUS CONTEXT\n\n` +
+        `This is a fresh thread: the previous one grew too long and was closed. Everything you knew is summarised ` +
+        `below, written by you just before the reset. Trust it for intent and decisions, but NOT for file contents — ` +
+        `read_file anything before you edit it (edits on unread files are refused).\n\n${context.handoff}`
     );
   }
 
