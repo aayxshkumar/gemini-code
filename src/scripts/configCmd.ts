@@ -7,7 +7,7 @@ import {
   writeUserConfig,
   configSources,
 } from "../config.js";
-import { c } from "../ui/format.js";
+import { c, glyph } from "../ui/format.js";
 
 /**
  * `gemini-code config` — show, set and unset persistent defaults, so the
@@ -62,7 +62,7 @@ export async function configCommand(argv: string[]): Promise<void> {
         ? Number(value)
         : value;
     writeUserConfig({ ...current, [key]: parsed });
-    console.log(`  ${c.green("✓")} ${key} = ${String(parsed)}  ${c.dim(`(${userConfigPath()})`)}`);
+    console.log(`  ${c.green(glyph.ok)} ${key} = ${String(parsed)}  ${c.dim(`(${userConfigPath()})`)}`);
     return;
   }
 
@@ -79,7 +79,7 @@ export async function configCommand(argv: string[]): Promise<void> {
     }
     delete current[key];
     writeUserConfig(current);
-    console.log(`  ${c.green("✓")} removed ${key}`);
+    console.log(`  ${c.green(glyph.ok)} removed ${key}`);
     return;
   }
 

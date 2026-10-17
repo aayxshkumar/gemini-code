@@ -66,13 +66,19 @@ export async function ensureChromeRunning(log: (msg: string) => void = console.l
  */
 export function findChromeExecutable(): string | undefined {
   if (process.platform === "win32") {
+    const pf = process.env["PROGRAMFILES"] ?? "C:\\Program Files";
+    const pf86 = process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)";
+    const local = process.env["LOCALAPPDATA"] ?? "";
+    // Chrome first; then Microsoft Edge, which is Chromium too, speaks the
+    // same DevTools protocol, and is on every Windows machine — so a
+    // laptop without Chrome still works out of the box.
     const candidates = [
-      path.join(process.env["PROGRAMFILES"] ?? "C:\\Program Files", "Google/Chrome/Application/chrome.exe"),
-      path.join(
-        process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)",
-        "Google/Chrome/Application/chrome.exe"
-      ),
-      path.join(process.env["LOCALAPPDATA"] ?? "", "Google/Chrome/Application/chrome.exe"),
+      path.join(pf, "Google/Chrome/Application/chrome.exe"),
+      path.join(pf86, "Google/Chrome/Application/chrome.exe"),
+      path.join(local, "Google/Chrome/Application/chrome.exe"),
+      path.join(pf86, "Microsoft/Edge/Application/msedge.exe"),
+      path.join(pf, "Microsoft/Edge/Application/msedge.exe"),
+      path.join(local, "Microsoft/Edge/Application/msedge.exe"),
     ];
     return candidates.find((p) => p && existsSync(p));
   }
@@ -109,7 +115,7 @@ function launchChrome(): void {
     if (!exe) {
       throw new Error(
         process.platform === "win32"
-          ? "Couldn't find chrome.exe. Install Google Chrome, or set GEMINI_CODE_CHROME to its full path."
+          ? "Couldn't find chrome.exe or msedge.exe. Install Google Chrome or Microsoft Edge, or set GEMINI_CODE_CHROME to the browser's full path."
           : "Couldn't find Chrome. Install google-chrome or chromium, or set GEMINI_CODE_CHROME to its path."
       );
     }

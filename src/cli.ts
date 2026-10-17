@@ -57,7 +57,8 @@ import { checkLogin } from "./scripts/login.js";
 import { doctor } from "./scripts/doctor.js";
 import { configCommand } from "./scripts/configCmd.js";
 import { API_MODELS } from "./server/protocol.js";
-import { c } from "./ui/format.js";
+import { c, glyph, ASCII } from "./ui/format.js";
+const ASCII_SELECTED = ASCII ? "  <- selected" : "  ← selected";
 import { setAsker } from "./ui/prompt.js";
 
 function helpText(): string {
@@ -100,7 +101,7 @@ function pickerLines(entries: PickerEntry[]): string[] {
     .map((e, i) => {
       const alias = resolveModelAliasFor(e.label);
       return `  ${c.bold(String(i + 1).padStart(2))}) ${e.label.padEnd(16)} ${c.dim(e.description)}${
-        e.selected ? c.green("  ← selected") : ""
+        e.selected ? c.green(ASCII_SELECTED) : ""
       }${e.locked ? c.yellow("  (locked: needs a paid plan)") : ""}${alias.length ? c.dim(`  alias: ${alias[0]}`) : ""}`;
     });
 }
@@ -178,7 +179,7 @@ async function chooseModelInteractively(driver: GeminiDriver, current: string | 
   // the saved value keeps working across Google's version bumps.
   const alias = resolveModel(chosen) ? chosen : (resolveModelAliasFor(chosen)[0] ?? chosen);
   writeUserConfig({ ...readConfigFile(userConfigPath()), model: alias });
-  console.log(`  ${c.green("✓")} model saved: ${c.bold(alias)}\n`);
+  console.log(`  ${c.green(glyph.ok)} model saved: ${c.bold(alias)}\n`);
   return alias;
 }
 
@@ -310,7 +311,7 @@ async function main() {
 
   // Banner, Claude Code style.
   console.log(`
-${c.magenta("✻")} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — Claude-Code-style agent on the Gemini web UI`)}
+${c.magenta(glyph.star)} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — Claude-Code-style agent on the Gemini web UI`)}
 
   ${c.dim("cwd")}     ${path.basename(process.cwd())}
   ${c.dim("model")}   ${modelName}${levelNote}${
@@ -334,9 +335,9 @@ ${c.magenta("✻")} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — Claude-Cod
         : "y/N before every edit, command and request"
   }
   ${c.dim("mode")}    ${ORCHESTRATOR_MODE ? "orchestrator — main tab plans & validates, workers implement" : "solo — one tab does everything"}
-${created ? `\n  ${c.green("✓")} created ${MEMORY_FILENAME} for durable project memory` : ""}${
+${created ? `\n  ${c.green(glyph.ok)} created ${MEMORY_FILENAME} for durable project memory` : ""}${
     resumable
-      ? `\n  ${c.yellow("⟳")} found an unfinished plan in ${PLAN_FILENAME} (${resumable.status}) — your next task will continue it`
+      ? `\n  ${c.yellow(glyph.resume)} found an unfinished plan in ${PLAN_FILENAME} (${resumable.status}) — your next task will continue it`
       : ""
   }
 ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing while a task runs steers it.")}
@@ -398,7 +399,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
   let stagedImages: string[] = [];
   const stageImage = (file: string) => {
     stagedImages.push(file);
-    console.log(`  ${c.green("✓")} attached ${path.basename(file)} — send a task to include it\n`);
+    console.log(`  ${c.green(glyph.ok)} attached ${path.basename(file)} — send a task to include it\n`);
   };
 
   // Leave the journal marked interrupted if we're killed mid-task, so the
@@ -507,7 +508,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
       }
     } finally {
       pasteBusy = false;
-      process.stdout.write(c.magenta("› "));
+      process.stdout.write(c.magenta(glyph.prompt));
     }
   };
 
@@ -536,7 +537,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
   const nextLine = (): Promise<string | null> => {
     if (queued.length) return Promise.resolve(queued.shift()!);
     if (inputDone) return Promise.resolve(null);
-    process.stdout.write(c.magenta("› "));
+    process.stdout.write(c.magenta(glyph.prompt));
     return new Promise<string | null>((resolve) => {
       pending = resolve;
     });
@@ -580,7 +581,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
                 const name = await driver.setModel(wanted, {
                   onFallback: (w, g) => console.log(c.yellow(`  ${w} isn't in this picker — using ${g}`)),
                 });
-                console.log(`  ${c.green("✓")} model: ${c.bold(name)} ${c.dim(`(picker: ${await driver.getCurrentModel()})`)}\n`);
+                console.log(`  ${c.green(glyph.ok)} model: ${c.bold(name)} ${c.dim(`(picker: ${await driver.getCurrentModel()})`)}\n`);
               }
               break;
 
@@ -600,7 +601,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
                 break;
               }
               const level = await driver.setThinkingLevel(want);
-              console.log(`  ${c.green("✓")} thinking level: ${c.bold(level)}\n`);
+              console.log(`  ${c.green(glyph.ok)} thinking level: ${c.bold(level)}\n`);
               break;
             }
 
@@ -611,7 +612,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
                 break;
               }
               await driver.setExtendedThinking(want);
-              console.log(`  ${c.green("✓")} ${await driver.getCurrentModel()}\n`);
+              console.log(`  ${c.green(glyph.ok)} ${await driver.getCurrentModel()}\n`);
               break;
             }
 
@@ -641,7 +642,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
                 const active = driver.currentGem ?? referenceGem;
                 console.log(
                   active
-                    ? `  ${c.green("✓")} Gem ${c.bold(active.name)} ${c.dim(
+                    ? `  ${c.green(glyph.ok)} Gem ${c.bold(active.name)} ${c.dim(
                         driver.currentGem ? "(the whole session runs inside it)" : "(reference — ask_gem consults it)"
                       )}\n`
                     : `  ${c.dim("no Gem in use — /gems lists them, /gem <name> picks one")}\n`
@@ -655,13 +656,13 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
                 await driver.clearGem();
                 await driver.newConversation();
                 session = makeMainSession(await readMemory());
-                console.log(`  ${c.green("✓")} no Gem in use ${c.dim("(fresh thread)")}\n`);
+                console.log(`  ${c.green(glyph.ok)} no Gem in use ${c.dim("(fresh thread)")}\n`);
                 break;
               }
               try {
                 if (gemMode === "inside") {
                   const gem = await driver.useGem(arg);
-                  console.log(`  ${c.green("✓")} session now runs inside Gem ${c.bold(gem.name)}\n`);
+                  console.log(`  ${c.green(glyph.ok)} session now runs inside Gem ${c.bold(gem.name)}\n`);
                 } else {
                   const gem = await driver.findGem(arg);
                   // Drop the previous Gem's tab before pointing at another,
@@ -674,7 +675,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
                     log: (msg) => console.log(c.dim(msg)),
                   });
                   console.log(
-                    `  ${c.green("✓")} ask_gem now consults ${c.bold(gem.name)} ${c.dim("(reference only)")}\n`
+                    `  ${c.green(glyph.ok)} ask_gem now consults ${c.bold(gem.name)} ${c.dim("(reference only)")}\n`
                   );
                 }
                 // The tool list changed and a Gem applies per thread, so the
@@ -714,7 +715,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
               await driver.newConversation();
               forgetAll();
               session = makeMainSession(await readMemory());
-              console.log(`  ${c.green("✓")} added ${c.bold(displayPath(added.root.dir))} ${c.dim(`(${added.root.dir}; fresh thread)`)}\n`);
+              console.log(`  ${c.green(glyph.ok)} added ${c.bold(displayPath(added.root.dir))} ${c.dim(`(${added.root.dir}; fresh thread)`)}\n`);
               break;
             }
 
@@ -723,7 +724,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
               if (note === undefined) {
                 console.log(`  ${c.dim("nothing to compact yet — the thread hasn't started")}\n`);
               } else {
-                console.log(`  ${c.green("✓")} fresh thread; handoff note kept (${note.length} chars). Next task continues from it.\n`);
+                console.log(`  ${c.green(glyph.ok)} fresh thread; handoff note kept (${note.length} chars). Next task continues from it.\n`);
               }
               break;
             }
@@ -735,7 +736,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
               // A fresh thread has no memory of the primer, so the next task
               // must re-send it — that's what a new AgentSession does.
               session = makeMainSession(await readMemory());
-              console.log(`  ${c.green("✓")} fresh conversation thread\n`);
+              console.log(`  ${c.green(glyph.ok)} fresh conversation thread\n`);
               break;
 
             case "paste": {
@@ -771,7 +772,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
 
             case "undo": {
               const result = await checkpoints.undoLast();
-              console.log(`  ${result.ok ? c.green("✓") : c.yellow("!")} ${result.message}\n`);
+              console.log(`  ${result.ok ? c.green(glyph.ok) : c.yellow("!")} ${result.message}\n`);
               break;
             }
 
@@ -783,7 +784,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
               }
               if (arg === "clear") {
                 await clearPlan();
-                console.log(`  ${c.green("✓")} cleared ${PLAN_FILENAME}\n`);
+                console.log(`  ${c.green(glyph.ok)} cleared ${PLAN_FILENAME}\n`);
                 break;
               }
               console.log(`\n${current.raw}\n`);
@@ -802,7 +803,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
                 break;
               }
               await appendMemory(arg);
-              console.log(`  ${c.green("✓")} saved to ${MEMORY_FILENAME}\n`);
+              console.log(`  ${c.green(glyph.ok)} saved to ${MEMORY_FILENAME}\n`);
               break;
 
             case "tools":
@@ -857,7 +858,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
         await checkpoints.commit(); // keep snapshots from a failed run too
         // One failed task shouldn't kill the whole REPL session — report it
         // and keep the prompt alive so the browser/thread stays usable.
-        console.error(`\n  ${c.red("✗")} ${(err as Error).message}\n`);
+        console.error(`\n  ${c.red(glyph.bad)} ${(err as Error).message}\n`);
       }
     }
   } finally {
@@ -930,7 +931,7 @@ async function serve(): Promise<void> {
 
   const key = args.apiKey ? "<your key>" : "anything";
   console.log(`
-${c.magenta("✻")} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — OpenAI-compatible API on your Gemini web session`)}
+${c.magenta(glyph.star)} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — OpenAI-compatible API on your Gemini web session`)}
 
   ${c.dim("base url")}  ${c.bold(url)}
   ${c.dim("models")}    ${API_MODELS.map((m) => (m.alias === DEFAULT_MODEL_ALIAS ? `${m.id} (default)` : m.id)).join(", ")}

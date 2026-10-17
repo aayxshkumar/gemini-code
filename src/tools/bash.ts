@@ -22,18 +22,52 @@ export function resolveShell(): string | true {
   if (process.env.GEMINI_CODE_SHELL) return process.env.GEMINI_CODE_SHELL;
   if (!IS_WINDOWS) return true; // /bin/sh — fine everywhere else
 
-  const candidates = [
+  // 1. Git Bash, in its usual homes.
+  const gitBash = [
     `${process.env["ProgramFiles"] ?? "C:\\Program Files"}\\Git\\bin\\bash.exe`,
     `${process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)"}\\Git\\bin\\bash.exe`,
     `${process.env["LOCALAPPDATA"] ?? ""}\\Programs\\Git\\bin\\bash.exe`,
+    `${process.env["ProgramFiles"] ?? "C:\\Program Files"}\\Git\\usr\\bin\\bash.exe`,
   ];
-  const found = candidates.find((p) => p && existsSync(p));
-  return found ?? true; // no Git Bash: fall back to cmd.exe
+  const found = gitBash.find((p) => p && existsSync(p));
+  if (found) return found;
+
+  // 2. A bash on PATH — but NOT C:\Windows\System32\bash.exe, which is the
+  //    WSL launcher: it runs commands inside a Linux distro, where the
+  //    project's paths, Node and Python are all different (or absent).
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    const candidate = path.join(dir, "bash.exe");
+    if (/\\Windows\\System32\\?$/i.test(dir)) continue;
+    if (dir && existsSync(candidate)) return candidate;
+  }
+
+  // 3. PowerShell: on every Windows machine, and a far better fit for the
+  //    model than cmd.exe (real pipes, Get-ChildItem, Select-String, …).
+  for (const exe of ["pwsh.exe", "powershell.exe"]) {
+    for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+      if (dir && existsSync(path.join(dir, exe))) return exe;
+    }
+  }
+  return true; // nothing else: cmd.exe
 }
 
 const SHELL = resolveShell();
 const SHELL_NAME =
   SHELL === true ? (IS_WINDOWS ? "cmd.exe" : "sh") : (SHELL.split(/[\\/]/).pop() ?? SHELL);
+export const SHELL_FLAVOUR: "bash" | "powershell" | "cmd" = /bash/i.test(SHELL_NAME)
+  ? "bash"
+  : /pwsh|powershell/i.test(SHELL_NAME)
+    ? "powershell"
+    : IS_WINDOWS && SHELL === true
+      ? "cmd"
+      : "bash";
+/** What the model is told to write. Wrong-shell syntax is the top Windows failure. */
+const SHELL_HINT =
+  SHELL_FLAVOUR === "powershell"
+    ? `This is POWERSHELL, not bash: write PowerShell (Get-ChildItem, Select-String, Remove-Item -Recurse, $env:NAME, ; to chain). No ls -la, rm -rf, grep, export or &&-only chains. `
+    : SHELL_FLAVOUR === "cmd"
+      ? `This is CMD.EXE, not bash: write cmd syntax (dir, del, type, set NAME=value, & to chain). Install Git for Windows to get a real bash. `
+      : "";
 
 /**
  * spawn options that behave the same on every platform.
@@ -323,7 +357,7 @@ export const bashTool: ToolDefinition = {
   description:
     `run_bash(args: {command: string, cwd?: string, background?: boolean}) -> runs a shell command in the project root ` +
     `('cwd' runs it in a subdirectory or another workspace root instead, e.g. "../shared-lib") ` +
-    `(shell: ${SHELL_NAME} on ${process.platform}). ` +
+    `(shell: ${SHELL_NAME} on ${process.platform}). ${SHELL_HINT}` +
     `Returns its output, or times out after ${FOREGROUND_TIMEOUT_MS / 1000}s. ` +
     `Set background: true for anything that does NOT exit on its own — dev servers, watchers, tails — ` +
     `and it returns an id immediately instead of blocking; read its logs with check_output. ` +
