@@ -505,6 +505,41 @@ export class GeminiDriver implements IGeminiDriver {
     await page.evaluate(script).catch(() => undefined);
   }
 
+  /** The conversation URL, once Gemini has redirected /app to /app/<id>. */
+  currentThreadUrl(): string | undefined {
+    const url = this.page && !this.page.isClosed() ? this.page.url() : "";
+    return /gemini\.google\.com\/(?:gem\/[^/]+\/)?app\/[A-Za-z0-9_-]+/.test(url) ? url.split("?")[0] : undefined;
+  }
+
+  /**
+   * Reopens a conversation by URL — the one an interrupted task was running
+   * in — so a resumed task keeps the whole thread, not just a summary of it.
+   * False when the thread is gone (temporary chats vanish; so do deleted
+   * ones), in which case the caller falls back to a fresh thread.
+   */
+  async openThread(url: string): Promise<boolean> {
+    const page = this.requirePage();
+    try {
+      await this.navigate(url);
+      await this.waitForAppShell();
+    } catch {
+      return false;
+    }
+    // A missing thread redirects back to /app or shows an error; a real
+    // one renders its earlier turns.
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      const here = page.url().split("?")[0];
+      if (!here.includes(url.split("?")[0].replace(/\/$/, ""))) return false;
+      if ((await this.countResponses().catch(() => 0)) > 0) {
+        this.responseCountBeforeSend = await this.countResponses().catch(() => 0);
+        return true;
+      }
+      await page.waitForTimeout(400);
+    }
+    return false;
+  }
+
   /** Clicks "Stop" if Gemini is still generating. True if it was. */
   async stopGenerating(): Promise<boolean> {
     const page = this.page;

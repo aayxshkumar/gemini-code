@@ -34,7 +34,7 @@ import { killAllBackgroundProcesses } from "./tools/bash.js";
 import { createDelegateTool, MAX_PARALLEL_WORKERS } from "./agent/workers.js";
 import { createAskGemTool } from "./tools/askGem.js";
 import type { ToolDefinition } from "./types.js";
-import { PlanJournal, findResumablePlan, readPlan, clearPlan, PLAN_FILENAME } from "./context/plan.js";
+import { PlanJournal, findResumablePlan, readPlan, clearPlan, resumeTaskText, PLAN_FILENAME } from "./context/plan.js";
 import { createUpdatePlanTool } from "./tools/updatePlan.js";
 import { createScreenshotTool } from "./tools/screenshot.js";
 import { createBrowsePageTool } from "./tools/browsePage.js";
@@ -85,6 +85,7 @@ ${modelHelp()
   ${c.cyan("/undo")}             revert the file changes from the last task
   ${c.cyan("/plan")}             show the current plan / progress journal
   ${c.cyan("/plan clear")}       delete ${PLAN_FILENAME}
+  ${c.cyan("/resume")}           continue the interrupted task in ${PLAN_FILENAME} (or just type "continue")
   ${c.cyan("/memory")}           show ${MEMORY_FILENAME}
   ${c.cyan("/remember <note>")}  append a note to ${MEMORY_FILENAME}
   ${c.cyan("/tools")}            list tools available to Gemini
@@ -309,6 +310,14 @@ async function main() {
     console.log(c.yellow(`Couldn't set model to "${startModel}": ${(err as Error).message.split("\n")[0]}`));
   }
 
+  // An interrupted task: reopen its Gemini thread when it still exists, so
+  // "continue" picks up with the whole conversation intact. A temporary chat
+  // or a deleted thread falls back to a fresh thread primed from the journal.
+  let resumedInThread = false;
+  if (resumable?.thread && (await driver.openThread(resumable.thread).catch(() => false))) {
+    resumedInThread = true;
+  }
+
   // Banner, Claude Code style.
   console.log(`
 ${c.magenta(glyph.star)} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — Claude-Code-style agent on the Gemini web UI`)}
@@ -337,7 +346,8 @@ ${c.magenta(glyph.star)} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — Claud
   ${c.dim("mode")}    ${ORCHESTRATOR_MODE ? "orchestrator — main tab plans & validates, workers implement" : "solo — one tab does everything"}
 ${created ? `\n  ${c.green(glyph.ok)} created ${MEMORY_FILENAME} for durable project memory` : ""}${
     resumable
-      ? `\n  ${c.yellow(glyph.resume)} found an unfinished plan in ${PLAN_FILENAME} (${resumable.status}) — your next task will continue it`
+      ? `\n  ${c.yellow(glyph.resume)} unfinished task in ${PLAN_FILENAME} (${resumable.status}): "${resumable.task.slice(0, 70)}${resumable.task.length > 70 ? "…" : ""}"` +
+        `\n    ${resumedInThread ? "its Gemini thread is reopened" : "its thread is gone — a fresh one will be primed from the journal"}; type ${c.bold("continue")} (or /resume) to pick it up, or /plan clear to drop it`
       : ""
   }
 ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing while a task runs steers it.")}
@@ -393,7 +403,11 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
 
   // The resume plan is injected once, into the first session only — after
   // that it's either finished or superseded by the new run's own journal.
-  let session = makeMainSession(memory, resumable?.raw);
+  let session = makeMainSession(memory, resumedInThread ? undefined : resumable?.raw);
+  if (resumable) journal.resume(resumable);
+  if (resumedInThread) session.continueInThread();
+  /** Until the first task runs, a bare "continue" means the interrupted one. */
+  let resumePending = !!resumable;
 
   /** Images staged by Ctrl+V, /paste or /image, sent with the next task. */
   let stagedImages: string[] = [];
@@ -719,6 +733,19 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
               break;
             }
 
+            case "resume": {
+              const plan = await findResumablePlan();
+              if (!plan) {
+                console.log(`  ${c.dim(`nothing to resume — ${PLAN_FILENAME} has no unfinished task`)}\n`);
+                break;
+              }
+              // Run it as a task right away.
+              queued.unshift(resumeTaskText(plan));
+              journal.resume(plan);
+              resumePending = false;
+              break;
+            }
+
             case "compact": {
               const note = await session.compactNow((m) => console.log(m));
               if (note === undefined) {
@@ -821,12 +848,23 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
         continue;
       }
 
+      // After a crash, "continue" on its own means the interrupted task.
+      let taskText = task;
+      if (resumePending && /^(continue|resume|go on|carry on|keep going|pick up( where you left off)?|finish it)[.! ]*$/i.test(task)) {
+        const plan = await findResumablePlan();
+        if (plan) {
+          taskText = resumeTaskText(plan);
+          console.log(`  ${c.dim(`continuing: ${plan.task.slice(0, 90)}`)}`);
+        }
+      }
+      resumePending = false;
+
       try {
         const attachments = stagedImages;
         stagedImages = [];
         checkpoints.begin(task);
         taskAbort = new AbortController();
-        const answer = await session.runTask(task, {
+        const answer = await session.runTask(taskText, {
           attachments,
           cancelSignal: taskAbort.signal,
           onEvent: (msg) => console.log(msg),

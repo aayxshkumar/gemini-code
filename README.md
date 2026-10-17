@@ -260,6 +260,7 @@ Semantic versioning, reported by `gemini-code --version`.
 
 | Version | Highlights |
 | --- | --- |
+| **0.13.0** | **Crash resume**: the journal records the Gemini thread; after a crash, `continue` (or `/resume`) reopens that exact thread and picks up from the first unfinished step, with the plan's steps carried over; falls back to a journal-primed fresh thread when the thread is gone |
 | **0.12.0** | **Windows first**: Microsoft Edge works as the browser; command shell is Git Bash → PowerShell → cmd (never the WSL launcher) with the model told which syntax to write; ASCII output on the legacy console; `npm run setup` works on Windows; `install.ps1` and `setup.ps1` run in CI on a Windows runner; README leads with the Windows path |
 | **0.11.1** | Windows: `search_code` parsed nothing from `git grep` on CRLF checkouts (every hit ended in `\r`); walk results now use forward slashes; CI green on Ubuntu, macOS and Windows |
 | **0.11.0** | **Stalls and failures handled**: Ctrl+C cancels the task (twice quits); a stuck generation is stopped before a resend; a closed tab, dropped connection or dead Chrome is recovered and the thread re-primed from the journal; offline and signed-out pauses wait instead of burning retries; a tool that never returns is abandoned; identical or ping-pong calls and endless exploring are pointed out; "can't see the attachment" resends inline; optional wall-clock task cap; binary reads refused; advisory lock when two sessions share a project |
@@ -318,6 +319,7 @@ Type a task. `/help` lists commands. `exit` quits.
 | `/thinking on\|off` | the Extended thinking toggle, on pickers that have one |
 | `/undo` | revert all file changes from the last task |
 | `/plan`, `/plan clear` | show / delete the progress journal |
+| `/resume` or typing `continue` | pick up the interrupted task in `GEMINI-PLAN.md`, in its original Gemini thread when it still exists |
 | `/memory`, `/remember <note>` | show / append durable project memory |
 | `ask_user` (tool) | the model can ask you one real question with options; see [Asking instead of guessing](#asking-instead-of-guessing) |
 | `/roots`, `/add-dir <path>` | show the workspace roots / add another repository mid-session |
@@ -771,22 +773,53 @@ A real run against a 600-line file: `search_code` → `read_file` (9 lines) →
 
 ### Crash-resumable plan journal
 
-Every task writes `GEMINI-PLAN.md` as it goes — the task, the model's checklist, and
-a timestamped log of every tool call, flushed after each step:
+Every task writes `GEMINI-PLAN.md` as it goes — the task, the model's checklist,
+the Gemini thread it runs in, and a timestamped log of every tool call, flushed
+after each step:
 
 ```md
 - **Status:** in_progress
+- **Task:** Add the export endpoint and its tests
+- **Thread:** https://gemini.google.com/app/8f3a…
 ## Plan
-- [x] Create src/add.py
-- [ ] Create src/sub.py
+- [x] Add the route
+- [ ] Write the tests
 ## Progress
-- 15:40:01 write_file(src/add.py) -> ok
+- 15:40:01 write_file(src/export.py) -> ok
 ```
 
 Because it's written during the work rather than at the end, a file left
 `in_progress` (or `interrupted`, which Ctrl+C sets) is itself the signal that work
-was cut short. The next run detects it and continues from the first incomplete step
-instead of starting over.
+was cut short — a crash, a closed laptop, a killed terminal.
+
+**To resume: start `gemini-code` again, sign in if asked, and type `continue`.**
+(`/resume` does the same.) The banner tells you what it found:
+
+```
+⟳ unfinished task in GEMINI-PLAN.md (in_progress): "Add the export endpoint and its tests"
+  its Gemini thread is reopened; type continue (or /resume) to pick it up, or /plan clear to drop it
+```
+
+Two cases:
+
+- **The thread still exists** (the default when `temporaryChat` is `false`, or when
+  Chrome stayed open): it's reopened by URL, so the model continues with the
+  *whole* conversation — every file it read, every decision — not a summary. The
+  only thing it's told is that the local process restarted, so it must re-read a
+  file before editing it (the edit gate enforces that anyway).
+- **The thread is gone** (a temporary chat after the browser closed, or deleted):
+  a fresh thread is primed with the journal — original task, step list with what's
+  ticked off, last actions — and the model is told to check the disk before redoing
+  anything.
+
+Either way, `continue` expands into a full task: the original goal, the plan
+status and the last actions, with the instruction to pick up from the first
+unfinished step. The plan's steps carry over into the resumed run rather than
+being replaced, so `/plan` keeps telling the truth across the restart.
+
+If you want resume to reopen the real thread after a crash, set
+`gemini-code config set temporaryChat false` — temporary chats don't survive the
+browser closing.
 
 ### Why login is manual
 

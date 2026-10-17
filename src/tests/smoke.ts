@@ -53,7 +53,7 @@ import { CheckpointStore } from "../context/checkpoint.js";
 import { createUpdatePlanTool } from "../tools/updatePlan.js";
 import { confirmAction } from "../tools/confirm.js";
 import { setAsker } from "../ui/prompt.js";
-import { PlanJournal, readPlan, findResumablePlan, clearPlan } from "../context/plan.js";
+import { PlanJournal, readPlan, findResumablePlan, clearPlan, parsePlan, resumeTaskText } from "../context/plan.js";
 import { runParallelTasks, createDelegateTool, MAX_WORKER_REPORT_CHARS } from "../agent/workers.js";
 
 let passed = 0;
@@ -148,6 +148,66 @@ async function main() {
     });
     assert.equal(result.kind, "tool_call");
     if (result.kind === "tool_call") assert.equal(result.call.name, "run_bash");
+  });
+
+  console.log("Crash and resume:");
+  await test("the journal records the thread URL and parses back steps, log and task", async () => {
+    const j = new PlanJournal(".tmp-test");
+    await j.begin("ship the widget");
+    await j.setSteps([{ title: "make it", done: true }, { title: "test it", done: false }]);
+    await j.log("write_file(w.py) -> ok");
+    await j.setThread("https://gemini.google.com/app/abc123");
+    const plan = (await readPlan(".tmp-test"))!;
+    assert.equal(plan.status, "in_progress");
+    assert.equal(plan.task, "ship the widget");
+    assert.equal(plan.thread, "https://gemini.google.com/app/abc123");
+    assert.deepEqual(plan.steps, [{ title: "make it", done: true }, { title: "test it", done: false }]);
+    assert.ok(plan.log.some((l) => /write_file\(w\.py\)/.test(l)));
+    const text = resumeTaskText(plan);
+    assert.match(text, /ORIGINAL TASK:\nship the widget/);
+    assert.match(text, /\[x\] make it[\s\S]*\[ \] test it/);
+    assert.match(text, /first unfinished step/);
+    assert.equal(parsePlan("# nothing").task, "");
+  });
+
+  await test("resuming keeps the plan's steps through the next begin() instead of wiping them", async () => {
+    const plan = (await readPlan(".tmp-test"))!;
+    const j = new PlanJournal(".tmp-test");
+    j.resume(plan);
+    await j.begin("Continue the task…");
+    assert.deepEqual(j.pendingSteps(), ["test it"], "open steps survive");
+    assert.equal(j.thread, "https://gemini.google.com/app/abc123");
+    const again = (await readPlan(".tmp-test"))!;
+    assert.ok(again.log.some((l) => /resumed:/.test(l)));
+    assert.equal(again.steps.length, 2);
+    // A normal begin() afterwards starts fresh again.
+    await j.begin("something new");
+    assert.deepEqual(j.pendingSteps(), []);
+  });
+
+  await test("a session continuing in a reopened thread sends no primer, just a resume note", async () => {
+    const driver = new FakeDriver([finalResponse("picking up")]);
+    const session = new AgentSession(driver, { tree: "t" });
+    session.continueInThread();
+    const answer = await session.runTask("Continue the task that was interrupted…");
+    assert.equal(answer, "picking up");
+    assert.equal(driver.sentMessages.length, 1);
+    assert.doesNotMatch(driver.sentMessages[0], /RULES FOR USING TOOLS/, "the thread already has the primer");
+    assert.match(driver.sentMessages[0], /has just been resumed/);
+    assert.match(driver.sentMessages[0], /Continue the task that was interrupted/);
+  });
+
+  await test("the loop records the thread URL as soon as the driver knows it", async () => {
+    const base = new FakeDriver([finalResponse("ok")]);
+    const driver: IGeminiDriver = {
+      sendPrompt: (t, o) => base.sendPrompt(t, o),
+      waitForResponseComplete: () => base.waitForResponseComplete(),
+      getLastResponse: () => base.getLastResponse(),
+      currentThreadUrl: () => "https://gemini.google.com/app/xyz789",
+    };
+    const j = new PlanJournal(".tmp-test");
+    await new AgentSession(driver, {}, [], j).runTask("hello");
+    assert.equal((await readPlan(".tmp-test"))!.thread, "https://gemini.google.com/app/xyz789");
   });
 
   console.log("Stalls and edge cases:");
