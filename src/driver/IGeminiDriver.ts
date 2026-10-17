@@ -47,6 +47,10 @@ export interface IGeminiDriver {
   isOffline?(): Promise<boolean>;
   /** Waits for the tab to be online again; false if it never came back. */
   waitForOnline?(maxMs: number, log: (msg: string) => void): Promise<boolean>;
+  /** The current conversation's URL once Gemini has assigned one, else undefined. */
+  currentThreadUrl?(): string | undefined;
+  /** Reopens a saved conversation. False if it no longer exists (e.g. a temporary chat). */
+  openThread?(url: string): Promise<boolean>;
   /** Signed in? (the sign-in button is NOT showing) */
   isLoggedIn?(): Promise<boolean>;
   /** Blocks until signed in (interactive) or throws (unattended). */

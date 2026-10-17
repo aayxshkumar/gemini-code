@@ -173,6 +173,8 @@ export class AgentSession {
   private exchanges = 0;
   /** The task in flight, so a compaction mid-task can restate it. */
   private currentTask = "";
+  /** Set by continueInThread(): prepended to the next task instead of a primer. */
+  private resumeNote: string | undefined;
   /** Static tools plus any session-scoped ones (e.g. delegate_tasks). */
   private readonly tools: ToolDefinition[];
   private readonly toolsByName: Record<string, ToolDefinition>;
@@ -237,6 +239,11 @@ export class AgentSession {
       const primed = await this.buildPrimedMessage(userTask, log);
       message = primed.message;
       if (primed.attach) attachFile.push(primed.attach);
+    } else if (this.resumeNote) {
+      // Same thread as the interrupted run: it already has the primer and
+      // all the context; only the gap needs explaining.
+      message = `${this.resumeNote}\n\n${userTask}`;
+      this.resumeNote = undefined;
     }
 
     for (let turn = 0; turn < MAX_TOOL_TURNS_PER_TASK; turn++) {
@@ -648,6 +655,22 @@ export class AgentSession {
     return this.context.handoff;
   }
 
+  /**
+   * The thread this session is attached to is the one an interrupted task
+   * ran in (reopened by URL). Treat it as already primed; the next task
+   * carries a short note about the gap. Files must be re-read before
+   * editing — the model remembers them, but this process doesn't.
+   */
+  continueInThread(): void {
+    this.primed = true;
+    this.exchanges = 0;
+    forgetAll();
+    this.resumeNote =
+      `NOTE: this conversation was interrupted (the local agent process stopped) and has just been resumed. ` +
+      `You still have the full context above, but the local tool state was reset: read a file again before ` +
+      `editing it, and check what is actually on disk before redoing a step.`;
+  }
+
   /** `/compact`: the same, at the user's request, between tasks. */
   async compactNow(log: (msg: string) => void = () => {}): Promise<string | undefined> {
     return this.compact("requested with /compact", log);
@@ -724,6 +747,7 @@ export class AgentSession {
           }
           await this.driver.waitForResponseComplete();
           this.exchanges++;
+          await this.journal?.setThread(this.driver.currentThreadUrl?.());
           return await this.driver.getLastResponse();
         };
         const reply = await (cancelSignal ? Promise.race([send(), cancelled]) : send());
