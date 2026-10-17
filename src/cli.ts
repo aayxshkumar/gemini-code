@@ -1,5 +1,9 @@
 #!/usr/bin/env node
+// Config first: it fills process.env from ~/.gemini-code/config.json before
+// the modules below read their GEMINI_CODE_* settings at load time.
+import "./config.js";
 import readline from "node:readline/promises";
+import { createRequire } from "node:module";
 import { emitKeypressEvents } from "node:readline";
 import path from "node:path";
 import { GeminiDriver, type Gem } from "./driver/GeminiDriver.js";
@@ -36,10 +40,13 @@ import { existsSync } from "node:fs";
  */
 const ORCHESTRATOR_MODE = process.env.GEMINI_CODE_ORCHESTRATOR !== "0";
 
-/** Kept in step with package.json by `npm version`. */
-export const VERSION = "0.7.0";
+/** Read from package.json so `npm version` can't leave it stale. */
+export const VERSION: string = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
 import { openChrome, ensureChromeRunning } from "./scripts/openChrome.js";
 import { checkLogin } from "./scripts/login.js";
+import { doctor } from "./scripts/doctor.js";
+import { configCommand } from "./scripts/configCmd.js";
+import { API_MODELS } from "./server/protocol.js";
 import { c } from "./ui/format.js";
 import { setAsker } from "./ui/prompt.js";
 
@@ -128,12 +135,20 @@ async function main() {
 
   // Default the model (env override: GEMINI_CODE_MODEL=pro npm run dev).
   const startModel = process.env.GEMINI_CODE_MODEL ?? DEFAULT_MODEL_ALIAS;
+  const wantThinking = process.env.GEMINI_CODE_THINKING
+    ? /^(on|true|yes|1)$/i.test(process.env.GEMINI_CODE_THINKING)
+    : DEFAULT_EXTENDED_THINKING;
   let modelName = "unknown";
   try {
-    modelName = await driver.setModel(startModel);
-    // "fast" should mean fast: extended thinking stacks on top of the base
-    // model and slows it down, so turn it off unless asked for.
-    await driver.setExtendedThinking(DEFAULT_EXTENDED_THINKING);
+    modelName = await driver.setModel(startModel, {
+      onFallback: (wanted, got) =>
+        console.log(c.yellow(`${wanted} isn't in this account's model picker — using ${got} instead.`)),
+    });
+    // Extended thinking stacks on top of the base model and slows it down,
+    // so it's off unless asked for (GEMINI_CODE_THINKING=on or /thinking on).
+    await driver.setExtendedThinking(wantThinking).catch(() => undefined);
+    const label = await driver.getCurrentModel().catch(() => "");
+    if (label && label !== "unknown") modelName = `${modelName} ${c.dim(`(picker: ${label})`)}`;
   } catch (err) {
     modelName = await driver.getCurrentModel();
     console.log(c.yellow(`Couldn't set model to "${startModel}": ${(err as Error).message.split("\n")[0]}`));
@@ -607,10 +622,13 @@ Usage:
       --cors-origin <url>     let a browser app at <url> call it (repeatable)
   gemini-code open-chrome     open a normal Chrome window to sign into (do this first)
   gemini-code login           check that the signed-in Chrome is reachable
+  gemini-code doctor          check Node, Chrome, the profile, PATH and the sign-in state
+  gemini-code config          show saved defaults; "config set model pro" saves one
   gemini-code --help          this message
 
-Environment:
-  GEMINI_CODE_MODEL           fastest | fast (default) | pro
+Settings (environment, or "gemini-code config set <key> <value>", or <project>/.gemini-code.json):
+  GEMINI_CODE_MODEL           thinking (default) | fast | fastest | pro
+  GEMINI_CODE_THINKING        on | off — the Extended thinking toggle on top of the model
   GEMINI_CODE_GEM             Gem to start in, by name or id (same as --gem)
   GEMINI_CODE_MAX_WORKERS     parallel worker tabs (default 3)
   GEMINI_CODE_AUTO_APPROVE=1  skip y/N confirmations for writes, shell and network
@@ -641,7 +659,7 @@ async function serve(): Promise<void> {
 ${c.magenta("✻")} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — OpenAI-compatible API on your Gemini web session`)}
 
   ${c.dim("base url")}  ${c.bold(url)}
-  ${c.dim("models")}    gemini-web-flash (default), gemini-web-pro, gemini-web-flash-lite
+  ${c.dim("models")}    ${API_MODELS.map((m) => (m.alias === DEFAULT_MODEL_ALIAS ? `${m.id} (default)` : m.id)).join(", ")}
   ${c.dim("tabs")}      up to ${args.tabs} parallel (one request per tab)
   ${c.dim("auth")}      ${args.apiKey ? "Bearer key required" : "none — localhost only"}${
     args.allowedOrigins.length ? `
@@ -687,6 +705,10 @@ async function cli(): Promise<void> {
       return void openChrome();
     case "login":
       return checkLogin();
+    case "doctor":
+      return doctor();
+    case "config":
+      return configCommand(process.argv.slice(3));
     case "-h":
     case "--help":
     case "help":

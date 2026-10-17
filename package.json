@@ -1,7 +1,7 @@
 {
   "name": "gemini-code",
-  "version": "0.7.0",
-  "description": "Claude-Code-style coding agent that drives the Gemini web UI via Playwright (for orgs with a Gemini Pro web plan but no API/CLI access).",
+  "version": "0.8.0",
+  "description": "Claude-Code-style coding agent that drives the Gemini web UI (3.8 Thinking by default) via Playwright, for people with a Gemini web plan but no API access.",
   "type": "module",
   "scripts": {
     "test": "tsx src/tests/smoke.ts",
@@ -13,7 +13,10 @@
     "build": "tsc -p . && node scripts/postbuild.mjs",
     "start": "node dist/cli.js",
     "package": "bash scripts/package-release.sh",
-    "prepublishOnly": "npm run build && npm test"
+    "prepublishOnly": "npm run build && npm test",
+    "prepare": "node scripts/prepare.mjs",
+    "setup": "bash setup.sh",
+    "doctor": "node dist/cli.js doctor"
   },
   "dependencies": {
     "playwright": "^1.47.0"
@@ -29,7 +32,9 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "scripts/prepare.mjs",
+    "README.md",
+    "LICENSE"
   ],
   "license": "MIT",
   "engines": {
@@ -45,10 +50,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Muruganandham18/gemini-code.git"
+    "url": "git+https://github.com/aayxshkumar/gemini-code.git"
   },
   "bugs": {
-    "url": "https://github.com/Muruganandham18/gemini-code/issues"
+    "url": "https://github.com/aayxshkumar/gemini-code/issues"
   },
-  "homepage": "https://github.com/Muruganandham18/gemini-code#readme"
+  "homepage": "https://github.com/aayxshkumar/gemini-code#readme"
 }

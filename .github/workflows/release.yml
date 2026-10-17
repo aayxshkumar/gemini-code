@@ -1,0 +1,25 @@
+# Pushing a tag like v0.8.0 builds the release tarball and attaches it to a
+# GitHub release, which is what `install.sh` / `install.ps1` download. With
+# no release published, the installers fall back to building from source.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run package
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: .release/*.tar.gz
+          generate_release_notes: true

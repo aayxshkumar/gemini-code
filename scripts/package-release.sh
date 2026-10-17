@@ -21,6 +21,7 @@ npm run build >/dev/null
 
 cp -R dist "${STAGE}/dist"
 cp package.json README.md LICENSE "${STAGE}/"
+mkdir -p "${STAGE}/scripts" && cp scripts/prepare.mjs "${STAGE}/scripts/"
 [ -d docs ] && cp -R docs "${STAGE}/docs"
 
 # Production deps only — dev tooling (typescript, tsx, esbuild) isn't needed
@@ -56,7 +57,7 @@ chmod +x "${STAGE}/gemini-code"
 cat > "${STAGE}/INSTALL.txt" <<EOF
 gemini-code v${VERSION}
 
-Requirements: macOS, Node.js 20+, Google Chrome.
+Requirements: macOS or Linux, Node.js 20+, Google Chrome.
 
   1. Put this folder wherever you like, e.g. ~/tools/${NAME}
   2. Link the launcher onto your PATH:

@@ -12,3 +12,4 @@ dist/
 GEMINI.md
 GEMINI-PLAN.md
 .release/
+bin/

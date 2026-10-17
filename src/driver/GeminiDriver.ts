@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { existsSync, mkdirSync } from "node:fs";
 import { selectors } from "./selectors.js";
 import type { IGeminiDriver, GeminiResponse } from "./IGeminiDriver.js";
-import { resolveModel, modelHelp, EXTENDED_THINKING } from "./models.js";
+import { resolveModel, modelHelp, modelWithFallbacks, EXTENDED_THINKING } from "./models.js";
 import { HTML_TO_MARKDOWN } from "./markdown.js";
 
 const GEMINI_URL = "https://gemini.google.com/app";
@@ -75,7 +75,8 @@ export function resolveProfileDir(cwd = process.cwd()): string {
   if (process.env.GEMINI_CODE_PROFILE) return path.resolve(process.env.GEMINI_CODE_PROFILE);
   const local = path.resolve(cwd, ".gemini-code-profile");
   if (existsSync(local)) return local;
-  return path.join(homedir(), ".gemini-code", "profile");
+  // GEMINI_CODE_HOME moves everything (app, profile, config) together.
+  return path.join(process.env.GEMINI_CODE_HOME || path.join(homedir(), ".gemini-code"), "profile");
 }
 
 export interface GeminiDriverOptions {
@@ -337,6 +338,13 @@ export class GeminiDriver implements IGeminiDriver {
    * has to happen once, by hand, in the visible window this opened.
    * We never touch credentials here.
    */
+  /** Non-blocking read of the sign-in state, for `gemini-code doctor`. */
+  async isLoggedIn(): Promise<boolean> {
+    const page = this.requirePage();
+    const signIn = page.locator(`${selectors.signInButton} >> visible=true`).first();
+    return !(await signIn.isVisible().catch(() => false));
+  }
+
   async ensureLoggedIn(timeoutMs = 5 * 60_000): Promise<void> {
     const page = this.requirePage();
     // `.first()` alone isn't enough here: the page has multiple "Sign in"
@@ -438,7 +446,7 @@ export class GeminiDriver implements IGeminiDriver {
    * keywords rather than exact labels so Google's version bumps
    * ("3.5 Flash" → "3.6 Flash") don't break it.
    */
-  async setModel(alias: string): Promise<string> {
+  async setModel(alias: string, opts: { onFallback?: (wanted: string, got: string) => void } = {}): Promise<string> {
     const page = this.requirePage();
     const choice = resolveModel(alias);
     if (!choice) {
@@ -459,27 +467,38 @@ export class GeminiDriver implements IGeminiDriver {
     // Poll rather than read once: the menu animates in, and on a freshly
     // opened tab every item can still read as invisible on the first pass —
     // which reported "Couldn't find Flash" for a menu that plainly had it.
-    const deadline = Date.now() + 5_000;
-    while (Date.now() < deadline) {
-      const count = await items.count();
-      for (let i = 0; i < count; i++) {
-        const item = items.nth(i);
-        if (!(await item.isVisible().catch(() => false))) continue;
-        const text = (await item.innerText().catch(() => "")).trim();
-        if (choice.matches(text)) {
-          await item.click();
-          await page.waitForTimeout(800);
-          return choice.name;
+    //
+    // The wanted model is tried for the whole window before any fallback,
+    // so a slow-rendering menu can't make us settle for second best.
+    const chain = modelWithFallbacks(choice);
+    const seen: string[] = [];
+    for (const candidate of chain) {
+      const deadline = Date.now() + (candidate === choice ? 5_000 : 1_500);
+      while (Date.now() < deadline) {
+        const count = await items.count();
+        for (let i = 0; i < count; i++) {
+          const item = items.nth(i);
+          if (!(await item.isVisible().catch(() => false))) continue;
+          const text = (await item.innerText().catch(() => "")).trim();
+          if (text && !seen.includes(text)) seen.push(text);
+          if (candidate.matches(text)) {
+            await item.click();
+            await page.waitForTimeout(800);
+            if (candidate !== choice) opts.onFallback?.(choice.name, candidate.name);
+            await this.getCurrentModel().catch(() => undefined);
+            return candidate.name;
+          }
         }
+        await page.waitForTimeout(250);
       }
-      await page.waitForTimeout(250);
     }
 
     // Nothing matched — close the menu rather than leaving it open over the UI.
     await page.keyboard.press("Escape").catch(() => {});
     throw new Error(
-      `Couldn't find "${choice.name}" in the model picker. Available entries were checked against ` +
-        `keyword rules in models.ts; Google may have renamed them.`
+      `Couldn't find "${choice.name}"${chain.length > 1 ? ` (or ${chain.slice(1).map((m) => m.name).join(", ")})` : ""} ` +
+        `in the model picker. The menu offered: ${seen.map((t) => JSON.stringify(t.split("\n")[0])).join(", ") || "nothing visible"}. ` +
+        `Google may have renamed the entries — see the keyword rules in src/driver/models.ts.`
     );
   }
 

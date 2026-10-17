@@ -7,7 +7,14 @@ import type { GeminiResponse } from "../driver/IGeminiDriver.js";
 const FENCED_TOOL_RE = /```tool\s*\n([\s\S]*?)\n?```/;
 
 export type ParseResult =
-  | { kind: "tool_call"; call: ToolCall }
+  /**
+   * `call` is the first tool call in the reply; `calls` is every one found,
+   * in order. A reply may carry several independent calls (one code block
+   * each, or a JSON array in one block) so that reads and searches that
+   * don't depend on each other cost one round trip through the web UI
+   * instead of one each.
+   */
+  | { kind: "tool_call"; call: ToolCall; calls: ToolCall[] }
   | { kind: "final"; text: string }
   | { kind: "malformed"; raw: string; error: string };
 
@@ -54,22 +61,82 @@ export function extractJsonObjects(raw: string): unknown[] {
   return found;
 }
 
-/** Finds the first balanced {...} substring and parses it, ignoring any surrounding text. */
+/**
+ * JSON.parse with the repairs a model's hand-written JSON most often needs:
+ * a trailing comma before } or ], and // or /* comments. Only attempted when
+ * strict parsing fails, so valid JSON is never altered.
+ */
+export function parseLenientJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch (strictErr) {
+    let repaired = "";
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (inString) {
+        repaired += ch;
+        if (escaped) escaped = false;
+        else if (ch === "\\") escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') {
+        inString = true;
+        repaired += ch;
+      } else if (ch === "/" && text[i + 1] === "/") {
+        while (i < text.length && text[i] !== "\n") i++;
+        repaired += "\n";
+      } else if (ch === "/" && text[i + 1] === "*") {
+        const end = text.indexOf("*/", i + 2);
+        i = end === -1 ? text.length : end + 1;
+      } else {
+        repaired += ch;
+      }
+    }
+    repaired = repaired.replace(/,(\s*[}\]])/g, "$1");
+    try {
+      return JSON.parse(repaired);
+    } catch {
+      throw strictErr;
+    }
+  }
+}
+
+/**
+ * Finds the first balanced {...} or [...] substring and parses it, ignoring
+ * any surrounding text (a stray "json" label, say).
+ */
 function extractJsonObject(raw: string): unknown {
-  const start = raw.indexOf("{");
+  const start = raw.search(/[{[]/);
   if (start === -1) throw new Error("no '{' found");
+  const open = raw[start];
+  const close = open === "{" ? "}" : "]";
   let depth = 0;
+  let inString = false;
+  let escaped = false;
   for (let i = start; i < raw.length; i++) {
-    if (raw[i] === "{") depth++;
-    else if (raw[i] === "}") {
+    const ch = raw[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === open) depth++;
+    else if (ch === close) {
       depth--;
-      if (depth === 0) return JSON.parse(raw.slice(start, i + 1));
+      if (depth === 0) return parseLenientJson(raw.slice(start, i + 1));
     }
   }
   throw new Error("unbalanced braces");
 }
 
 const ARG_KEYS = ["args", "arguments", "parameters", "params", "input"] as const;
+/** Keys a model uses for the tool's name when it forgets it's `name`. */
+const NAME_KEYS = ["name", "tool", "tool_name", "function", "action"] as const;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -86,16 +153,42 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  * {"name": ...} is also what package.json and plenty of other JSON look like.
  */
 function asToolCall(parsed: unknown, knownTools?: ReadonlySet<string>): ToolCall | undefined {
-  if (!isPlainObject(parsed) || typeof parsed.name !== "string") return undefined;
-  const name = parsed.name;
-  if (isPlainObject(parsed.args)) return { name, args: parsed.args };
-  if (!knownTools?.has(name)) return undefined;
-
+  if (!isPlainObject(parsed)) return undefined;
+  // OpenAI-style nesting: {"function": {"name": ..., "arguments": {...}}}
+  if (isPlainObject(parsed.function) && typeof parsed.function.name === "string") {
+    return asToolCall(parsed.function, knownTools);
+  }
+  if (typeof parsed.name === "string") {
+    const name = parsed.name;
+    if (isPlainObject(parsed.args)) return { name, args: parsed.args };
+    if (!knownTools?.has(name)) return undefined;
+    for (const key of ARG_KEYS) {
+      if (isPlainObject(parsed[key])) return { name, args: parsed[key] as Record<string, unknown> };
+    }
+    const { name: _name, ...rest } = parsed;
+    return { name, args: rest };
+  }
+  // The name under another key is only trusted when it IS a tool.
+  if (!knownTools?.size) return undefined;
+  const nameKey = NAME_KEYS.find((k) => typeof parsed[k] === "string" && knownTools.has(parsed[k] as string));
+  if (!nameKey) return undefined;
+  const name = parsed[nameKey] as string;
   for (const key of ARG_KEYS) {
     if (isPlainObject(parsed[key])) return { name, args: parsed[key] as Record<string, unknown> };
   }
-  const { name: _name, ...rest } = parsed;
+  const { [nameKey]: _n, ...rest } = parsed;
   return { name, args: rest };
+}
+
+/** One candidate block may hold one call, or an array of them. */
+function toolCallsIn(parsed: unknown, knownTools?: ReadonlySet<string>): ToolCall[] {
+  if (Array.isArray(parsed)) {
+    const calls = parsed.map((p) => asToolCall(p, knownTools));
+    // All or nothing: a list that is only partly tool calls is not a batch.
+    return calls.every((c): c is ToolCall => !!c) ? calls : [];
+  }
+  const one = asToolCall(parsed, knownTools);
+  return one ? [one] : [];
 }
 
 /**
@@ -113,14 +206,17 @@ export function parseGeminiReply(response: GeminiResponse, knownTools?: Readonly
   const fencedMatch = response.text.match(FENCED_TOOL_RE);
   if (fencedMatch) candidates.unshift(fencedMatch[1].trim());
 
+  // Every code block that holds a valid call is collected, so a reply with
+  // several independent calls runs them all in one turn.
+  const calls: ToolCall[] = [];
   for (const candidate of candidates) {
     try {
-      const call = asToolCall(extractJsonObject(candidate), knownTools);
-      if (call) return { kind: "tool_call", call };
+      calls.push(...toolCallsIn(extractJsonObject(candidate), knownTools));
     } catch {
       // Not this candidate — try the next one, or fall through below.
     }
   }
+  if (calls.length) return { kind: "tool_call", call: calls[0], calls };
 
   // Last resort: the call written as prose rather than as a code block
   // ("I'll call {"name": "read_file", "args": {"path": "x"}} now"). The UI
@@ -128,10 +224,12 @@ export function parseGeminiReply(response: GeminiResponse, knownTools?: Readonly
   // to accept the whole thing as a finished answer and stop. Only accepted
   // for a name that IS a tool, so prose that merely contains JSON stays prose.
   if (knownTools?.size) {
+    const inProse: ToolCall[] = [];
     for (const candidate of extractJsonObjects(response.text)) {
       const call = asToolCall(candidate, knownTools);
-      if (call && knownTools.has(call.name)) return { kind: "tool_call", call };
+      if (call && knownTools.has(call.name)) inProse.push(call);
     }
+    if (inProse.length) return { kind: "tool_call", call: inProse[0], calls: inProse };
   }
 
   // No valid tool call found, but if something looks like an attempt at one

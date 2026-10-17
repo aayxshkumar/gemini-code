@@ -24,7 +24,7 @@ import { listFilesTool } from "../tools/listFiles.js";
 import { bashTool, checkOutputTool, killProcessTool, looksLongRunning, resolveShell } from "../tools/bash.js";
 import { fetchUrlTool } from "../tools/fetchUrl.js";
 import { webSearchTool, parseResults } from "../tools/webSearch.js";
-import { resolveModel, DEFAULT_MODEL_ALIAS, EXTENDED_THINKING } from "../driver/models.js";
+import { resolveModel, modelWithFallbacks, DEFAULT_MODEL_ALIAS, EXTENDED_THINKING } from "../driver/models.js";
 import { resolveGem } from "../driver/GeminiDriver.js";
 import { createAskGemTool } from "../tools/askGem.js";
 import { gemFlag, gemModeFlag, serveArgs } from "../args.js";
@@ -142,6 +142,53 @@ async function main() {
     });
     assert.equal(result.kind, "tool_call");
     if (result.kind === "tool_call") assert.equal(result.call.name, "run_bash");
+  });
+
+  await test("collects several independent calls from one reply, as blocks or an array", () => {
+    const known = new Set(["read_file", "search_code", "git_status"]);
+    const a = JSON.stringify({ name: "read_file", args: { path: "a.py" } });
+    const b = JSON.stringify({ name: "search_code", args: { pattern: "TODO" } });
+    const blocks = parseGeminiReply({ text: `${a}\n${b}`, codeBlocks: [a, b] }, known);
+    assert.equal(blocks.kind, "tool_call");
+    if (blocks.kind !== "tool_call") return;
+    assert.deepEqual(blocks.calls.map((c) => c.name), ["read_file", "search_code"]);
+    assert.equal(blocks.call.name, "read_file", "call is still the first one, for old callers");
+
+    const arr = `[${a}, ${b}, {"name": "git_status"}]`;
+    const array = parseGeminiReply({ text: arr, codeBlocks: [arr] }, known);
+    assert.equal(array.kind, "tool_call");
+    if (array.kind === "tool_call") assert.deepEqual(array.calls.map((c) => c.name), ["read_file", "search_code", "git_status"]);
+
+    // A list that is only partly tool calls is not a batch; the prose scan
+    // still picks up the one real call in it, as it would anywhere in a reply.
+    const mixed = `[${a}, {"version": "1.0.0"}]`;
+    const partial = parseGeminiReply({ text: mixed, codeBlocks: [mixed] }, known);
+    assert.equal(partial.kind, "tool_call");
+    if (partial.kind === "tool_call") assert.equal(partial.calls.length, 1);
+  });
+
+  await test("repairs the JSON a model most often gets slightly wrong", () => {
+    const known = new Set(["read_file", "edit_file"]);
+    const trailing = '{"name": "read_file", "args": {"path": "a.py",},}';
+    assert.equal(parseGeminiReply({ text: trailing, codeBlocks: [trailing] }, known).kind, "tool_call");
+    const commented = '{\n  // the file to read\n  "name": "read_file", "args": {"path": "a.py"}\n}';
+    assert.equal(parseGeminiReply({ text: commented, codeBlocks: [commented] }, known).kind, "tool_call");
+    // A comment marker inside a string is left alone.
+    const url = '{"name": "read_file", "args": {"path": "http://x/y"}}';
+    const parsed = parseGeminiReply({ text: url, codeBlocks: [url] }, known);
+    assert.equal(parsed.kind, "tool_call");
+    if (parsed.kind === "tool_call") assert.equal(parsed.call.args.path, "http://x/y");
+    // Other spellings of "name", only for a real tool.
+    const fn = '{"function": {"name": "edit_file", "arguments": {"path": "a", "old_text": "x", "new_text": "y"}}}';
+    const asFn = parseGeminiReply({ text: fn, codeBlocks: [fn] }, known);
+    assert.equal(asFn.kind, "tool_call");
+    if (asFn.kind === "tool_call") assert.equal(asFn.call.args.old_text, "x");
+    const tool = '{"tool": "read_file", "path": "a.py"}';
+    const asTool = parseGeminiReply({ text: tool, codeBlocks: [tool] }, known);
+    assert.equal(asTool.kind, "tool_call");
+    if (asTool.kind === "tool_call") assert.deepEqual(asTool.call, { name: "read_file", args: { path: "a.py" } });
+    const notTool = '{"tool": "hammer", "weight": 2}';
+    assert.equal(parseGeminiReply({ text: notTool, codeBlocks: [notTool] }, known).kind, "final");
   });
 
   await test("flags malformed JSON inside a code block as an attempted tool call", () => {
@@ -1303,15 +1350,24 @@ async function main() {
   });
 
   console.log("Model selection:");
-  await test("resolves friendly aliases, and 'fast' is the default", () => {
+  await test("resolves friendly aliases, and 'thinking' is the default", () => {
     assert.equal(resolveModel("fast")?.name, "Flash");
     assert.equal(resolveModel("pro")?.name, "Pro");
     assert.equal(resolveModel("fastest")?.name, "Flash-Lite");
     assert.equal(resolveModel("nonsense"), undefined);
-    assert.equal(resolveModel(DEFAULT_MODEL_ALIAS)?.name, "Flash");
-    // Extended thinking is a toggle stacked on the base model, not a model
-    // of its own (the picker reads e.g. "Flash Extended") — verified live.
-    assert.equal(resolveModel("thinking"), undefined, "thinking is a toggle, not a model");
+    assert.equal(resolveModel(DEFAULT_MODEL_ALIAS)?.name, "Thinking");
+    assert.equal(resolveModel("3.8")?.name, "Thinking");
+    // "3.8 Thinking" is a model in the newest picker; "Extended thinking"
+    // is still the toggle stacked on top of whichever model is selected.
+    const thinking = resolveModel("thinking")!;
+    assert.ok(thinking.matches("3.8 Thinking\nReasons before answering"));
+    assert.ok(thinking.matches("Thinking"));
+    assert.ok(!thinking.matches("Standard thinking\nQuick everyday help"));
+    assert.ok(!thinking.matches("High thinking\nComplex problem solving"));
+    assert.ok(!thinking.matches("Extended thinking"));
+    assert.ok(!resolveModel("pro")!.matches("3.8 Thinking\nComplex problem solving"), "pro's blurb rule must not steal Thinking");
+    assert.ok(!EXTENDED_THINKING.matches("3.8 Thinking\nReasons before answering"), "the toggle must not click the Thinking model");
+    assert.deepEqual(modelWithFallbacks(thinking).map((m) => m.name), ["Thinking", "Pro", "Flash"]);
   });
 
   await test("matches live menu labels despite version-number drift", () => {
@@ -1443,12 +1499,14 @@ async function main() {
   });
 
   await test("maps any client model name to a Gemini model", () => {
-    assert.equal(modelAliasFor(undefined), "fast");
+    assert.equal(modelAliasFor(undefined), "thinking");
+    assert.equal(modelAliasFor("gemini-web-thinking"), "thinking");
+    assert.equal(modelAliasFor("gemini-3.8-thinking"), "thinking");
     assert.equal(modelAliasFor("gemini-web-pro"), "pro");
     assert.equal(modelAliasFor("gemini-web-flash-lite"), "fastest");
     assert.equal(modelAliasFor("gemini-2.5-pro"), "pro", "real Gemini API names work");
     assert.equal(modelAliasFor("gemini-2.0-flash-lite"), "fastest", "lite wins over flash");
-    assert.equal(modelAliasFor("gpt-4o"), "fast", "unknown names fall back instead of failing");
+    assert.equal(modelAliasFor("gpt-4o"), "thinking", "unknown names fall back instead of failing");
   });
 
   await test("rejects requests the web UI can't serve", () => {

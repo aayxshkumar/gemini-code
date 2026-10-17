@@ -1,7 +1,8 @@
 # gemini-code
 
-A Claude-Code-style terminal coding agent that runs on the **Gemini web UI**, for
-people who have a Gemini web subscription but no Gemini API or CLI access.
+A Claude-Code-style terminal coding agent that runs on the **Gemini web UI**
+(**3.8 Thinking** by default), for people who have a Gemini web subscription but
+no Gemini API or CLI access.
 
 It drives a real, logged-in Chrome tab with Playwright: your prompt goes into the
 composer, Gemini's reply is parsed back out, and any tools it asks for run
@@ -11,9 +12,9 @@ composer, Gemini's reply is parsed back out, and any tools it asks for run
 ✻ gemini-code — Claude-Code-style agent on the Gemini web UI
 
   cwd     my-project
-  model   Flash
+  model   Thinking (picker: 3.8 Thinking)
   context project tree (41 lines), GEMINI.md, 1 doc (README.md)
-  tools   read_file, write_file, run_bash, list_files, remember, fetch_url, delegate_tasks, update_plan
+  tools   read_file, write_file, edit_file, search_code, git_status, git_diff, run_bash, check_output, kill_process, list_files, remember, fetch_url, web_search, delegate_tasks, update_plan, screenshot_page, read_page, browser_open, browser_do
   workers up to 3 parallel Gemini tabs
   mode    orchestrator — main tab plans & validates, workers implement
 
@@ -43,37 +44,67 @@ The version is 0.1.0.
 
 ## Install
 
-**One command. Nothing to clone, nothing to build.**
+Three ways, all ending with a `gemini-code` command on your PATH. Pick the first
+unless you want to hack on the source.
 
-macOS / Linux:
+**1. One command, nothing to clone** — macOS / Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Muruganandham18/gemini-code/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/aayxshkumar/gemini-code/main/install.sh | bash
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/Muruganandham18/gemini-code/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/aayxshkumar/gemini-code/main/install.ps1 | iex
 ```
 
-The installer checks your Node and Chrome, fetches the latest release (or builds
-from source if none is published yet), installs to `~/.gemini-code/app`, and puts
-`gemini-code` on your PATH. No sudo, no admin rights.
+The installer checks Node and Chrome, fetches the latest release (or builds from
+source if none is published yet), installs to `~/.gemini-code/app`, puts
+`gemini-code` on your PATH and runs `gemini-code doctor`. No sudo, no admin rights.
 
-> Two files rather than one because `curl | bash` and `irm | iex` are different
-> shells that can't read the same script — Claude Code splits them the same way.
+**2. Straight from GitHub with npm** (any OS with Node 20+):
 
-> **Running a local copy of the script instead?** `irm` fetches a *URL*, so
-> `irm .\install.ps1` fails with "Invalid URI". For a file already on disk just
-> run it: `.\install.ps1` (PowerShell) or `bash install.sh`.
+```bash
+npm install -g github:aayxshkumar/gemini-code
+```
 
-Then just run it in any project:
+**3. Clone and run the setup script** — for hacking on it, or when you want
+`git pull` to update it in place:
+
+```bash
+git clone https://github.com/aayxshkumar/gemini-code.git
+cd gemini-code
+./setup.sh          # Windows: .\setup.ps1
+```
+
+`setup.sh` installs dependencies, builds, links `gemini-code` onto your PATH
+pointing at the checkout, and runs the doctor. After that, `git pull && npm run build`
+updates it.
+
+Then, in any project:
 
 ```bash
 cd ~/code/my-project
 gemini-code
 ```
+
+The first run opens Chrome and asks you to sign in to Gemini by hand, once. After
+that the session is kept in `~/.gemini-code/profile`.
+
+### New machine checklist
+
+1. Install [Node.js 20+](https://nodejs.org) and [Google Chrome](https://google.com/chrome).
+2. Run one of the install commands above.
+3. `gemini-code doctor` — it tells you exactly what's still missing, if anything.
+4. `cd` into a project and run `gemini-code`; sign in when Chrome opens.
+5. Optional: `gemini-code config set model pro` (or any key in [Settings](#settings))
+   so your defaults travel with the machine, not with your shell profile.
+
+> Two installer files rather than one because `curl | bash` and `irm | iex` are
+> different shells that can't read the same script — Claude Code splits them the
+> same way. `irm` fetches a *URL*, so for a script already on disk just run it:
+> `bash install.sh` or `.\install.ps1`.
 
 ### Requirements
 
@@ -91,32 +122,10 @@ On an older Node, [nvm](https://github.com/nvm-sh/nvm) is the quickest fix:
 > `npx playwright install` — it drives the Chrome you already have, and the test
 > suites do too. A clean install is ~55 MB.
 
-### Other ways to install
-
-```bash
-npm install -g gemini-code          # from npm
-```
-
-From source, for hacking on it:
-
-```bash
-git clone https://github.com/Muruganandham18/gemini-code.git
-cd gemini-code
-npm install
-npm run build
-npm link            # symlinks the CLI to your checkout
-```
-
-`npm link` points at your checkout, so `git pull && npm run build` updates it in
-place.
-
 ### Updating
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Muruganandham18/gemini-code/main/install.sh | bash
-```
-
-Re-running the installer replaces the installed copy.
+Re-run the installer (it replaces the installed copy), re-run `npm install -g github:aayxshkumar/gemini-code`,
+or in a clone: `git pull && npm run build`.
 
 ### Uninstalling
 
@@ -135,6 +144,8 @@ your PATH.
 | --- | --- | --- |
 | `~/.gemini-code/app` | the installed program | n/a |
 | `~/.gemini-code/profile` | Chrome profile — **holds a live Google session** | **never** |
+| `~/.gemini-code/config.json` | your saved defaults (`gemini-code config`) | n/a |
+| `<project>/.gemini-code.json` | per-project overrides of the same keys | yes, if useful |
 | `<project>/GEMINI.md` | durable project memory | yes, if useful |
 | `<project>/GEMINI-PLAN.md` | in-flight task journal | usually not |
 | `<project>/.gemini-code-tmp/` | attachments, screenshots, undo snapshots | no |
@@ -198,8 +209,13 @@ Worth knowing:
 
 ### Troubleshooting
 
+Start with `gemini-code doctor`: it checks Node, Chrome, the profile, your PATH,
+the debug port and whether the Gemini session is signed in, and prints the fix
+next to anything wrong.
+
 | Symptom | Cause / fix |
 | --- | --- |
+| `Thinking isn't in this account's model picker — using Pro instead` | Google shows different pickers to different accounts. It fell back to the closest reasoning tier; `/model` shows what's selected. If the picker does have a Thinking entry under a new name, update the keyword rules in [`src/driver/models.ts`](src/driver/models.ts) |
 | `command not found: gemini-code` | `~/.local/bin` isn't on your PATH — the installer prints the line to add |
 | `Couldn't attach to Chrome on port 9222` | Chrome isn't up: `gemini-code open-chrome`, sign in, retry |
 | `Your Gemini session is signed out` | Session expired: `gemini-code login` and sign in |
@@ -232,6 +248,7 @@ Semantic versioning, reported by `gemini-code --version`.
 
 | Version | Highlights |
 | --- | --- |
+| **0.8.0** | **3.8 Thinking is the default model** (with a fallback chain when a picker lacks it); several tool calls per reply; lenient tool-call JSON; `gemini-code doctor`, `gemini-code config` and a persistent config file; `setup.sh`/`setup.ps1` for clones; `npm install -g github:…`; CI and tagged releases |
 | **0.4.1** | Windows: commands run in the same console with output captured, Git Bash preferred over cmd, process trees killed properly |
 | **0.4.0** | command output saved to searchable logs; errors surfaced from anywhere in a long build |
 | **0.3.1** | stops the loop ending on a progress report; continuation nudging from the plan |
@@ -278,8 +295,8 @@ Type a task. `/help` lists commands. `exit` quits.
 | Command | What it does |
 | --- | --- |
 | `/model` | show current model |
-| `/model fastest\|fast\|pro` | switch model |
-| `/thinking on\|off` | extended thinking |
+| `/model thinking\|fast\|fastest\|pro` | switch model (`thinking` = 3.8 Thinking, the default) |
+| `/thinking on\|off` | the Extended thinking toggle on top of the model (off by default; Thinking already reasons) |
 | `/undo` | revert all file changes from the last task |
 | `/plan`, `/plan clear` | show / delete the progress journal |
 | `/memory`, `/remember <note>` | show / append durable project memory |
@@ -294,11 +311,29 @@ Type a task. `/help` lists commands. `exit` quits.
 Typing **while a task runs** steers it — your text is folded into the next turn as a
 `USER UPDATE`, so you can redirect mid-flight instead of waiting.
 
-### Environment
+### Settings
+
+Every setting can be an environment variable, a key in `~/.gemini-code/config.json`
+(managed by `gemini-code config set <key> <value>`), or a key in a project's
+`.gemini-code.json`. Environment wins over project file, which wins over the user file.
+
+```bash
+gemini-code config                     # what's in effect, and where each value comes from
+gemini-code config set model pro       # saved to ~/.gemini-code/config.json
+gemini-code config set workers 2
+gemini-code config set autoApprove true
+gemini-code config unset model
+```
+
+Friendly keys: `model`, `thinking`, `workers`, `orchestrator`, `autoApprove`, `maxTurns`,
+`shell`, `chrome`, `profile`, `gem`, `responseTimeoutMs`, `apiPort`, `apiKey` — or any
+raw `GEMINI_CODE_*` name from the table.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GEMINI_CODE_MODEL` | `fast` | `fastest` \| `fast` \| `pro` |
+| `GEMINI_CODE_MODEL` | `thinking` | `thinking` (3.8 Thinking) \| `fast` \| `fastest` \| `pro` |
+| `GEMINI_CODE_THINKING` | `off` | `on` turns on the Extended thinking toggle on top of the model |
+| `GEMINI_CODE_CHROME` | auto-detected | path to the Chrome executable |
 | `GEMINI_CODE_GEM` | unset | Gem to consult, by name or id (same as `--gem`) |
 | `GEMINI_CODE_GEM_MODE` | `reference` | `inside` runs the whole session in the Gem |
 | `GEMINI_CODE_ORCHESTRATOR` | `1` | `0` = one tab does everything |
@@ -332,7 +367,7 @@ gemini-code serve                 # http://127.0.0.1:8787/v1
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="anything")
 r = client.chat.completions.create(
-    model="gemini-web-flash",
+    model="gemini-web-thinking",
     messages=[{"role": "user", "content": "Explain CORS in two sentences."}],
 )
 print(r.choices[0].message.content)
@@ -345,7 +380,7 @@ const client = new OpenAI({ baseURL: "http://127.0.0.1:8787/v1", apiKey: "anythi
 
 ```bash
 curl http://127.0.0.1:8787/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"model":"gemini-web-flash","messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"gemini-web-thinking","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 **What's supported** (all tested with the official OpenAI Python SDK against a live
@@ -353,16 +388,16 @@ session):
 
 | Feature | Notes |
 | --- | --- |
-| `GET /v1/models` | `gemini-web-flash` (default), `gemini-web-pro`, `gemini-web-flash-lite` |
+| `GET /v1/models` | `gemini-web-thinking` (default), `gemini-web-flash`, `gemini-web-pro`, `gemini-web-flash-lite` |
 | `POST /v1/chat/completions` | system, user, assistant and tool messages |
 | Streaming (`stream: true`) | server-sent events ending in `[DONE]`; `stream_options.include_usage` works |
 | Function calling (`tools`) | returns real `tool_calls` with `finish_reason: "tool_calls"`; `tool_choice` `auto` / `required` / a named function / `none` |
 | Images | `image_url` parts, as `data:` URLs or `http(s)` URLs |
 | Markdown output | code fences with their language, headings, lists and tables, rebuilt from the rendered reply |
 
-Model names are lenient: `gemini-2.5-pro` picks Pro, anything with `lite` picks
-Flash-Lite, and names it doesn't know (a hard-coded `gpt-4o`, say) get the default
-rather than an error.
+Model names are lenient: `gemini-2.5-pro` picks Pro, anything with `thinking` picks
+3.8 Thinking, anything with `lite` picks Flash-Lite, and names it doesn't know (a
+hard-coded `gpt-4o`, say) get the default rather than an error.
 
 **How a stateless API maps onto a stateful chat.** Every API request carries the whole
 conversation; a Gemini tab remembers its own thread. When a request is exactly an
@@ -406,6 +441,15 @@ The web UI has no function-calling API, so tool use is prompted: Gemini is told 
 emit a JSON code block, and this program parses it, runs the tool locally, and sends
 the result back as the next message in the same thread. Gemini's own UI keeps the
 conversation history — this tool never replays it.
+
+A reply may carry **several independent tool calls** — one code block each, or a
+JSON array in one block. They run in order and every result comes back in one
+message, headed `[i/N]`, so reading three files costs one trip through the web UI
+instead of three. The primer tells Gemini to batch reads and searches that don't
+depend on each other, and never a call whose arguments depend on an earlier result.
+The parser also repairs the JSON models most often get slightly wrong (a trailing
+comma, a `//` comment, `tool`/`function` instead of `name`), instead of bouncing
+the turn back for a retry.
 
 One subtlety worth knowing: the UI renders markdown to HTML before we can read it,
 so a ` ``` ` fence never survives as literal backticks — only the *content* of the
@@ -622,7 +666,8 @@ like a password: never commit it, never copy it around. It's gitignored here.
 ## Development
 
 ```bash
-npm test             # 56 tests: parser, tools, loop, workers, plan, context
+./setup.sh           # clone -> on your PATH, pointing at this checkout
+npm test             # 106 tests: parser, tools, loop, workers, plan, context, API
 npm run test:browser # headless Chromium: launch, logged-out detection, interactive browsing
 npm run test:e2e     # REAL Gemini round trip (needs open-chrome + sign-in)
 npm run dev          # run from source without building
@@ -632,9 +677,12 @@ npm run dev          # run from source without building
 src/
   driver/     Playwright automation (selectors.ts is the DOM-coupled file)
   agent/      prompt contract, tool-call parsing, the agent loop, worker pool
-  tools/      read/write/bash/fetch/list/remember/update_plan
+  tools/      read/edit/write/search/git/bash/fetch/search/browse/remember/update_plan
   context/    project tree, docs, GEMINI.md memory, plan journal
+  server/     the OpenAI-compatible API
+  scripts/    open-chrome, login, doctor, config subcommands
   ui/         terminal formatting
+  config.ts   ~/.gemini-code/config.json and <project>/.gemini-code.json -> env
   cli.ts      REPL, slash commands, orchestrator wiring
 ```
 
