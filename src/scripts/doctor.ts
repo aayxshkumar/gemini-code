@@ -5,7 +5,8 @@ import { findChromeExecutable, isChromeReachable, DEBUG_PORT } from "./openChrom
 import { resolveProfileDir, GeminiDriver } from "../driver/GeminiDriver.js";
 import { homeDir, userConfigPath, projectConfigPath, readConfigFile } from "../config.js";
 import { DEFAULT_MODEL_ALIAS } from "../driver/models.js";
-import { c } from "../ui/format.js";
+import { c, glyph } from "../ui/format.js";
+import { resolveShell } from "../tools/bash.js";
 
 const require = createRequire(import.meta.url);
 
@@ -16,11 +17,11 @@ const require = createRequire(import.meta.url);
  */
 export async function doctor(): Promise<void> {
   let fatal = 0;
-  const ok = (m: string) => console.log(`  ${c.green("✓")} ${m}`);
+  const ok = (m: string) => console.log(`  ${c.green(glyph.ok)} ${m}`);
   const warn = (m: string) => console.log(`  ${c.yellow("!")} ${m}`);
   const bad = (m: string) => {
     fatal++;
-    console.log(`  ${c.red("✗")} ${m}`);
+    console.log(`  ${c.red(glyph.bad)} ${m}`);
   };
 
   console.log(`\n${c.bold("gemini-code doctor")}\n`);
@@ -28,6 +29,14 @@ export async function doctor(): Promise<void> {
   // Node
   const major = Number(process.versions.node.split(".")[0]);
   if (major >= 20) ok(`Node.js ${process.version}`);
+  if (process.platform === "win32") {
+    const shell = resolveShell();
+    const name = shell === true ? "cmd.exe" : String(shell).split(/[\\/]/).pop();
+    if (/bash/i.test(String(name))) ok(`shell for commands: ${name} (Git Bash)`);
+    else if (/pwsh|powershell/i.test(String(name))) warn(`shell for commands: ${name} — works, but Git Bash is better for the model; install Git for Windows (https://git-scm.com/download/win)`);
+    else warn("shell for commands: cmd.exe — install Git for Windows so commands run in bash (https://git-scm.com/download/win)");
+    if (!process.env.WT_SESSION && !process.env.TERM_PROGRAM) warn("legacy console detected — Windows Terminal renders this tool's output better (Microsoft Store: Windows Terminal)");
+  }
   else bad(`Node.js ${process.version} — needs 20+. Install from https://nodejs.org or: nvm install 20`);
 
   // Playwright present (the one runtime dependency)
@@ -44,8 +53,10 @@ export async function doctor(): Promise<void> {
     (process.platform === "darwin"
       ? ["/Applications/Google Chrome.app", path.join(process.env.HOME ?? "", "Applications/Google Chrome.app")].find((p) => existsSync(p))
       : findChromeExecutable());
-  if (chrome) ok(`Google Chrome: ${chrome}`);
-  else bad("Google Chrome not found — install it from https://google.com/chrome, or set GEMINI_CODE_CHROME to its path");
+  if (chrome) ok(`${/msedge/i.test(chrome) ? "Microsoft Edge (Chromium — works like Chrome here)" : "Google Chrome"}: ${chrome}`);
+  else bad(process.platform === "win32"
+    ? "Neither Google Chrome nor Microsoft Edge found — install one, or set GEMINI_CODE_CHROME to the browser's full path"
+    : "Google Chrome not found — install it from https://google.com/chrome, or set GEMINI_CODE_CHROME to its path");
 
   // Profile + home
   const profile = resolveProfileDir();

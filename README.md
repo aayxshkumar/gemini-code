@@ -44,66 +44,78 @@ The version is 0.1.0.
 
 ## Install
 
-Two ways, both ending with a `gemini-code` command on your PATH. Pick the first
-unless you want to hack on the source.
+### Windows (recommended path)
 
-**1. One command, nothing to clone** — macOS / Linux:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/aayxshkumar/gemini-code/main/install.sh | bash
-```
-
-Windows (PowerShell):
+Open **PowerShell** (Windows Terminal is best; the old console works but renders
+plainer) and run:
 
 ```powershell
 irm https://raw.githubusercontent.com/aayxshkumar/gemini-code/main/install.ps1 | iex
 ```
 
-The installer checks Node and Chrome, fetches the latest release (or builds from
-source if none is published yet), installs to `~/.gemini-code/app`, puts
-`gemini-code` on your PATH and runs `gemini-code doctor`. No sudo, no admin rights.
+That checks Node and your browser (Chrome **or Microsoft Edge** — both work),
+downloads the latest release to `%USERPROFILE%\.gemini-code\app`, adds
+`gemini-code` to your user PATH, and runs `gemini-code doctor`. No admin rights.
 
-**2. Clone and run the setup script** — for hacking on it, or when you want
-`git pull` to update it in place:
+Then, **in a new terminal**:
 
-```bash
-git clone https://github.com/aayxshkumar/gemini-code.git
-cd gemini-code
-./setup.sh          # Windows: .\setup.ps1
-```
-
-`setup.sh` installs dependencies, builds, links `gemini-code` onto your PATH
-pointing at the checkout, and runs the doctor. After that, `git pull && npm run build`
-updates it.
-
-Then, in any project:
-
-```bash
-cd ~/code/my-project
+```powershell
+cd C:\src\my-project
 gemini-code
 ```
 
-The first run opens Chrome and asks you to sign in to Gemini by hand, once. After
-that the session is kept in `~/.gemini-code/profile`.
+The first run opens the browser for you to sign in to Gemini once, then lists
+the models your account's picker offers (e.g. `3.8 Thinking`) and asks which to
+use. The choice is saved.
+
+**From a clone instead** (when you want `git pull` to update it):
+
+```powershell
+git clone https://github.com/aayxshkumar/gemini-code.git
+cd gemini-code
+powershell -ExecutionPolicy Bypass -File .\setup.ps1     # or: npm run setup
+```
+
+(`-ExecutionPolicy Bypass` is needed because Windows blocks local scripts by
+default; it applies to this one command only.)
+
+**Windows notes**
+
+- **Shell for commands.** The agent runs commands in **Git Bash** when
+  [Git for Windows](https://git-scm.com/download/win) is installed — install it,
+  it's what the model writes best. Without it, PowerShell is used (and the model
+  is told to write PowerShell), then cmd.exe as a last resort. The WSL `bash.exe`
+  in System32 is never picked. Override with `gemini-code config set shell pwsh.exe`.
+- **Browser.** Chrome if present, otherwise Edge (`msedge.exe`). Point at another
+  Chromium with `gemini-code config set chrome "C:\\path\\to\\browser.exe"`.
+- **Paste an image.** Windows Terminal keeps Ctrl+V for itself, so type `/paste`
+  after copying a screenshot (Win+Shift+S).
+- **CRLF files** are edited and written back as CRLF; searches work on CRLF
+  checkouts.
+- `gemini-code doctor` tells you which shell and browser it found and whether
+  you're on the legacy console.
+
+Both Windows scripts (`install.ps1`, `setup.ps1`) run on a real Windows runner
+in CI on every push, so they are tested, not assumed.
+
+### macOS / Linux
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aayxshkumar/gemini-code/main/install.sh | bash
+```
+
+or from a clone: `./setup.sh`. Same behaviour as the Windows path.
 
 ### New machine checklist
 
-1. Install [Node.js 20+](https://nodejs.org) and [Google Chrome](https://google.com/chrome).
-2. Run one of the install commands above.
+1. Install [Node.js 20+](https://nodejs.org) (`winget install OpenJS.NodeJS.LTS`), and
+   [Git for Windows](https://git-scm.com/download/win). Chrome or Edge must be present.
+2. Run the install command above.
 3. `gemini-code doctor` — it tells you exactly what's still missing, if anything.
-4. `cd` into a project and run `gemini-code`; sign in when Chrome opens.
-5. **Pick your model.** With nothing configured yet, the first start lists what
-   *this account's* picker actually offers — e.g. `3.8 Thinking`, `Auto`, `3.1 Pro`
-   (locked entries marked) — and asks you to choose by number or name. The choice is
-   saved to `~/.gemini-code/config.json`, so it isn't asked again. Any time later:
-   `gemini-code --model "3.8 Thinking"`, `gemini-code --choose-model`, `/models` and
-   `/model <name>` inside a session, or `gemini-code config set model thinking`.
-6. Optional: other defaults with `gemini-code config set <key> <value>` (see [Settings](#settings)).
-
-> Two installer files rather than one because `curl | bash` and `irm | iex` are
-> different shells that can't read the same script — Claude Code splits them the
-> same way. `irm` fetches a *URL*, so for a script already on disk just run it:
-> `bash install.sh` or `.\install.ps1`.
+4. `cd` into a project and run `gemini-code`; sign in when the browser opens; pick
+   your model when asked (`--model "3.8 Thinking"` also works).
+5. Optional defaults with `gemini-code config set <key> <value>` (see [Settings](#settings)):
+   `autoApprove edits` is the practical one on a real project.
 
 ### Requirements
 
@@ -248,6 +260,7 @@ Semantic versioning, reported by `gemini-code --version`.
 
 | Version | Highlights |
 | --- | --- |
+| **0.12.0** | **Windows first**: Microsoft Edge works as the browser; command shell is Git Bash → PowerShell → cmd (never the WSL launcher) with the model told which syntax to write; ASCII output on the legacy console; `npm run setup` works on Windows; `install.ps1` and `setup.ps1` run in CI on a Windows runner; README leads with the Windows path |
 | **0.11.1** | Windows: `search_code` parsed nothing from `git grep` on CRLF checkouts (every hit ended in `\r`); walk results now use forward slashes; CI green on Ubuntu, macOS and Windows |
 | **0.11.0** | **Stalls and failures handled**: Ctrl+C cancels the task (twice quits); a stuck generation is stopped before a resend; a closed tab, dropped connection or dead Chrome is recovered and the thread re-primed from the journal; offline and signed-out pauses wait instead of burning retries; a tool that never returns is abandoned; identical or ping-pong calls and endless exploring are pointed out; "can't see the attachment" resends inline; optional wall-clock task cap; binary reads refused; advisory lock when two sessions share a project |
 | **0.10.0** | Agent threads run as Gemini **Temporary chats** (your history stays yours); messages over the composer's 32k limit are attached in full instead of silently cut; `ask_user` for genuine ambiguity; unattended runs decline instead of hanging on a y/N; structured handoff notes on compaction; coding-standards block in the primer; quota messages recognised |

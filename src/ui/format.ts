@@ -7,6 +7,26 @@ const enabled = process.stdout.isTTY && !process.env.NO_COLOR;
 const wrap = (open: number, close: number) => (s: string) =>
   enabled ? `[${open}m${s}[${close}m` : s;
 
+/**
+ * The legacy Windows console (conhost with an OEM code page) mangles the
+ * Unicode glyphs this UI uses; Windows Terminal, VS Code's terminal and
+ * every Unix terminal render them fine. Pick plain ASCII when it looks
+ * like the legacy console. GEMINI_CODE_ASCII=1 forces it anywhere.
+ */
+const legacyWindowsConsole =
+  process.platform === "win32" && !process.env.WT_SESSION && !process.env.TERM_PROGRAM && !process.env.ConEmuANSI;
+export const ASCII = process.env.GEMINI_CODE_ASCII === "1" || legacyWindowsConsole;
+export const glyph = {
+  bullet: ASCII ? "*" : "⏺",
+  branch: ASCII ? "  |-" : "  ⎿ ",
+  star: ASCII ? "*" : "✻",
+  ok: ASCII ? "+" : "✓",
+  bad: ASCII ? "x" : "✗",
+  warn: ASCII ? "!" : "!",
+  prompt: ASCII ? "> " : "› ",
+  resume: ASCII ? "~" : "⟳",
+};
+
 export const c = {
   dim: wrap(2, 22),
   bold: wrap(1, 22),
@@ -22,18 +42,18 @@ export const c = {
 /** Claude Code-style tool-call line: ⏺ read_file(package.json) */
 export function toolCallLine(name: string, args: Record<string, unknown>): string {
   const summary = summarizeArgs(args);
-  return `${c.green("⏺")} ${c.bold(name)}${c.dim("(")}${summary}${c.dim(")")}`;
+  return `${c.green(glyph.bullet)} ${c.bold(name)}${c.dim("(")}${summary}${c.dim(")")}`;
 }
 
 /** Claude Code-style result line, indented under the call: ⎿ 42 lines */
 export function toolResultLine(ok: boolean, output: string): string {
-  const marker = c.dim("  ⎿ ");
+  const marker = c.dim(glyph.branch);
   if (!ok) return `${marker}${c.red(firstLine(output, 120))}`;
   return `${marker}${c.dim(describeOutput(output))}`;
 }
 
 export function noteLine(text: string): string {
-  return `${c.dim("  ⎿ ")}${c.dim(text)}`;
+  return `${c.dim(glyph.branch)}${c.dim(text)}`;
 }
 
 function summarizeArgs(args: Record<string, unknown>): string {

@@ -8,7 +8,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -19,3 +19,45 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+
+  # The user runs this on Windows. The PowerShell installer and setup script
+  # can't be exercised on a Mac, so they run here, for real, on every push.
+  windows-install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: setup.ps1 from a clone (the "git clone + setup" route)
+        shell: pwsh
+        run: |
+          .\setup.ps1
+          $bin = Join-Path $PWD "bin\gemini-code.cmd"
+          & $bin --version
+          & $bin doctor
+          & $bin config set model auto
+          & $bin config
+          if (-not (Test-Path "$env:USERPROFILE\.gemini-code\config.json")) { throw "config.json was not written" }
+      - name: install.ps1 (the one-command route, downloads the latest release)
+        shell: pwsh
+        run: |
+          $env:GEMINI_CODE_HOME = Join-Path $env:RUNNER_TEMP "gc-home"
+          .\install.ps1
+          $cmd = Join-Path $env:GEMINI_CODE_HOME "bin\gemini-code.cmd"
+          if (-not (Test-Path $cmd)) { throw "shim not created at $cmd" }
+          & $cmd --version
+          & $cmd doctor
+      - name: run_bash picks a sane shell on Windows
+        shell: pwsh
+        run: |
+          node --input-type=module -e "
+            import { resolveShell, bashTool } from './dist/tools/bash.js';
+            const shell = resolveShell();
+            console.log('shell:', shell);
+            if (/System32/i.test(String(shell))) throw new Error('picked the WSL launcher');
+            process.env.GEMINI_CODE_AUTO_APPROVE = '1';
+            const r = await bashTool.run({ command: 'echo hello-from-shell' });
+            console.log(r.output);
+            if (!/hello-from-shell/.test(r.output)) throw new Error('command did not run');
+          "

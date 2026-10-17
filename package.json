@@ -1,6 +1,6 @@
 {
   "name": "gemini-code",
-  "version": "0.11.1",
+  "version": "0.12.0",
   "description": "Claude-Code-style coding agent that drives the Gemini web UI (3.8 Thinking by default) via Playwright, for people with a Gemini web plan but no API access.",
   "type": "module",
   "scripts": {
@@ -15,7 +15,7 @@
     "package": "bash scripts/package-release.sh",
     "prepublishOnly": "npm run build && npm test",
     "prepare": "node scripts/prepare.mjs",
-    "setup": "bash setup.sh",
+    "setup": "node scripts/setup.mjs",
     "doctor": "node dist/cli.js doctor"
   },
   "dependencies": {
@@ -31,10 +31,11 @@
     "gemini-code": "dist/cli.js"
   },
   "files": [
+    "LICENSE",
+    "README.md",
     "dist",
     "scripts/prepare.mjs",
-    "README.md",
-    "LICENSE"
+    "scripts/setup.mjs"
   ],
   "license": "MIT",
   "engines": {
