@@ -1,6 +1,6 @@
 {
   "name": "gemini-code",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "Claude-Code-style coding agent that drives the Gemini web UI (3.8 Thinking by default) via Playwright, for people with a Gemini web plan but no API access.",
   "type": "module",
   "scripts": {
