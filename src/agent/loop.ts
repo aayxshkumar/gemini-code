@@ -248,71 +248,86 @@ export class AgentSession {
         continue;
       }
 
-      // kind === "tool_call"
-      toolCallsMade++;
-      const { name, args } = parsed.call;
-      log(toolCallLine(name, args));
-      const tool = this.toolsByName[name];
-      const result = tool
-        ? await tool.run(args)
-        : { ok: false, output: `Error: unknown tool "${name}". Available: ${Object.keys(this.toolsByName).join(", ")}` };
+      // kind === "tool_call" — one call, or several independent ones that
+      // the model batched into one reply. They run in order; every result
+      // goes back in the same message, so N reads cost one web-UI round
+      // trip instead of N.
+      const batch = parsed.calls;
+      if (batch.length > 1) log(noteLine(`${batch.length} tool calls in one reply — running them in order`));
+      const sections: string[] = [];
+      let stalled = false;
+      for (let i = 0; i < batch.length; i++) {
+        const { name, args } = batch[i];
+        toolCallsMade++;
+        log(toolCallLine(name, args));
+        const tool = this.toolsByName[name];
+        const result = tool
+          ? await tool.run(args)
+          : { ok: false, output: `Error: unknown tool "${name}". Available: ${Object.keys(this.toolsByName).join(", ")}` };
 
-      log(toolResultLine(result.ok, result.output));
+        log(toolResultLine(result.ok, result.output));
 
-      if (result.ok) {
-        turnsSinceProgress = 0;
-        lastFailure = "";
-        sameFailureCount = 0;
-      } else {
-        turnsSinceProgress++;
-        // Same tool, same first line of error = the same wall, hit again.
-        const signature = `${name}: ${result.output.split("\n")[0].slice(0, 120)}`;
-        sameFailureCount = signature === lastFailure ? sameFailureCount + 1 : 1;
-        lastFailure = signature;
-      }
-      await this.journal?.log(
-        `${name}(${truncateArgs(args)}) -> ${result.ok ? "ok" : "ERROR"}: ${result.output.replace(/\s+/g, " ").slice(0, 160)}`
-      );
-
-      // Repeating one failing call wastes the whole task. Say plainly that
-      // this approach is not working and name the ways out, once — the model
-      // otherwise tends to re-send a near-identical call.
-      if (!result.ok && (sameFailureCount >= REPEAT_FAILURE_LIMIT || turnsSinceProgress >= STALL_TURNS)) {
-        const why =
-          sameFailureCount >= REPEAT_FAILURE_LIMIT
-            ? `That is ${sameFailureCount} attempts at ${name} failing the same way.`
-            : `Nothing has succeeded for ${turnsSinceProgress} turns.`;
-        log(noteLine(`stuck — telling it to change approach (${why})`));
-        await this.journal?.log(`stall: ${why}`);
-        message = formatToolResult(
-          `${result.output}\n\n` +
-            `STOP AND CHANGE APPROACH. ${why} Repeating it will not start working.\n` +
-            `- If an edit will not match, read the file again and copy the target text from what you just read, ` +
-            `or replace the whole file with write_file.\n` +
-            `- If a command keeps failing, read its error with check_output before running it again.\n` +
-            `- If this step cannot be done, move on to the next one and report what you skipped at the end.`
+        if (result.ok) {
+          turnsSinceProgress = 0;
+          lastFailure = "";
+          sameFailureCount = 0;
+        } else {
+          turnsSinceProgress++;
+          // Same tool, same first line of error = the same wall, hit again.
+          const signature = `${name}: ${result.output.split("\n")[0].slice(0, 120)}`;
+          sameFailureCount = signature === lastFailure ? sameFailureCount + 1 : 1;
+          lastFailure = signature;
+        }
+        await this.journal?.log(
+          `${name}(${truncateArgs(args)}) -> ${result.ok ? "ok" : "ERROR"}: ${result.output.replace(/\s+/g, " ").slice(0, 160)}`
         );
-        turnsSinceProgress = 0;
-        sameFailureCount = 0;
-        lastFailure = "";
-        continue;
-      }
 
-      if (result.attachment) {
-        // A tool handed back a file (e.g. a screenshot) for Gemini to see.
-        attachFile.push(result.attachment);
-        log(noteLine(`attaching ${path.basename(result.attachment)}`));
-        message = formatToolResult(result.output);
-      } else if (result.output.length > MAX_INLINE_RESULT_CHARS) {
-        attachFile.push(await this.writeAttachment(name, args, result.output));
-        const attached = attachFile[attachFile.length - 1];
-        log(noteLine(`too long to paste — attaching ${path.basename(attached)}`));
-        message = formatToolResult(
-          `Output was too long to paste (${result.output.length} characters), so it is ATTACHED to this message as "${path.basename(attached)}". Read the attached file for the full result.`
-        );
-      } else {
-        message = formatToolResult(result.output);
+        // Repeating one failing call wastes the whole task. Say plainly that
+        // this approach is not working and name the ways out, once — the
+        // model otherwise tends to re-send a near-identical call.
+        if (!result.ok && (sameFailureCount >= REPEAT_FAILURE_LIMIT || turnsSinceProgress >= STALL_TURNS)) {
+          const why =
+            sameFailureCount >= REPEAT_FAILURE_LIMIT
+              ? `That is ${sameFailureCount} attempts at ${name} failing the same way.`
+              : `Nothing has succeeded for ${turnsSinceProgress} turns.`;
+          log(noteLine(`stuck — telling it to change approach (${why})`));
+          await this.journal?.log(`stall: ${why}`);
+          sections.push(
+            `${this.label(batch, i)}${result.output}\n\n` +
+              `STOP AND CHANGE APPROACH. ${why} Repeating it will not start working.\n` +
+              `- If an edit will not match, read the file again and copy the target text from what you just read, ` +
+              `or replace the whole file with write_file.\n` +
+              `- If a command keeps failing, read its error with check_output before running it again.\n` +
+              `- If this step cannot be done, move on to the next one and report what you skipped at the end.`
+          );
+          turnsSinceProgress = 0;
+          sameFailureCount = 0;
+          lastFailure = "";
+          stalled = true;
+          break;
+        }
+
+        if (result.attachment) {
+          // A tool handed back a file (e.g. a screenshot) for Gemini to see.
+          attachFile.push(result.attachment);
+          log(noteLine(`attaching ${path.basename(result.attachment)}`));
+          sections.push(`${this.label(batch, i)}${result.output}`);
+        } else if (result.output.length > MAX_INLINE_RESULT_CHARS) {
+          const attached = await this.writeAttachment(name, args, result.output, batch.length > 1 ? i + 1 : undefined);
+          attachFile.push(attached);
+          log(noteLine(`too long to paste — attaching ${path.basename(attached)}`));
+          sections.push(
+            `${this.label(batch, i)}Output was too long to paste (${result.output.length} characters), so it is ATTACHED ` +
+              `to this message as "${path.basename(attached)}". Read the attached file for the full result.`
+          );
+        } else {
+          sections.push(`${this.label(batch, i)}${result.output}`);
+        }
       }
+      if (stalled && batch.length > 1) {
+        sections.push(`(The remaining ${batch.length - sections.length} call(s) in that batch were not run.)`);
+      }
+      message = formatToolResult(sections.join("\n\n"));
     }
 
     await this.journal?.markInterrupted("hit the max tool-call turns");
@@ -412,11 +427,19 @@ export class AgentSession {
     return filePath;
   }
 
+  /** Heads each result in a batched reply, so the model can tell them apart. */
+  private label(batch: { name: string; args: Record<string, unknown> }[], i: number): string {
+    if (batch.length === 1) return "";
+    return `[${i + 1}/${batch.length}] ${batch[i].name}(${truncateArgs(batch[i].args)}):\n`;
+  }
+
   /** Writes an oversized tool result to a temp file for upload, named after what produced it. */
   private async writeAttachment(
     toolName: string,
     args: Record<string, unknown>,
-    output: string
+    output: string,
+    /** Position in a batch, so two long results in one turn don't share a filename. */
+    index?: number
   ): Promise<string> {
     const dir = path.resolve(process.cwd(), TMP_DIR);
     await mkdir(dir, { recursive: true });
@@ -428,7 +451,7 @@ export class AgentSession {
     // after sending, so reuse is safe.
     const sourcePath = typeof args.path === "string" ? args.path : undefined;
     const base = sourcePath ? path.basename(sourcePath) : `${toolName}-output.txt`;
-    const filePath = path.join(dir, base);
+    const filePath = path.join(dir, index === undefined ? base : `${index}-${base}`);
 
     await writeFile(filePath, output, "utf8");
     return filePath;

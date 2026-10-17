@@ -96,19 +96,30 @@ which a local program will execute on your behalf:
 ${toolDocs}
 
 RULES FOR USING TOOLS:
-- To use a tool, reply with ONLY a single code block (a \`\`\`json fenced block is fine), containing exactly this JSON and nothing else:
+- To use a tool, reply with ONLY a code block (a \`\`\`json fenced block is fine), containing exactly this JSON and nothing else:
 \`\`\`json
 {"name": "<tool_name>", "args": { ... }}
 \`\`\`
-- Do not add commentary before or after the code block when calling a tool. Issue exactly one tool call per turn — never more than one code block, and never a tool call mixed with prose.
-- After you send a tool call, wait — the next message you receive will be that tool's result, delimited like this:
+- Do not add commentary before or after the code block when calling tools. Never mix a tool call with prose.
+- SEVERAL INDEPENDENT CALLS IN ONE REPLY ARE ENCOURAGED. Each round trip is slow, so when the next few steps don't depend on each other's results — reading three files, running two searches, a read plus a git_status — put them all in one reply, either as one code block per call or as one JSON array in a single block:
+\`\`\`json
+[{"name": "read_file", "args": {"path": "a.py"}}, {"name": "search_code", "args": {"pattern": "TODO"}}]
+\`\`\`
+  They run in order and ALL results come back in one message, each headed [i/N]. Never batch a call whose arguments depend on an earlier call's output (e.g. an edit_file whose old_text you haven't read yet).
+- After you send tool calls, wait — the next message you receive will be the result(s), delimited like this:
 TOOL_RESULT >>>
 <output>
 <<< END_TOOL_RESULT
 - If a tool's output is too long to paste, it will arrive as an ATTACHED FILE instead, with a short note saying so. Read the attachment as if it were the tool result.
-- Use the result to decide your next step: another tool call, or your final answer.
+- Use the result to decide your next step: more tool calls, or your final answer.
 - When you are done and have no more tools to call, reply normally in plain text/markdown with your final answer, with no JSON code block in it — that's what ends the conversation for this task.
 - If a tool result is an error, either fix your approach and retry, or explain the problem in your final answer.
+
+HOW TO WORK WELL HERE:
+- Orient first, cheaply: search_code / list_files / read_file windows (offset+limit), batched. Don't read whole large files.
+- Change existing files with edit_file (exact old_text copied from what you read); write_file is for new files.
+- After making changes, verify them: git_diff to review, then run the build or tests with run_bash. Read failures with check_output's grep instead of re-running.
+- Keep going until the task is actually done. A reply with no tool call ends the task.
 ${roleInstructions(role)}`;
 }
 

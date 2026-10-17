@@ -86,7 +86,7 @@ export function validateRequest(body: unknown): string | undefined {
 
 /** Model ids advertised on /v1/models: one per picker entry. */
 export const API_MODELS = MODELS.map((m) => ({
-  id: `gemini-web-${m.aliases[m.aliases.length > 1 ? 1 : 0]}`,
+  id: `gemini-web-${m.name.toLowerCase()}`,
   alias: m.aliases[0],
   name: m.name,
 }));

@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # gemini-code installer — macOS and Linux.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Muruganandham18/gemini-code/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/aayxshkumar/gemini-code/main/install.sh | bash
 #
 # Installs to ~/.gemini-code/app and links the launcher onto your PATH.
 # Nothing here needs sudo unless you point PREFIX at a system directory.
 set -euo pipefail
 
-REPO="Muruganandham18/gemini-code"
+REPO="${GEMINI_CODE_REPO:-aayxshkumar/gemini-code}"
+REF="${GEMINI_CODE_REF:-main}"
 APP_DIR="${GEMINI_CODE_HOME:-$HOME/.gemini-code}/app"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
 
@@ -81,10 +82,11 @@ else
   command -v git >/dev/null 2>&1 || die "git is required to build from source"
   command -v npm >/dev/null 2>&1 || die "npm is required to build from source"
   TMP="$(mktemp -d)"
-  git clone --depth 1 -q "https://github.com/$REPO.git" "$TMP"
+  git clone --depth 1 -q --branch "$REF" "https://github.com/$REPO.git" "$TMP"
   ( cd "$TMP" && npm install --silent --no-audit --no-fund >/dev/null && npm run build >/dev/null )
   # Ship only what's needed to run.
   cp -R "$TMP/dist" "$TMP/package.json" "$TMP/package-lock.json" "$APP_DIR/"
+  mkdir -p "$APP_DIR/scripts" && cp "$TMP/scripts/prepare.mjs" "$APP_DIR/scripts/"
   [ -f "$TMP/README.md" ] && cp "$TMP/README.md" "$APP_DIR/"
   ( cd "$APP_DIR" && npm install --omit=dev --silent --no-audit --no-fund >/dev/null )
   rm -rf "$TMP"
@@ -128,9 +130,11 @@ else
 fi
 
 echo
+node "$APP_DIR/dist/cli.js" doctor 2>/dev/null || true
 bold "Next steps"
 info "1. cd into any project"
 info "2. run: gemini-code"
 info "3. Chrome opens — sign in to Gemini by hand the first time (just once)"
+info "   defaults: gemini-code config set model pro   (3.8 Thinking is the default)"
 echo
 info "Docs: https://github.com/$REPO"

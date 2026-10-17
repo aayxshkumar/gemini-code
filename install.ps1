@@ -1,13 +1,14 @@
 # gemini-code installer — Windows.
 #
-#   irm https://raw.githubusercontent.com/Muruganandham18/gemini-code/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/aayxshkumar/gemini-code/main/install.ps1 | iex
 #
 # Installs to %USERPROFILE%\.gemini-code\app and adds it to your user PATH.
 # No admin rights needed.
 
 $ErrorActionPreference = "Stop"
 
-$Repo    = "Muruganandham18/gemini-code"
+$Repo    = if ($env:GEMINI_CODE_REPO) { $env:GEMINI_CODE_REPO } else { "aayxshkumar/gemini-code" }
+$Ref     = if ($env:GEMINI_CODE_REF) { $env:GEMINI_CODE_REF } else { "main" }
 $Home_   = if ($env:GEMINI_CODE_HOME) { $env:GEMINI_CODE_HOME } else { Join-Path $env:USERPROFILE ".gemini-code" }
 $AppDir  = Join-Path $Home_ "app"
 $BinDir  = Join-Path $Home_ "bin"
@@ -71,13 +72,15 @@ if ($tarUrl) {
   if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Die "git is required to build from source" }
   if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Write-Die "npm is required to build from source" }
   $tmp = Join-Path $env:TEMP ("gc-" + [guid]::NewGuid().ToString("N"))
-  git clone --depth 1 -q "https://github.com/$Repo.git" $tmp
+  git clone --depth 1 -q --branch $Ref "https://github.com/$Repo.git" $tmp
   Push-Location $tmp
   npm install --silent --no-audit --no-fund | Out-Null
   npm run build | Out-Null
   Pop-Location
   Copy-Item (Join-Path $tmp "dist") $AppDir -Recurse
   Copy-Item (Join-Path $tmp "package.json") $AppDir
+  New-Item -ItemType Directory -Force -Path (Join-Path $AppDir "scripts") | Out-Null
+  Copy-Item (Join-Path $tmp "scripts\prepare.mjs") (Join-Path $AppDir "scripts")
   if (Test-Path (Join-Path $tmp "README.md")) { Copy-Item (Join-Path $tmp "README.md") $AppDir }
   Push-Location $AppDir
   npm install --omit=dev --silent --no-audit --no-fund | Out-Null
@@ -102,10 +105,13 @@ if ($userPath -notlike "*$BinDir*") {
 }
 
 Write-Host ""
+node "$AppDir\dist\cli.js" doctor
+Write-Host ""
 Write-Host "Next steps" -ForegroundColor Cyan
 Write-Host "  1. Open a NEW terminal (so the PATH change applies)"
 Write-Host "  2. cd into any project"
 Write-Host "  3. run: gemini-code"
 Write-Host "  4. Chrome opens - sign in to Gemini by hand the first time (just once)"
+Write-Host "     defaults: gemini-code config set model pro   (3.8 Thinking is the default)"
 Write-Host ""
 Write-Host "  Docs: https://github.com/$Repo"
