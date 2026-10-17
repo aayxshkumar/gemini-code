@@ -116,7 +116,7 @@ export async function searchCode(opts: {
         const lines = content.split("\n");
         for (let i = 0; i < lines.length; i++) {
           if (re.test(lines[i])) {
-            hits.push({ file: path.relative(root, full), line: i + 1, text: lines[i].trim().slice(0, 200) });
+            hits.push({ file: path.relative(root, full).split(path.sep).join("/"), line: i + 1, text: lines[i].trim().slice(0, 200) });
             if (hits.length >= max) {
               truncated = true;
               return;

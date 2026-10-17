@@ -20,6 +20,10 @@ const IGNORED_DIRS = new Set([
 ]);
 
 let rgAvailable: boolean | undefined;
+const DEBUG = process.env.GEMINI_CODE_SEARCH_DEBUG === "1";
+function debug(msg: string): void {
+  if (DEBUG) process.stderr.write(`[search] ${msg}\n`);
+}
 
 function run(cmd: string, args: string[], cwd: string, maxBytes = 8_000_000): Promise<{ code: number | null; out: string }> {
   return new Promise((resolve) => {
@@ -35,7 +39,10 @@ function run(cmd: string, args: string[], cwd: string, maxBytes = 8_000_000): Pr
       if (out.length < maxBytes) out += d.toString("utf8");
       else child.kill();
     });
-    child.on("close", (code) => resolve({ code, out }));
+    child.on("close", (code) => {
+      debug(`${cmd} ${args.map((a) => JSON.stringify(a)).join(" ")} (cwd ${cwd}) -> exit ${code}, ${out.length} bytes${out ? `: ${JSON.stringify(out.slice(0, 160))}` : ""}`);
+      resolve({ code, out });
+    });
   });
 }
 
@@ -146,7 +153,7 @@ export async function grep(
       const hits = parse(out);
       return { hits: hits.slice(0, max), truncated: hits.length > max, engine: "rg" };
     }
-    if (code === 2) return undefined; // bad regex for rg — let the caller fall back / report
+    // exit 2 = rg error (bad regex, unreadable path): try the next engine.
   }
   if (!scopedIntoIgnored && (await isGitRepo(root))) {
     const args = ["grep", "-n", "-I", "-E", "--no-color", ...(opts.caseSensitive ? [] : ["-i"]), "-e", pattern, "--"];
