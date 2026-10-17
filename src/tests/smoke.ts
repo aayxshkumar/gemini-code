@@ -121,6 +121,7 @@ async function main() {
   // This whole suite is non-interactive (no TTY on stdin), so auto-approve
   // the confirm gates that write_file/run_bash would otherwise block on.
   process.env.GEMINI_CODE_AUTO_APPROVE = "1";
+  process.env.GEMINI_CODE_PROMPT_UNATTENDED = "1"; // the suite has no TTY but still tests the prompts
   // Most loop tests script one reply per turn and assert on it. The
   // no-tool-call backstop adds a turn to any task that never calls a tool, so
   // it's off by default here and switched on by the tests that cover it.

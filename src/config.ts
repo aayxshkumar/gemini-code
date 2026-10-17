@@ -22,6 +22,7 @@ export const CONFIG_KEYS: Record<string, { env: string; hint: string }> = {
   thinking: { env: "GEMINI_CODE_THINKING", hint: "on | off — the Extended thinking toggle, where the picker has one" },
   addDirs: { env: "GEMINI_CODE_ADD_DIRS", hint: "extra workspace roots (dependency repos), e.g. [\"../shared-lib\"]" },
   compactTurns: { env: "GEMINI_CODE_COMPACT_TURNS", hint: "exchanges per thread before a context reset with handoff (default 40, 0 = off)" },
+  temporaryChat: { env: "GEMINI_CODE_TEMPORARY_CHAT", hint: "true (default) | false — run threads as Gemini Temporary chats (not saved to your history)" },
   workers: { env: "GEMINI_CODE_MAX_WORKERS", hint: "parallel worker tabs (default 3)" },
   orchestrator: { env: "GEMINI_CODE_ORCHESTRATOR", hint: "true (default) | false — one tab does everything when false" },
   autoApprove: { env: "GEMINI_CODE_AUTO_APPROVE", hint: "false (default) | edits | edits,commands | all — what runs without a y/N" },

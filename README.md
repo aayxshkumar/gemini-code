@@ -248,6 +248,7 @@ Semantic versioning, reported by `gemini-code --version`.
 
 | Version | Highlights |
 | --- | --- |
+| **0.10.0** | Agent threads run as Gemini **Temporary chats** (your history stays yours); messages over the composer's 32k limit are attached in full instead of silently cut; `ask_user` for genuine ambiguity; unattended runs decline instead of hanging on a y/N; structured handoff notes on compaction; coding-standards block in the primer; quota messages recognised |
 | **0.9.0** | **Built for big, multi-repo codebases.** `--add-dir` workspace roots (read, search, edit and run commands in dependency repos); read-before-edit and changed-on-disk gates; edits echo the changed region; `find_files`; ripgrep/git-grep search with a `path` scope; "did you mean" on wrong paths; answers are checked for paths that don't exist; Gemini's own error replies are retried; AGENTS.md / CLAUDE.md honoured as instructions; auto-compaction with a handoff note (`/compact`); `autoApprove=edits` |
 | **0.8.0** | **Model choice is yours at startup**: a live chooser on first run, `--model`, `/models`, picker labels like `3.8 Thinking` work directly; `thinking` is the default (the Thinking model where offered, else Auto with Thinking level High); locked models are skipped; several tool calls per reply; lenient tool-call JSON; `gemini-code doctor`, `gemini-code config` and a persistent config file; `setup.sh`/`setup.ps1` for clones; CI and tagged releases |
 | **0.4.1** | Windows: commands run in the same console with output captured, Git Bash preferred over cmd, process trees killed properly |
@@ -303,6 +304,7 @@ Type a task. `/help` lists commands. `exit` quits.
 | `/undo` | revert all file changes from the last task |
 | `/plan`, `/plan clear` | show / delete the progress journal |
 | `/memory`, `/remember <note>` | show / append durable project memory |
+| `ask_user` (tool) | the model can ask you one real question with options; see [Asking instead of guessing](#asking-instead-of-guessing) |
 | `/roots`, `/add-dir <path>` | show the workspace roots / add another repository mid-session |
 | `/compact` | close the thread and continue in a fresh one from a handoff note the model writes for itself |
 | `/clear` | start a fresh Gemini thread |
@@ -330,7 +332,7 @@ gemini-code config set autoApprove true
 gemini-code config unset model
 ```
 
-Friendly keys: `model`, `thinkingLevel`, `thinking`, `addDirs`, `compactTurns`, `workers`, `orchestrator`, `autoApprove`, `maxTurns`,
+Friendly keys: `model`, `thinkingLevel`, `thinking`, `addDirs`, `compactTurns`, `temporaryChat`, `workers`, `orchestrator`, `autoApprove`, `maxTurns`,
 `shell`, `chrome`, `profile`, `gem`, `responseTimeoutMs`, `apiPort`, `apiKey` — or any
 raw `GEMINI_CODE_*` name from the table.
 
@@ -346,6 +348,9 @@ raw `GEMINI_CODE_*` name from the table.
 | `GEMINI_CODE_MAX_WORKERS` | `3` | parallel worker tabs |
 | `GEMINI_CODE_ADD_DIRS` | unset | extra workspace roots, PATH-style separated (same as `--add-dir`; config key `addDirs` takes a list) |
 | `GEMINI_CODE_AUTO_APPROVE` | unset | `edits` runs file writes/edits without asking (commands and requests still ask); `edits,commands` also runs commands; `1`/`all` skips everything |
+| `GEMINI_CODE_TEMPORARY_CHAT` | `1` | `0` keeps the agent's threads in your Gemini history instead of running them as Temporary chats |
+| `GEMINI_CODE_DEBUG_INPUT` | unset | `1` traces every keystroke and line readline receives, for a terminal where answers don't seem to arrive |
+| `GEMINI_CODE_PROMPT_UNATTENDED` | unset | `1` still asks y/N questions when stdin isn't a terminal (for scripts that pipe answers in); otherwise unattended runs decline unapproved actions at once |
 | `GEMINI_CODE_COMPACT_TURNS` | `40` | exchanges per thread before the thread is closed and continued fresh from a handoff note; `0` disables |
 | `GEMINI_CODE_IDLE_NUDGES` | `1` | times to push back on a task that ends with no tool call |
 | `GEMINI_CODE_MAX_TURNS` | `60` | tool-call turns one task may take |
@@ -582,6 +587,41 @@ What keeps it honest at scale, borrowed from Claude Code, OpenCode and Codex:
 - **Approve by kind.** `autoApprove=edits` is the practical setting on a real
   project: edits run (reviewable with `git_diff`, reversible with `/undo`) while
   shell commands and network requests still ask.
+
+### How the Gemini web UI constrains this, and what the driver does about it
+
+Measured against the live UI, not assumed:
+
+- **The composer keeps 32,000 characters and drops the rest.** A message over
+  that would lose its tail — and the TASK comes last. Anything longer is sent as
+  a head plus the complete message as an attachment, with a note saying so.
+  Tool output over ~4,000 characters was already attached; this closes the gap
+  for huge tasks and pasted specs.
+- **Threads are Temporary chats** by default. Every task is a Gemini conversation,
+  and an agent produces dozens a day; as ordinary chats they bury your own in the
+  sidebar and feed Gemini's personalisation with tool-call JSON. Temporary chats
+  keep uploads and the model picker, parse identically, and don't appear in your
+  history. `temporaryChat=false` turns it off; the banner says which you got.
+- **Gemini's own error replies are retried.** "I encountered an error doing what
+  you asked" and quota messages are the UI failing, not an answer.
+- **The reply isn't finished when the stop button goes.** The rendered text keeps
+  growing for about a second after; the driver waits for both signals.
+- **A reply can't be read until it's rendered**, so streaming to the API arrives
+  in bursts.
+
+### Asking instead of guessing
+
+The model has an `ask_user` tool for the one kind of question worth stopping
+for: a genuine decision the code can't settle — which of two designs, whether to
+touch a second repository, a missing URL. It offers numbered options and returns
+your answer. It is told not to use it for permission (writes and commands are
+confirmed separately) or for anything the other tools could find out. Unattended
+(piped stdin, CI) it answers itself: proceed on the safest assumption and say so.
+
+Unattended runs also no longer hang on a y/N. Without a terminal, an action that
+isn't pre-approved is declined immediately with a message telling the model not to
+retry and to report what it skipped — and telling you which
+`GEMINI_CODE_AUTO_APPROVE` value would allow it.
 
 ### Protocol drift in long threads
 

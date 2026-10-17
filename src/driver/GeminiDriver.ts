@@ -196,6 +196,44 @@ export class GeminiDriver implements IGeminiDriver {
    */
   private gem?: Gem;
 
+  /**
+   * Whether threads this driver starts should be Temporary chats. Set once
+   * from config; re-applied after every "New chat", which drops out of it.
+   */
+  temporaryChats = false;
+
+  /** Is the current thread a Temporary chat? */
+  async isTemporaryChat(): Promise<boolean> {
+    const page = this.requirePage();
+    // The text lives in a tooltip that is in the DOM but visually hidden
+    // until hover, so presence is the signal, not visibility.
+    const count = await page.getByText(selectors.temporaryChatIsOnText).count().catch(() => 0);
+    return count > 0;
+  }
+
+  /**
+   * Switches the (empty) current thread to a Temporary chat. Only valid
+   * before the first message of a thread — Google shows the toggle only
+   * then. Never throws: a UI without the button just stays a normal chat.
+   */
+  async ensureTemporaryChat(): Promise<boolean> {
+    const page = this.requirePage();
+    const on = page.locator(`${selectors.temporaryChatButton} >> visible=true`).first();
+    // Right after "New chat" the header re-renders; neither button is
+    // visible for a moment. Poll briefly for either state before giving up.
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      if (await this.isTemporaryChat()) return true;
+      if (await on.isVisible().catch(() => false)) {
+        await on.click({ timeout: 5_000 }).catch(() => undefined);
+        await page.waitForTimeout(700);
+        if (await this.isTemporaryChat()) return true;
+      }
+      await page.waitForTimeout(250);
+    }
+    return false;
+  }
+
   /** Where a fresh thread starts: inside the Gem when one is selected. */
   private homeUrl(): string {
     return this.gem ? gemChatUrl(this.gem.id) : GEMINI_URL;
@@ -295,6 +333,8 @@ export class GeminiDriver implements IGeminiDriver {
     child.ownsPage = true;
     child.gem = gem;
     await child.waitForAppShell();
+    child.temporaryChats = this.temporaryChats;
+    if (this.temporaryChats) await child.ensureTemporaryChat();
     await child.claimTab(page);
     await child.markTab(`💎 gemini-code · gem: ${gem.name}`, { guardClose: true });
     if (!page.url().includes(`/gem/${gem.id}`)) {
@@ -742,6 +782,7 @@ export class GeminiDriver implements IGeminiDriver {
       await this.waitForAppShell();
     }
     await this.waitForResponsesCleared();
+    if (this.temporaryChats) await this.ensureTemporaryChat();
   }
 
   /**

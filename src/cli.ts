@@ -149,10 +149,29 @@ async function chooseModelInteractively(driver: GeminiDriver, current: string | 
     console.log(c.yellow(`  no entry ${answer} — keeping ${current ?? DEFAULT_MODEL_ALIAS}`));
     return current;
   }
-  const chosen = byNumber ? byNumber.label : answer;
   if (byNumber?.locked) {
     console.log(c.yellow(`  "${byNumber.label}" is locked on this account — keeping ${current ?? DEFAULT_MODEL_ALIAS}`));
     return current;
+  }
+  // Only a real model is saved: one of our aliases, or text that matches
+  // exactly one unlocked picker entry. Anything else (a task typed at the
+  // wrong prompt, a typo) is refused rather than written to the config.
+  let chosen: string | undefined = byNumber?.label;
+  if (!chosen) {
+    if (resolveModel(answer)) chosen = answer;
+    else {
+      const needle = answer.toLowerCase();
+      const hits = selectable.filter((e) => !e.locked && e.label.toLowerCase().includes(needle));
+      if (hits.length === 1) chosen = hits[0].label;
+      else {
+        console.log(
+          c.yellow(
+            `  "${answer.slice(0, 40)}${answer.length > 40 ? "…" : ""}" isn't a model here (${hits.length ? "ambiguous" : "no match"}) — keeping ${current ?? DEFAULT_MODEL_ALIAS}`
+          )
+        );
+        return current;
+      }
+    }
   }
   // Remember an alias when one covers the label, else the label itself, so
   // the saved value keeps working across Google's version bumps.
@@ -234,7 +253,12 @@ async function main() {
     }
   }
 
+  // Temporary chats by default: the agent's threads are tool-call noise that
+  // would otherwise bury the user's own conversations in Gemini's sidebar and
+  // feed its personalisation. GEMINI_CODE_TEMPORARY_CHAT=0 keeps them.
+  driver.temporaryChats = process.env.GEMINI_CODE_TEMPORARY_CHAT !== "0";
   await driver.newConversation();
+  const temporary = driver.temporaryChats ? await driver.isTemporaryChat() : false;
 
   // Default the model (env override: GEMINI_CODE_MODEL=pro npm run dev).
   const argv = process.argv.slice(2);
@@ -290,6 +314,7 @@ ${c.magenta("✻")} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — Claude-Cod
   ${c.dim("workers")} up to ${MAX_PARALLEL_WORKERS} parallel Gemini tabs${
     roots.length ? `\n  ${c.dim("roots")}   + ${roots.map((r) => r.display).join(", ")} ${c.dim("(--add-dir)")}` : ""
   }
+  ${c.dim("threads")} ${temporary ? "temporary chats — not saved to your Gemini history" : driver.temporaryChats ? c.yellow("couldn't switch to Temporary chat — threads will be saved to your history") : "saved to your Gemini history (temporaryChat=false)"}
   ${c.dim("approve")} ${
     autoApproved("edit") && autoApproved("command") && autoApproved("network")
       ? c.yellow("everything runs without asking (autoApprove=all)")
@@ -393,7 +418,13 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
   /** Set while a confirmation prompt is waiting for an answer. */
   let awaitingAnswer: ((line: string) => void) | null = null;
 
+  // GEMINI_CODE_DEBUG_INPUT=1 traces what readline receives — for diagnosing
+  // a terminal whose keystrokes don't seem to arrive.
+  const traceInput = process.env.GEMINI_CODE_DEBUG_INPUT === "1";
+  if (traceInput) process.stdin.on("data", (d: Buffer) => process.stderr.write(`[input data ${JSON.stringify(d.toString())}]\n`));
+
   rl.on("line", (line) => {
+    if (traceInput) process.stderr.write(`[input line ${JSON.stringify(line)} awaiting=${!!awaitingAnswer} pending=${!!pending}]\n`);
     // A confirmation has first claim on the line. Without this the answer
     // would ALSO be queued and later sent to Gemini as a task — typing "y"
     // to approve a write would become a message saying "y".
@@ -844,6 +875,7 @@ Settings (environment, or "gemini-code config set <key> <value>", or <project>/.
   GEMINI_CODE_ADD_DIRS        extra workspace roots, PATH-style separated (same as --add-dir)
   GEMINI_CODE_AUTO_APPROVE    edits | edits,commands | all — what runs without a y/N (default: ask for all)
   GEMINI_CODE_COMPACT_TURNS   exchanges per thread before a context reset with handoff (default 40)
+  GEMINI_CODE_TEMPORARY_CHAT  0 keeps the agent's threads in your Gemini history (default: Temporary chats)
   GEMINI_CODE_PROFILE         Chrome profile dir (default ~/.gemini-code/profile)
   GEMINI_CODE_API_KEY         same as serve --api-key
   GEMINI_CODE_API_PORT, GEMINI_CODE_API_HOST, GEMINI_CODE_API_TABS, GEMINI_CODE_API_CORS
