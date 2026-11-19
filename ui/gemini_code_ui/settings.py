@@ -48,12 +48,18 @@ SETTINGS: tuple[Setting, ...] = (
     # Set from the composer's picker, which lists what Gemini offers this
     # account. Empty leaves Gemini on whatever it has selected.
     Setting("model", "Model", PICKER, "text", "", "GEMINI_CODE_MODEL"),
-    Setting("thinking_level", "Thinking level", PICKER, "text", "", "GEMINI_CODE_THINKING"),
+    Setting("thinking_level", "Thinking level", PICKER, "text", "", "GEMINI_CODE_THINKING_LEVEL"),
+    # The terminal's Extended thinking toggle (on | off), where the picker has one.
+    Setting("extended_thinking", "Extended thinking", PICKER, "text", "", "GEMINI_CODE_THINKING"),
     # Most recent first, for the composer's folder picker.
     Setting("recent_projects", "Recent folders", PICKER, "list", ()),
     Setting("enterprise_url", "Gemini Enterprise link", GENERAL, "text", "", "GEMINI_CODE_ENTERPRISE_URL",
             help="Where you sign in, e.g. https://vertexaisearch.cloud.google.com/home/cid/<id>. "
                  "Empty uses gemini.google.com (or the link saved by the terminal app)."),
+    Setting("add_dirs", "Extra workspace folders", GENERAL, "text", "", "GEMINI_CODE_ADD_DIRS",
+            help="Other repositories the agent may read and edit, separated by ; on Windows (: elsewhere)."),
+    Setting("temporary_chat", "Use Temporary chats", GENERAL, "bool", True, "GEMINI_CODE_TEMPORARY_CHAT",
+            help="The agent's threads stay out of your Gemini history. Not available on Gemini Enterprise."),
     Setting("gem", "Gem", GENERAL, "text", "", "GEMINI_CODE_GEM",
             help="Name or id of a Gem to use. Leave empty for none."),
     Setting("gem_mode", "Gem mode", GENERAL, "choice", "reference", "GEMINI_CODE_GEM_MODE",
@@ -77,6 +83,12 @@ SETTINGS: tuple[Setting, ...] = (
     Setting("drift_nudges", "Nudges when a reply abandons the tool protocol", LIMITS, "int", 3, "GEMINI_CODE_DRIFT_NUDGES"),
     Setting("reminder_turns", "Restate the tool protocol every N turns", LIMITS, "int", 5, "GEMINI_CODE_REMINDER_TURNS"),
     Setting("turn_retries", "Re-sends before a turn fails", LIMITS, "int", 2, "GEMINI_CODE_TURN_RETRIES"),
+    Setting("explore_nudge_turns", "Read-only calls before asking it to act", LIMITS, "int", 20,
+            "GEMINI_CODE_EXPLORE_NUDGE_TURNS", help="0 turns the nudge off."),
+    Setting("compact_turns", "Exchanges per thread before a handoff reset", LIMITS, "int", 40, "GEMINI_CODE_COMPACT_TURNS",
+            help="0 never resets the thread."),
+    Setting("task_timeout_min", "Stop a task after (minutes)", LIMITS, "int", 0, "GEMINI_CODE_TASK_TIMEOUT_MIN",
+            help="0 means no limit; the turn limit still applies."),
 
     Setting("max_workers", "Parallel worker tabs", WORKERS, "int", 3, "GEMINI_CODE_MAX_WORKERS", minimum=1, maximum=16),
     Setting("worker_retries", "Retries for a failed worker", WORKERS, "int", 1, "GEMINI_CODE_WORKER_RETRIES"),
@@ -89,6 +101,8 @@ SETTINGS: tuple[Setting, ...] = (
     Setting("shell_timeout", "Wait for Gemini to load (ms)", TIMEOUTS, "int", 60_000, "GEMINI_CODE_SHELL_TIMEOUT_MS", minimum=1000),
     Setting("bash_timeout", "Foreground command timeout (ms)", TIMEOUTS, "int", 60_000, "GEMINI_CODE_BASH_TIMEOUT_MS", minimum=1000),
     Setting("mcp_timeout", "MCP tool call timeout (ms)", TIMEOUTS, "int", 60_000, "GEMINI_CODE_MCP_TIMEOUT_MS", minimum=1000),
+    Setting("tool_timeout", "Abandon a tool after (ms)", TIMEOUTS, "int", 600_000, "GEMINI_CODE_TOOL_TIMEOUT_MS", minimum=1000),
+    Setting("offline_wait", "Wait for the network to return (ms)", TIMEOUTS, "int", 300_000, "GEMINI_CODE_OFFLINE_WAIT_MS"),
 
     Setting("profile", "Chrome profile folder", BROWSER, "path", "", "GEMINI_CODE_PROFILE",
             help="Holds a live Google session. Empty uses ~/.gemini-code/profile. Never share or commit it."),
@@ -96,6 +110,16 @@ SETTINGS: tuple[Setting, ...] = (
             help="Only needed if Chrome isn't in its usual place."),
     Setting("shell", "Shell for commands", BROWSER, "text", "", "GEMINI_CODE_SHELL",
             help="Empty uses Git Bash on Windows, otherwise sh. Example: powershell.exe"),
+    Setting("home", "gemini-code folder", BROWSER, "path", "", "GEMINI_CODE_HOME",
+            help="Moves the config, profile and logs together. Empty uses ~/.gemini-code."),
+    Setting("ascii", "Plain ASCII output", BROWSER, "bool", False, "GEMINI_CODE_ASCII",
+            help="For consoles that can't show the agent's symbols.", off=None),
+    Setting("prompt_unattended", "Ask even without a terminal", BROWSER, "bool", False, "GEMINI_CODE_PROMPT_UNATTENDED",
+            help="Diagnostics: keeps y/N questions on when input is piped.", off=None),
+    Setting("debug_input", "Trace terminal input", BROWSER, "bool", False, "GEMINI_CODE_DEBUG_INPUT",
+            help="Diagnostics for the terminal REPL.", off=None),
+    Setting("search_debug", "Trace code search", BROWSER, "bool", False, "GEMINI_CODE_SEARCH_DEBUG",
+            help="Diagnostics: logs which search engine ran.", off=None),
 
     Setting("api_host", "Address", API, "text", "127.0.0.1", "GEMINI_CODE_API_HOST",
             help="Anything other than localhost also needs an API key, because it exposes your Gemini account."),

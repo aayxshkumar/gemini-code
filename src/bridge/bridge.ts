@@ -102,10 +102,12 @@ export function classifyActivity(line: string): Activity {
   const worker = tagged?.[1];
   const body = tagged ? tagged[2] : line;
 
-  const call = /^\s*⏺ ([\s\S]*)$/.exec(body);
+  // Both glyph sets: on a legacy Windows console (and so under the desktop
+  // app on Windows) ui/format.ts prints "*" and "|-" instead of "⏺" and "⎿".
+  const call = /^\s*(?:⏺|\*) ([\s\S]*)$/.exec(body);
   if (call) return { kind: "tool", text: call[1], worker };
 
-  const detail = /^\s*⎿ ([\s\S]*)$/.exec(body);
+  const detail = /^\s*(?:⎿|\|-) ?([\s\S]*)$/.exec(body);
   if (detail) {
     const failed = /^(error|exit code [1-9]|failed|timed out|declined|denied|refused)/i.test(detail[1]);
     return { kind: "detail", text: detail[1], worker, ...(failed ? { failed } : {}) };

@@ -120,7 +120,11 @@ async function startSession(emit: Emit, exit: () => Promise<void>) {
       log(`Couldn't set model to "${modelName}": ${err.message.split("\n")[0]}`);
     });
   }
-  const thinkingLevel = process.env.GEMINI_CODE_THINKING;
+  // The level (low/medium/high). GEMINI_CODE_THINKING is the terminal's
+  // on/off Extended thinking toggle, so it only counts here when it names a level.
+  const legacyLevel = process.env.GEMINI_CODE_THINKING;
+  const thinkingLevel =
+    process.env.GEMINI_CODE_THINKING_LEVEL || (legacyLevel && !/^(on|off|true|false|yes|no|1|0)$/i.test(legacyLevel) ? legacyLevel : "");
   if (thinkingLevel && !enterprise) {
     await driver.setThinkingLevel(thinkingLevel).catch((err: Error) => {
       log(`Couldn't set thinking to "${thinkingLevel}": ${err.message.split("\n")[0]}`);

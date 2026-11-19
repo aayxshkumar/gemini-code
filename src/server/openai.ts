@@ -129,6 +129,21 @@ async function materializeImages(urls: string[], dir: string): Promise<string[]>
   return files;
 }
 
+/** Reads and discards what's left of a request body, for at most 2s. */
+function drainRequest(req: IncomingMessage): Promise<void> {
+  if (req.readableEnded || req.destroyed) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(done, 2_000);
+    req.once("end", done);
+    req.once("error", done);
+    req.resume();
+  });
+}
+
 export async function startServer(opts: ServerOptions): Promise<{ url: string; close: () => Promise<void> }> {
   // Exposing a signed-in Gemini account to the network with no key would let
   // anyone who can reach the port use it. Refuse rather than warn.
@@ -212,6 +227,10 @@ export async function startServer(opts: ServerOptions): Promise<{ url: string; c
           res.end();
         }
       } else {
+        // An early refusal (401, 403, 415…) comes before the body is read.
+        // Closing with it unread resets the connection, and on macOS the
+        // client then sees "fetch failed" instead of the error. Drain first.
+        await drainRequest(req);
         sendError(res, e.status, e.message, e.type);
       }
       opts.log(`${req.method} ${url.pathname} -> ${e.status} ${e.message}`);

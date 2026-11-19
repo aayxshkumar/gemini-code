@@ -3099,6 +3099,10 @@ async function main() {
     assert.equal(classifyActivity("[api]   ⎿ 3 lines (40 B)").kind, "detail");
     assert.equal(classifyActivity("  ⎿ Exit code 1").failed, true);
     assert.equal(classifyActivity("[api] opening tab…").kind, "note");
+    // The ASCII glyphs a legacy Windows console gets.
+    assert.deepEqual(classifyActivity("* list_files(.)"), { kind: "tool", text: "list_files(.)", worker: undefined });
+    assert.equal(classifyActivity("[api]   |-3 lines (40 B)").kind, "detail");
+    assert.equal(classifyActivity("  |-Exit code 1").failed, true);
   });
 
   await test("reads the label and detail out of a confirmation question", () => {
