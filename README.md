@@ -266,6 +266,7 @@ Semantic versioning, reported by `gemini-code --version`.
 
 | Version | Highlights |
 | --- | --- |
+| **0.15.0** | **Permission rules**: per-project `allow`/`deny` for commands, writes and hosts, with commands split by bash, PowerShell or cmd rules, deny seeing through wrappers and nested shells, trust-on-first-use for a project's own settings, and `/permissions`. **Safe `/undo`**: refuses to overwrite your edits (`--force` keeps `.conflict` copies), multi-step, byte for byte, crash-safe history (`/undo list`). **`multi_edit` across files, all or nothing**. **`.gitignore` honoured in every walk**, the same way git does, so `.env` files are never listed. **`serve`**: cancel on disconnect, a bounded queue (429/503 with Retry-After), and safe image URL fetches |
 | **0.14.0** | **Gemini Enterprise**: sign in at your organisation's Gemini Enterprise link (`--enterprise <url>`, `/enterprise`, `gemini-code config set enterprise <url>`). **Upstream merged** (Muruganandham18/gemini-code through its 0.12.0): desktop app and standalone Windows exe, Mac app, MCP servers, Claude-compatible skills (`gemini-code skills add`), on-demand tool loading with `tool_search`, plan mode, `multi_edit`, `read_files`, notebooks, code outline/symbols, git log/show/blame, `search_code` context lines, a folder per chat, and the model picker fixed after Gemini's November 2026 menu change |
 | **0.13.0** | **Crash resume**: the journal records the Gemini thread; after a crash, `continue` (or `/resume`) reopens that exact thread and picks up from the first unfinished step, with the plan's steps carried over; falls back to a journal-primed fresh thread when the thread is gone |
 | **0.12.0** | **Windows first**: Microsoft Edge works as the browser; command shell is Git Bash → PowerShell → cmd (never the WSL launcher) with the model told which syntax to write; ASCII output on the legacy console; `npm run setup` works on Windows; `install.ps1` and `setup.ps1` run in CI on a Windows runner; README leads with the Windows path |
@@ -1129,11 +1130,82 @@ Worker tabs get a pinned title (`🤖 gemini-code · <name>`), a distinct favico
 
 ## Safety model
 
-`write_file`, `run_bash`, `fetch_url` and `screenshot_page` each require a y/N confirmation showing
-exactly what will happen (`fetch_url` shows the full URL, since a request can carry
-local data off the machine). Prompts are serialized so parallel workers can't
-interleave them. File tools refuse paths outside the project root.
-`GEMINI_CODE_AUTO_APPROVE=1` disables all of this — don't, until you trust it.
+Every file write, shell command and network request asks y/N first, showing exactly what
+will happen (`fetch_url` shows the full URL, since a request can carry local data off the
+machine). Prompts are serialized, so parallel workers can't interleave them. File tools
+refuse paths outside the workspace. `GEMINI_CODE_AUTO_APPROVE` (`edits`,
+`edits,commands` or `all`) skips the question by kind. Leave it off until you trust it.
+
+### Permission rules
+
+To approve or refuse things in advance, add `permissions` to `~/.gemini-code/config.json`
+or to a project's `.gemini-code.json`:
+
+```json
+{
+  "permissions": {
+    "allow": {
+      "commands": ["git status", "git diff *", "npm test", "npm run lint"],
+      "writes": ["src/**", "tests/**", "*.md"],
+      "hosts": ["api.github.com", "*.githubusercontent.com"]
+    },
+    "deny": {
+      "commands": ["git push *", "rm -rf *", "Remove-Item *"],
+      "writes": [".env", "secrets/"],
+      "hosts": ["*.internal"]
+    }
+  }
+}
+```
+
+- **deny** refuses without asking. It wins over allow and over `GEMINI_CODE_AUTO_APPROVE`.
+- **allow** runs without asking.
+- **Anything else asks as before**, with the reason on a `why it asks:` line. With no rules
+  configured, every prompt is exactly as it was.
+
+| Rules | Syntax | Covers |
+| --- | --- | --- |
+| `commands` | words; a final `*` matches any rest (or none); `*`/`?` inside a word are globs | `run_bash` |
+| `writes` | gitignore-style globs from the project root (`.env` = any `.env`, `/build` = only the top one, `dir/` = everything in it) | `write_file`, `edit_file`, `multi_edit`, `move_file`, `copy_file`, `delete_file`, `notebook_edit`, shell redirects (`> file`) |
+| `hosts` | `github.com` exactly, `*.github.com` any subdomain, `*` anything; optional `:port` | `fetch_url` and each of its redirects; deny also blocks `read_page`, `screenshot_page`, `browser_open`, `browser_do` |
+
+**How a command is checked.** The line is split by the rules of the shell that runs it:
+bash (Git Bash), PowerShell or cmd.exe. Quotes are respected, so
+`git commit -m "a && b"` is one command.
+- **Allow:** *every* command in the line must be allowed as written, so `git status && rm x`
+  isn't approved by `"git status"`. This includes commands inside `$(...)`, backticks, `<(...)`,
+  PowerShell `$(...)`/`@(...)` and script blocks, and cmd groups.
+- **Deny** sees further, into what each command really runs:
+  - wrappers (`sudo`, `env`, `xargs`, `timeout`, `nohup`, `find -exec`…);
+  - a path to the program (`/usr/bin/git`, `git.exe`);
+  - PowerShell aliases and cmd synonyms (`rm`/`del`/`ri` for `Remove-Item`);
+  - commands handed to another shell (`bash -c`, `eval`, `pwsh -Command` and
+    `-EncodedCommand`, `cmd /c`, `Invoke-Expression`).
+- **Never auto-approved** (it asks instead): anything the splitter can't read with certainty,
+  such as heredocs, unterminated quotes, a command name from a variable, `for`/`case`
+  bodies, or `LD_PRELOAD=`-style assignments.
+
+**Paths** are checked as written and through symlinks: a deny on either refuses, and allow
+needs both. Windows' trailing dots and `:stream` suffixes are normalised, so `.env.` is still
+`.env`. Writing `.gemini-code.json` or anything in `.git/` always asks.
+
+**Trust.** A project's **deny** rules always apply. Its **allow** rules don't, at first.
+Neither do its `autoApprove`, `shell`, `chrome`, `profile`, `GEMINI_CODE_HOME`, enterprise
+link and API host/key/CORS settings, or a `.gemini-code-profile` folder in it. On the first
+start, gemini-code lists them and asks whether you trust them. The answer is stored in
+`~/.gemini-code/trust.json` against exactly those settings, and you're asked again when they
+change. Unattended runs never trust. This is so a cloned repository can't switch the
+questions off by itself.
+
+`/permissions` shows the rules in force, where each came from, and what's held back.
+`/permissions check <command | path | url>` shows the decision without running anything.
+`/permissions reset` forgets the project's trust answer. Rules are read once, at startup.
+
+**What rules can't protect against.** The splitter sees the command line, not what programs
+do. An allowed `npm test` runs whatever the project's test script says. A script file
+(`bash build.sh`), an alias or a shell function is opaque, and so is a program that runs
+other programs from its own config (`make`, `git` hooks and aliases). An allowed `node -e`
+is arbitrary code. Prefer narrow allow rules, and deny the things you never want.
 
 Your Chrome profile (`~/.gemini-code/profile`) holds a live Google session. Treat it
 like a password: never commit it, never copy it around. It's gitignored here.

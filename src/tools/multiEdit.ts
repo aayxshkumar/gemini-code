@@ -24,6 +24,7 @@
  *      files already replaced are put back from their original bytes
  *      (timestamps too), and the result says exactly what state each is in.
  */
+import { gateWrites } from "../permissions/gate.js";
 import { randomBytes } from "node:crypto";
 import { access, chmod, open, readFile, realpath, rename, rm, stat, utimes } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
@@ -286,8 +287,9 @@ export const multiEditTool: ToolDefinition = {
       })
       .join("\n");
     const summary = `${parsed.edits.length} edit${parsed.edits.length === 1 ? "" : "s"} in ${planned.length} file${planned.length === 1 ? "" : "s"}`;
-    if (!(await confirmAction(`Apply ${summary}?`, detail, "edit"))) {
-      return { ok: false, output: declinedMessage(`apply these ${summary}`, "edit") };
+    const gate = await gateWrites(planned.map((f) => f.abs), `Apply ${summary}?`, detail);
+    if (!gate.run) {
+      return { ok: false, output: gate.message ? `multi_edit changed nothing. ${gate.message}` : declinedMessage(`apply these ${summary}`, "edit") };
     }
     await multiEditHooks.afterConfirm?.();
 

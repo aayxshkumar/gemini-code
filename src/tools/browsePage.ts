@@ -1,4 +1,5 @@
 import type { ToolDefinition } from "../types.js";
+import { hostDenied } from "../permissions/gate.js";
 import type { GeminiDriver } from "../driver/GeminiDriver.js";
 import { confirmAction } from "./confirm.js";
 
@@ -44,6 +45,8 @@ export function createBrowsePageTool(driver: GeminiDriver): ToolDefinition {
         url +
         (args.selector ? `\n  reading: ${String(args.selector)}` : "") +
         (args.clickSelector ? `\n  clicking first: ${String(args.clickSelector)}` : "");
+      const denied = hostDenied(url);
+      if (denied) return { ok: false, output: denied };
       if (!(await confirmAction("Open page and read it?", detail, "network"))) {
         return { ok: false, output: "User declined to open this page." };
       }

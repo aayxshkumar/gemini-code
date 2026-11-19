@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { gateWrite } from "../permissions/gate.js";
 import { readFile } from "node:fs/promises";
 import type { ToolDefinition } from "../types.js";
 import { resolveInRoot } from "./paths.js";
@@ -110,7 +111,9 @@ export const notebookEditTool: ToolDefinition = {
       return { ok: false, output: `Error: unknown mode "${mode}".` };
     }
 
-    if (!(await confirmAction("Edit notebook?", `${rel} — ${mode} cell ${index}`, "edit"))) {
+    const gate = await gateWrite(abs, "Edit notebook?", `${rel} — ${mode} cell ${index}`);
+    if (!gate.run && gate.message) return { ok: false, output: gate.message };
+    if (!gate.run) {
       return { ok: false, output: "User declined this edit." };
     }
     try {

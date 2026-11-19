@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { gateCommand } from "../permissions/gate.js";
 import { openSync, closeSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import type { ToolDefinition } from "../types.js";
@@ -375,12 +376,15 @@ export const bashTool: ToolDefinition = {
     if (!existsSync(cwd)) return { ok: false, output: `Error: cwd ${cwdArg} does not exist.` };
     const inDir = displayPath(cwd) === "." ? "" : `  (in ${displayPath(cwd)})`;
 
-    const approved = await confirmAction(
+    // Permission rules (deny / allow) first; anything they don't settle asks as before.
+    const gate = await gateCommand(
+      command,
+      SHELL_FLAVOUR,
+      cwd,
       wantsBackground ? "Run shell command (in background)?" : "Run shell command?",
-      command + inDir,
-      "command"
+      command + inDir
     );
-    if (!approved) return { ok: false, output: declinedMessage("run this command", "command") };
+    if (!gate.run) return { ok: false, output: gate.message || declinedMessage("run this command", "command") };
 
     if (wantsBackground) {
       const result = runBackground(command, cwd);

@@ -1,4 +1,5 @@
 import type { ToolDefinition } from "../types.js";
+import { gateWrite } from "../permissions/gate.js";
 import { resolveInRoot, outsideWorkspace } from "./paths.js";
 import { hasSeen, markWritten } from "./fileState.js";
 import { existsSync } from "node:fs";
@@ -34,9 +35,9 @@ export const writeFileTool: ToolDefinition = {
     }
     const abs = resolved.abs;
 
-    const approved = await confirmAction("Write file?", `${rel} (${content.length} bytes)`, "edit");
-    if (!approved) {
-      return { ok: false, output: declinedMessage("write this file", "edit") };
+    const gate = await gateWrite(abs, "Write file?", `${rel} (${content.length} bytes)`);
+    if (!gate.run) {
+      return { ok: false, output: gate.message || declinedMessage("write this file", "edit") };
     }
 
     try {

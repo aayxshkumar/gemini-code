@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { gateWrite } from "../permissions/gate.js";
 import type { ToolDefinition } from "../types.js";
 import { resolveInRoot, outsideWorkspace } from "./paths.js";
 import { checkEditable, markWritten } from "./fileState.js";
@@ -144,8 +145,9 @@ export const editFileTool: ToolDefinition = {
       `${rel} — ${replaceAll ? `${result.count} occurrence(s)` : "1 occurrence"}\n` +
       `  - ${preview(oldText).split("\n").join("\n  - ")}\n` +
       `  + ${preview(newText).split("\n").join("\n  + ")}`;
-    if (!(await confirmAction("Edit file?", detail, "edit"))) {
-      return { ok: false, output: declinedMessage("make this edit", "edit") };
+    const permission = await gateWrite(abs, "Edit file?", detail);
+    if (!permission.run) {
+      return { ok: false, output: permission.message || declinedMessage("make this edit", "edit") };
     }
 
     const failure = await saveEdited(abs, rel, result.text, eol);

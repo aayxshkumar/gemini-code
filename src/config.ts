@@ -89,24 +89,67 @@ export function envValueFor(key: string, value: string | number | boolean | stri
 }
 
 /**
+ * Settings a PROJECT file may not apply by itself: each one could switch the
+ * questions off, run commands through another program, point the agent at
+ * another Google session, or expose the account. A cloned repository's
+ * .gemini-code.json gets them only after the user trusts it (see
+ * permissions/session.ts). The same keys in ~/.gemini-code/config.json, the
+ * user's own file, apply as usual.
+ */
+export const TRUST_REQUIRED_ENV = new Set([
+  "GEMINI_CODE_AUTO_APPROVE",
+  "GEMINI_CODE_SHELL",
+  "GEMINI_CODE_CHROME",
+  "GEMINI_CODE_PROFILE",
+  "GEMINI_CODE_HOME",
+  "GEMINI_CODE_API_HOST",
+  "GEMINI_CODE_API_KEY",
+  "GEMINI_CODE_API_CORS",
+  "GEMINI_CODE_API_PRIVATE_IMAGES",
+  "GEMINI_CODE_PROMPT_UNATTENDED",
+  "GEMINI_CODE_ENTERPRISE_URL",
+]);
+
+/** Set once the user trusts the project at this path (its profile folder may then be used). */
+export const projectTrust: { trustedRoot?: string } = {};
+
+/** Project settings held back until the project is trusted: env name -> value. */
+export const heldBackSettings: Record<string, string> = {};
+
+/**
  * Applies both config files to process.env for variables not already set.
  * Returns which keys came from where, for `gemini-code config`.
  */
 export function applyConfig(env: NodeJS.ProcessEnv = process.env): { source: Record<string, string> } {
   const source: Record<string, string> = {};
+  const project = projectConfigPath();
   const layers: [string, ConfigFile][] = [
-    [projectConfigPath(), readConfigFile(projectConfigPath())],
+    [project, readConfigFile(project)],
     [userConfigPath(), readConfigFile(userConfigPath())],
   ];
   for (const [file, values] of layers) {
     for (const [key, value] of Object.entries(values)) {
       const name = envNameFor(key);
       if (!name || env[name] !== undefined) continue;
+      if (file === project && TRUST_REQUIRED_ENV.has(name)) {
+        heldBackSettings[name] = envValueFor(key, value);
+        continue;
+      }
       env[name] = envValueFor(key, value);
       source[name] = file;
     }
   }
   return { source };
+}
+
+/** Applies the held-back project settings, once the user trusts the project. */
+export function applyHeldBack(env: NodeJS.ProcessEnv = process.env): void {
+  for (const [name, value] of Object.entries(heldBackSettings)) {
+    if (env[name] === undefined) {
+      env[name] = value;
+      (configSources as Record<string, string>)[name] = projectConfigPath();
+    }
+  }
 }
 
 export function writeUserConfig(values: ConfigFile): void {

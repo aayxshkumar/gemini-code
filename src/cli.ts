@@ -10,6 +10,9 @@ import { GeminiDriver, applySiteSelectors, type Gem } from "./driver/GeminiDrive
 import { gemFlag, gemModeFlag, modelFlag, chooseModelFlag, enterpriseFlag, serveArgs } from "./args.js";
 import { enterpriseLink, isEnterprise, siteName } from "./driver/site.js";
 import { askForEnterpriseLink, enterpriseConfigured, setEnterprise } from "./enterprise.js";
+import { loadPermissions } from "./permissions/session.js";
+import { permissionsCheck, permissionsReport, permissionsReset } from "./permissions/report.js";
+import { SHELL_FLAVOUR } from "./tools/bash.js";
 import { startServer } from "./server/openai.js";
 import { installDialogRaceGuard } from "./driver/processGuards.js";
 import { createMainSession } from "./agent/mainSession.js";
@@ -66,6 +69,7 @@ import { setAsker } from "./ui/prompt.js";
 
 function helpText(): string {
   return `${c.bold("Commands")}
+  ${c.cyan("/permissions")}      the allow/deny rules in force; ${c.cyan("/permissions check <command|path|url>")}; ${c.cyan("/permissions reset")}
   ${c.cyan("/enterprise")}       where you sign in: show it, or ${c.cyan("/enterprise <link>")} to use Gemini Enterprise
   ${c.cyan("/enterprise off")}   go back to gemini.google.com
   ${c.cyan("/model")}            show the current model
@@ -214,7 +218,27 @@ async function chooseSite(argv: string[]): Promise<void> {
   applySiteSelectors();
 }
 
+/**
+ * Loads the permission rules and asks, once per change, whether to trust a
+ * project's own trust-required settings. Before anything else reads them.
+ */
+async function settlePermissions(): Promise<void> {
+  const ask = process.stdin.isTTY
+    ? async (question: string) => {
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        try {
+          return /^y(es)?$/i.test((await rl.question(`\n${question} (y/N) `)).trim());
+        } finally {
+          rl.close();
+        }
+      }
+    : undefined;
+  const state = await loadPermissions({ ask, log: (m) => console.error(c.yellow(m)) });
+  for (const e of state.rules.errors) console.error(c.yellow(`gemini-code: permissions: ${e}`));
+}
+
 async function main() {
+  await settlePermissions();
   await chooseSite(process.argv.slice(2));
   const driver = new GeminiDriver();
   // Start Chrome ourselves if it isn't already up, so the usual case is a
@@ -597,6 +621,14 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
             case "help":
               console.log(`\n${helpText()}\n`);
               break;
+
+            case "permissions": {
+              const [sub, ...more] = arg.split(/\s+/);
+              if (sub === "check") console.log(`\n${permissionsCheck(more.join(" "), SHELL_FLAVOUR)}\n`);
+              else if (sub === "reset") console.log(`  ${permissionsReset()}\n`);
+              else console.log(`\n${permissionsReport()}\n`);
+              break;
+            }
 
             case "enterprise": {
               if (!arg) {
@@ -1092,6 +1124,7 @@ async function skillsCommand(): Promise<void> {
 
 /** `gemini-code serve`: the OpenAI-compatible API. */
 async function serve(): Promise<void> {
+  await settlePermissions();
   const args = serveArgs(process.argv.slice(3));
 
   const driver = new GeminiDriver();
@@ -1166,6 +1199,7 @@ async function cli(): Promise<void> {
     case "skills":
       return skillsCommand();
     case "open-chrome": {
+      await settlePermissions();
       // `open-chrome <link>` or `open-chrome --enterprise <link>`: save it and open it to sign in.
       const raw = enterpriseFlag(process.argv.slice(3)) ?? process.argv.slice(3).find((a) => !a.startsWith("-"));
       if (raw) {
@@ -1177,6 +1211,7 @@ async function cli(): Promise<void> {
     case "probe":
       return probe();
     case "login":
+      await settlePermissions();
       return checkLogin();
     case "doctor":
       return doctor();

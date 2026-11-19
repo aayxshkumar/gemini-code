@@ -1,4 +1,5 @@
 import { copyFile, mkdir, readFile, rename, rm, stat } from "node:fs/promises";
+import { gateWrites } from "../permissions/gate.js";
 import path from "node:path";
 import type { ToolDefinition } from "../types.js";
 import { resolveInRoot } from "./paths.js";
@@ -126,8 +127,9 @@ async function transfer(args: Record<string, unknown>, verb: "Move" | "Copy") {
     return { ok: false, output: `Error: ${to} already exists. Set overwrite: true to replace it.` };
   }
 
-  if (!(await confirmAction(`${verb} file?`, `${from} -> ${to}`, "edit"))) {
-    return { ok: false, output: `User declined to ${verb.toLowerCase()} this file.` };
+  const gate = await gateWrites(verb === "Move" ? [target.abs, source.abs] : [target.abs], `${verb} file?`, `${from} -> ${to}`);
+  if (!gate.run) {
+    return { ok: false, output: gate.message || `User declined to ${verb.toLowerCase()} this file.` };
   }
   try {
     for (const abs of verb === "Move" ? [target.abs, source.abs] : [target.abs]) {
@@ -175,8 +177,9 @@ export const deleteFileTool: ToolDefinition = {
     if (!info) return { ok: false, output: `Error: ${rel} does not exist.` };
     if (!info.isFile()) return { ok: false, output: `Error: ${rel} isn't a file. Use run_bash for directories.` };
 
-    if (!(await confirmAction("Delete file?", rel, "edit"))) {
-      return { ok: false, output: "User declined to delete this file." };
+    const gate = await gateWrites([resolved.abs], "Delete file?", rel);
+    if (!gate.run) {
+      return { ok: false, output: gate.message || "User declined to delete this file." };
     }
     try {
       const backup = await checkpoints.recordBeforeWrite(resolved.abs);

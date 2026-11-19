@@ -1,4 +1,5 @@
 import { mkdir } from "node:fs/promises";
+import { hostDenied } from "../permissions/gate.js";
 import path from "node:path";
 import type { ToolDefinition } from "../types.js";
 import type { GeminiDriver } from "../driver/GeminiDriver.js";
@@ -39,6 +40,8 @@ export function createScreenshotTool(driver: GeminiDriver): ToolDefinition {
       // the SAME browser as your logged-in session, so the user should see
       // exactly where it's pointing before it opens.
       const detail = `${url}${args.selector ? `\n  element: ${String(args.selector)}` : ""}`;
+      const denied = hostDenied(url);
+      if (denied) return { ok: false, output: denied };
       if (!(await confirmAction("Open page and screenshot it?", detail, "network"))) {
         return { ok: false, output: "User declined to open this page." };
       }

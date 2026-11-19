@@ -1,3 +1,4 @@
+import { loadPermissions } from "../permissions/session.js";
 import { appUrl, isEnterprise } from "../driver/site.js";
 import readline from "node:readline";
 import { format } from "node:util";
@@ -75,6 +76,9 @@ async function startSession(emit: Emit, exit: () => Promise<void>) {
   const argv = process.argv.slice(3);
   const gemMode = gemModeFlag(argv);
 
+  // Rules are read once; a project's trust-required settings stay off here
+  // unless trusted before (there's no terminal to ask in).
+  await loadPermissions({ log });
   const driver = new GeminiDriver();
   const launched = await ensureChromeRunning(log);
   if (launched) log("Chrome is up, attaching...");

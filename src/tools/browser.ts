@@ -1,4 +1,5 @@
 import { mkdir } from "node:fs/promises";
+import { hostDenied } from "../permissions/gate.js";
 import path from "node:path";
 import type { ToolDefinition } from "../types.js";
 import type { GeminiDriver } from "../driver/GeminiDriver.js";
@@ -27,6 +28,8 @@ function originOf(url: string): string {
  */
 async function ensureOriginApproved(session: BrowserSession, url: string): Promise<boolean> {
   const origin = originOf(url);
+  // A deny rule refuses even an origin approved earlier in the session.
+  if (hostDenied(url)) return false;
   if (!origin || session.approvedOrigins.has(origin)) return true;
   const approved = await confirmAction(
     "Let the agent browse this site?",

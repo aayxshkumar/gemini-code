@@ -3,6 +3,7 @@ import path from "node:path";
 import { homedir } from "node:os";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { selectors, applySelectorOverrides } from "./selectors.js";
+import { projectTrust } from "../config.js";
 import { appUrl, isAppPage, isEnterprise, isSignInPage, siteName } from "./site.js";
 import type { IGeminiDriver, GeminiResponse } from "./IGeminiDriver.js";
 import {
@@ -107,8 +108,11 @@ export const TIMEOUTS = {
  */
 export function resolveProfileDir(cwd = process.cwd()): string {
   if (process.env.GEMINI_CODE_PROFILE) return path.resolve(process.env.GEMINI_CODE_PROFILE);
+  // A project's own profile folder holds somebody's Google session: it's
+  // used only when the user has trusted the project (permissions/trust.ts),
+  // or the user config sets it explicitly above.
   const local = path.resolve(cwd, ".gemini-code-profile");
-  if (existsSync(local)) return local;
+  if (projectTrust.trustedRoot === path.resolve(cwd) && existsSync(local)) return local;
   // GEMINI_CODE_HOME moves everything (app, profile, config) together.
   return path.join(process.env.GEMINI_CODE_HOME || path.join(homedir(), ".gemini-code"), "profile");
 }

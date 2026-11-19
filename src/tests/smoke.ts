@@ -88,6 +88,7 @@ import { gitignoreTests } from "./gitignore.js";
 import { multiEditTests } from "./multiEdit.js";
 import { undoTests } from "./undo.js";
 import { apiServerTests } from "./apiServer.js";
+import { permissionTests } from "./permissions.js";
 import { Bridge, classifyActivity, parseQuestion, type BridgeEvent, type BridgeHost } from "../bridge/bridge.js";
 
 let passed = 0;
@@ -3268,6 +3269,9 @@ async function main() {
     assert.ok(ofType("reply").every((r) => r.ok === false));
     setAsker(undefined);
   });
+
+  console.log("Permission rules:");
+  await permissionTests(test);
 
   console.log("API server under real clients:");
   await apiServerTests(test);
