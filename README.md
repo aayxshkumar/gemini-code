@@ -562,7 +562,7 @@ putting it behind a public service.
 
 A native app (PySide6, no web server) with the chat and every setting in one window.
 
-Download it from the [latest release](https://github.com/Muruganandham18/gemini-code/releases/latest).
+Download it from the [latest release](https://github.com/aayxshkumar/gemini-code/releases/latest).
 Node.js and the agent are inside, so Google Chrome is all you need installed.
 
 - **Windows:** `gemini-code.exe`. It's one file that unpacks itself to a temp folder when

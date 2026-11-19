@@ -28,7 +28,7 @@ cp "$(command -v node)" "$AGENT/node"
 
 "$PYTHON" -m PyInstaller --noconfirm --clean --windowed \
   --name gemini-code \
-  --osx-bundle-identifier com.muruganandham18.gemini-code \
+  --osx-bundle-identifier com.aayxshkumar.gemini-code \
   --icon "$UI/gemini_code_ui/assets/logo.png" \
   --add-data "$AGENT:agent" \
   --add-data "$UI/gemini_code_ui/assets:gemini_code_ui/assets" \
