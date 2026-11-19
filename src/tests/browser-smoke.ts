@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { rm } from "node:fs/promises";
 import path from "node:path";
-import { GeminiDriver } from "../driver/GeminiDriver.js";
+import { GeminiDriver, TIMEOUTS } from "../driver/GeminiDriver.js";
 import { chromium } from "playwright";
 import { createServer } from "node:http";
 import { BrowserSession, formatSnapshot } from "../driver/BrowserSession.js";
@@ -50,6 +50,7 @@ async function main() {
 
   await testInteractiveBrowsing();
   await testAttachmentDetection();
+  await testFailedTabsAreClosed();
 }
 
 main().catch((err) => {
@@ -212,6 +213,54 @@ async function testAttachmentDetection(): Promise<void> {
     console.log("  FAIL -", (err as Error).message);
     process.exitCode = 1;
   } finally {
+    await browser.close();
+  }
+}
+
+
+/**
+ * A Gem or worker tab that fails to come up must be CLOSED, not abandoned.
+ *
+ * spawnGemTab and spawnTab opened the page first and set it up after; any
+ * failure in between left the tab open with nothing driving it. ask_gem
+ * reopens on its next call, so each failed consult added one more orphan to
+ * the user's window.
+ */
+async function testFailedTabsAreClosed(): Promise<void> {
+  console.log("\nFailed tabs are closed:");
+
+  const browser = await launchTestBrowser();
+  const context = await browser.newContext();
+  // Every request gets a blank page: no Gemini app shell ever appears, so
+  // tab setup fails the way it does against a broken or signed-out session.
+  await context.route("**/*", (route) => route.fulfill({ contentType: "text/html", body: "<html><body></body></html>" }));
+
+  const savedShell = TIMEOUTS.appShell;
+  TIMEOUTS.appShell = 1_500;
+  try {
+    const driver = new GeminiDriver({ headless: true }) as unknown as {
+      context: unknown;
+      spawnGemTab(g: { id: string; name: string }): Promise<unknown>;
+      spawnTab(label?: string): Promise<unknown>;
+    };
+    driver.context = context;
+
+    for (const [label, spawn] of [
+      ["spawnGemTab", () => driver.spawnGemTab({ id: "abc123", name: "Kite 2" })],
+      ["spawnTab", () => driver.spawnTab("worker")],
+    ] as const) {
+      const before = context.pages().length;
+      let threw = false;
+      await spawn().catch(() => (threw = true));
+      assert.ok(threw, `${label} should fail against a page with no app shell`);
+      assert.equal(context.pages().length, before, `${label} must close the tab it opened`);
+      console.log(`  ok - ${label} closes its tab when setup fails`);
+    }
+  } catch (err) {
+    console.log("  FAIL -", (err as Error).message);
+    process.exitCode = 1;
+  } finally {
+    TIMEOUTS.appShell = savedShell;
     await browser.close();
   }
 }

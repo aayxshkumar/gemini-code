@@ -99,7 +99,10 @@ const consumerSelectors = {
    * /gem/<id>, where <id> is a slug for Google's premade Gems
    * ("coding-partner") and an opaque id for your own.
    */
-  gemLink: 'a[href^="/gem/"]',
+  // Contains, not starts-with: absolute URLs and multi-account paths
+  // (/u/1/gem/...) are links to a Gem too. "/gem/" with its slashes still
+  // excludes the list page itself (/gems/view).
+  gemLink: 'a[href*="/gem/"]',
 
   /**
    * Temporary chat: a thread Google doesn't save to the account's history

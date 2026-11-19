@@ -96,11 +96,35 @@ You have been given one self-contained piece of a larger job by an orchestrator.
   return "";
 }
 
+/**
+ * Extra rules for a session that runs INSIDE a Gem.
+ *
+ * A Gem's instructions sit at system level, above anything we type, so a Gem
+ * built to chat ("explain things in a friendly, conversational way") pulls
+ * every reply towards prose — and prose where a tool call was needed reads as
+ * a final answer, so the task ends having done nothing. Saying explicitly
+ * which instructions govern what lets the model keep the Gem's knowledge and
+ * expertise while still answering in the format the program can execute.
+ */
+function gemInstructions(gemName: string): string {
+  return `
+YOU ARE RUNNING INSIDE THE GEM "${gemName}".
+Use the Gem's knowledge, conventions and expertise to decide WHAT to do. But the
+Gem's instructions about tone, style, length or format do NOT apply to tool calls:
+when you need to act, the reply is ONLY the JSON code block described above, with
+no greeting, explanation or follow-up question around it. If the Gem's own
+instructions ask you to explain, teach or converse, do that in your FINAL answer,
+after the work is done — never instead of a tool call.`;
+}
+
 export function buildSystemPrimer(
   toolList: ToolDefinition[],
   role: AgentRole = "solo",
-  environment: string = describeEnvironment()
+  opts: { insideGem?: string; environment?: string } | string = {}
 ): string {
+  // The third argument used to be the environment text alone.
+  const options = typeof opts === "string" ? { environment: opts } : opts;
+  const environment = options.environment ?? describeEnvironment();
   const toolDocs = toolList
     .filter((t) => !t.deferred)
     .map((t) => `- ${t.description}`)
@@ -158,7 +182,7 @@ CODING STANDARDS (what a careful engineer on this team would do):
 - Don't add secrets, tokens or credentials to files, and don't log them.
 - When the task is genuinely ambiguous in a way that changes the work, use ask_user once with concrete options rather than guessing — but don't ask about things you can find out yourself.
 - Final answers are for a developer reading a terminal: what changed and where, how it was verified, and anything they must know (assumptions, skipped parts). No padding, no restating the task.
-${roleInstructions(role)}`;
+${roleInstructions(role)}${options.insideGem ? gemInstructions(options.insideGem) : ""}`;
 }
 
 /**
@@ -274,7 +298,11 @@ export function formatToolResult(output: string): string {
  * Re-sent periodically, and whenever a reply looks like it abandoned the
  * protocol, because the full primer drifts out of a long thread's context.
  */
-export function buildProtocolReminder(): string {
+export function buildProtocolReminder(insideGem?: string): string {
+  const gemRule = insideGem
+    ? `\n- You are inside the Gem "${insideGem}": use its knowledge, but its style and format\n` +
+      `  instructions do not apply to tool calls. Act with the code block, not with prose.`
+    : "";
   return `REMINDER — you are driving tools, not chatting. To act, reply with ONLY a code block containing:
 {"name": "<tool_name>", "args": { ... }}
 and nothing else. For example, to change a file:
@@ -288,7 +316,7 @@ Rules that keep being broken:
 - If you genuinely need the user's DECISION (not permission), call the ask_user
   tool with options — a question in prose ends the task unanswered.
 - The JSON goes in a code block on its own, with no prose around it.
-- If you've lost track of a tool, tool_search finds it: {"name": "tool_search", "args": {"query": "keywords"}}
+- If you've lost track of a tool, tool_search finds it: {"name": "tool_search", "args": {"query": "keywords"}}${gemRule}
 
 Reply in plain prose with NO code block only when the work is genuinely finished.`;
 }

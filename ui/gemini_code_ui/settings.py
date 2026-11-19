@@ -82,6 +82,8 @@ SETTINGS: tuple[Setting, ...] = (
             "GEMINI_CODE_CONTINUE_NUDGES"),
     Setting("drift_nudges", "Nudges when a reply abandons the tool protocol", LIMITS, "int", 3, "GEMINI_CODE_DRIFT_NUDGES"),
     Setting("reminder_turns", "Restate the tool protocol every N turns", LIMITS, "int", 5, "GEMINI_CODE_REMINDER_TURNS"),
+    Setting("gem_reminder_turns", "…every N turns inside a Gem", LIMITS, "int", 3, "GEMINI_CODE_GEM_REMINDER_TURNS",
+            help="A Gem's own instructions pull replies towards prose, so the protocol is restated more often there."),
     Setting("turn_retries", "Re-sends before a turn fails", LIMITS, "int", 2, "GEMINI_CODE_TURN_RETRIES"),
     Setting("explore_nudge_turns", "Read-only calls before asking it to act", LIMITS, "int", 20,
             "GEMINI_CODE_EXPLORE_NUDGE_TURNS", help="0 turns the nudge off."),
