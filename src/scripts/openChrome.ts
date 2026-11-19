@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { resolveProfileDir } from "../driver/GeminiDriver.js";
+import { appUrl, isEnterprise, siteName } from "../driver/site.js";
 
 export const DEBUG_PORT = 9222;
 
@@ -99,7 +100,7 @@ function launchChrome(): void {
   const args = [
     `--remote-debugging-port=${DEBUG_PORT}`,
     `--user-data-dir=${profileDir}`,
-    "https://gemini.google.com/app",
+    appUrl(),
   ];
 
   let command: string;
@@ -133,7 +134,7 @@ export function openChrome(): void {
   console.log(`[gemini-code] Launching a normal Google Chrome window (debug port ${DEBUG_PORT})`);
   console.log(`[gemini-code] Profile: ${profileDir}`);
   console.log(
-    "\nSign in to Gemini by hand in the window that opens — this is your real Chrome, not an " +
+    `\nSign in to ${siteName()} by hand${isEnterprise() ? ` (${appUrl()})` : ""} in the window that opens — this is your real Chrome, not an ` +
       "automated one, so Google's sign-in works normally. Once you're signed in, leave this window " +
       "open and run `gemini-code` in another terminal.\n"
   );

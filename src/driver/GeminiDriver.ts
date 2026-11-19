@@ -1,8 +1,9 @@
 import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright";
 import path from "node:path";
 import { homedir } from "node:os";
-import { existsSync, mkdirSync } from "node:fs";
-import { selectors } from "./selectors.js";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { selectors, applySelectorOverrides } from "./selectors.js";
+import { appUrl, isAppPage, isEnterprise, isSignInPage, siteName } from "./site.js";
 import type { IGeminiDriver, GeminiResponse } from "./IGeminiDriver.js";
 import {
   resolveModel,
@@ -18,9 +19,31 @@ import {
 } from "./models.js";
 import { HTML_TO_MARKDOWN } from "./markdown.js";
 
-const GEMINI_URL = "https://gemini.google.com/app";
 const GEMS_URL = "https://gemini.google.com/gems/view";
 const gemChatUrl = (id: string) => `https://gemini.google.com/gem/${id}`;
+
+/** Where `applySiteSelectors` looks for the user's own selector overrides. */
+export function selectorOverridesPath(): string {
+  return path.join(process.env.GEMINI_CODE_HOME || path.join(homedir(), ".gemini-code"), "selectors.json");
+}
+
+/**
+ * Puts the consumer or Enterprise selector set in place, plus the user's
+ * overrides. Called by every driver on construction and again by
+ * `/enterprise`, so a switch mid-session takes effect at once.
+ */
+export function applySiteSelectors(): string[] {
+  let overrides: Record<string, unknown> | undefined;
+  const file = selectorOverridesPath();
+  if (existsSync(file)) {
+    try {
+      overrides = JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, ""));
+    } catch (err) {
+      return [`ignoring ${file}: ${(err as Error).message}`];
+    }
+  }
+  return applySelectorOverrides({ enterprise: isEnterprise(), overrides });
+}
 
 export interface Gem {
   /** The id in the URL: a slug for Google's premade Gems, an opaque id for your own. */
@@ -148,6 +171,7 @@ export class GeminiDriver implements IGeminiDriver {
     this.userDataDir = opts.userDataDir ?? resolveProfileDir();
     this.headless = opts.headless ?? false;
     this.channel = "channel" in opts ? opts.channel : "chrome";
+    for (const note of applySiteSelectors()) console.error(`gemini-code: selectors: ${note}`);
   }
 
   /**
@@ -169,7 +193,7 @@ export class GeminiDriver implements IGeminiDriver {
       viewport: { width: 1280, height: 900 },
     });
     this.page = this.context.pages()[0] ?? (await this.context.newPage());
-    await this.page.goto(GEMINI_URL, { waitUntil: "domcontentloaded" });
+    await this.page.goto(appUrl(), { waitUntil: "domcontentloaded" });
     await this.waitForAppShell();
   }
 
@@ -201,6 +225,8 @@ export class GeminiDriver implements IGeminiDriver {
    * then. Never throws: a UI without the button just stays a normal chat.
    */
   async ensureTemporaryChat(): Promise<boolean> {
+    // Gemini Enterprise has no Temporary chat; its history is the organisation's.
+    if (isEnterprise()) return false;
     const page = this.requirePage();
     const on = page.locator(`${selectors.temporaryChatButton} >> visible=true`).first();
     // Right after "New chat" the header re-renders; neither button is
@@ -220,7 +246,12 @@ export class GeminiDriver implements IGeminiDriver {
 
   /** Where a fresh thread starts: inside the Gem when one is selected. */
   private homeUrl(): string {
-    return this.gem ? gemChatUrl(this.gem.id) : GEMINI_URL;
+    return this.gem && !isEnterprise() ? gemChatUrl(this.gem.id) : appUrl();
+  }
+
+  /** The tab this driver works in, for read-only diagnostics like `gemini-code probe`. */
+  get currentPage(): Page | undefined {
+    return this.page;
   }
 
   get currentGem(): Gem | undefined {
@@ -236,6 +267,7 @@ export class GeminiDriver implements IGeminiDriver {
   async listGems(): Promise<Gem[]> {
     const context = this.context;
     if (!context) throw new Error("Cannot list Gems before attach()/launch().");
+    if (isEnterprise()) throw new Error("Gems are a consumer Gemini feature; Gemini Enterprise has none to list.");
 
     const page = await context.newPage();
     try {
@@ -353,7 +385,7 @@ export class GeminiDriver implements IGeminiDriver {
     // share one browser, and taking "the first Gemini tab" meant a second
     // instance would type into a tab another one was mid-conversation in —
     // both then fight over the same composer.
-    const candidates = this.context.pages().filter((p) => p.url().includes("gemini.google.com"));
+    const candidates = this.context.pages().filter((p) => isAppPage(p.url()));
     let claimed: Page | undefined;
     for (const candidate of candidates) {
       if (!(await this.isTabOwnedByAnother(candidate))) {
@@ -364,9 +396,7 @@ export class GeminiDriver implements IGeminiDriver {
 
     if (!claimed) {
       claimed = await this.context.newPage();
-      await claimed.goto(GEMINI_URL, { waitUntil: "domcontentloaded" });
-    } else if (!claimed.url().includes("gemini.google.com")) {
-      await claimed.goto(GEMINI_URL, { waitUntil: "domcontentloaded" });
+      await claimed.goto(appUrl(), { waitUntil: "domcontentloaded" });
     }
 
     this.page = claimed;
@@ -383,13 +413,25 @@ export class GeminiDriver implements IGeminiDriver {
    */
   private async waitForAppShell(timeoutMs = TIMEOUTS.appShell): Promise<void> {
     const page = this.requirePage();
+    // Gemini Enterprise signs out by redirecting to a sign-in host, where
+    // neither control ever appears: that is a state too, not a timeout.
+    const offApp = async () => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (isEnterprise() && this.offAppPage()) return;
+        await page.waitForTimeout(500);
+      }
+      throw new Error("timeout");
+    };
     await Promise.race([
       page.locator(`${selectors.signInButton} >> visible=true`).first().waitFor({ timeout: timeoutMs }),
       page.locator(selectors.composerInput).first().waitFor({ timeout: timeoutMs }),
+      offApp(),
     ]).catch(() => {
       throw new Error(
-        "Timed out waiting for the Gemini app to render (neither the sign-in button nor the " +
-          "composer appeared). The page structure may have changed — recalibrate selectors.ts."
+        `Timed out waiting for the ${siteName()} app to render (neither the sign-in button nor the ` +
+          "composer appeared). The page structure may have changed — run `gemini-code probe` and see " +
+          "README › Gemini Enterprise, or recalibrate selectors.ts."
       );
     });
   }
@@ -402,9 +444,21 @@ export class GeminiDriver implements IGeminiDriver {
    */
   /** Non-blocking read of the sign-in state, for `gemini-code doctor`. */
   async isLoggedIn(): Promise<boolean> {
+    return !(await this.signedOut());
+  }
+
+  /** On Enterprise: the tab has left the app (a sign-in or SSO redirect, or the wrong tenant). */
+  private offAppPage(): boolean {
+    const url = this.page?.url() ?? "";
+    return isSignInPage(url) || (!!url && url !== "about:blank" && !isAppPage(url));
+  }
+
+  /** A visible sign-in control, or — on Enterprise — a redirect off the app. */
+  private async signedOut(): Promise<boolean> {
     const page = this.requirePage();
+    if (isEnterprise() && this.offAppPage()) return true;
     const signIn = page.locator(`${selectors.signInButton} >> visible=true`).first();
-    return !(await signIn.isVisible().catch(() => false));
+    return signIn.isVisible().catch(() => false);
   }
 
   async ensureLoggedIn(
@@ -418,15 +472,13 @@ export class GeminiDriver implements IGeminiDriver {
     // item), which would make isVisible() false even while a real,
     // clickable sign-in prompt is on screen. `>> visible=true` filters the
     // match list down to visible elements before `.first()` picks one.
-    const signIn = page.locator(`${selectors.signInButton} >> visible=true`).first();
-
-    if (!(await signIn.isVisible().catch(() => false))) return; // already signed in
+    if (!(await this.signedOut())) return; // already signed in
 
     // A tab left open from before signing in still shows the button, so a
     // signed-in session looked signed out until someone reloaded it by hand.
     await this.navigate(this.homeUrl()).catch(() => undefined);
     await this.waitForAppShell().catch(() => undefined);
-    if (!(await signIn.isVisible().catch(() => false))) return;
+    if (!(await this.signedOut())) return;
 
     // Sessions do expire, so this isn't only a first-run path. Put the
     // window in front of the user rather than silently blocking on a
@@ -438,14 +490,14 @@ export class GeminiDriver implements IGeminiDriver {
     // instead of hanging until the timeout.
     if (!interactive) {
       throw new Error(
-        "Your Gemini session is signed out, and this isn't an interactive terminal.\n" +
+        `Your ${siteName()} session is signed out, and this isn't an interactive terminal.\n` +
           "Run `gemini-code login` yourself, sign in in the Chrome window it brings up, then retry."
       );
     }
 
     const seconds = Math.round(timeoutMs / 1000);
     console.log(
-      "\n[gemini-code] Your Gemini session is signed out.\n" +
+      `\n[gemini-code] Your ${siteName()} session is signed out.\n` +
         "A Chrome window has been brought to the front — sign in there and I'll carry on automatically.\n" +
         `(waiting up to ${seconds}s; nothing here touches your credentials)\n`
     );
@@ -453,7 +505,14 @@ export class GeminiDriver implements IGeminiDriver {
     const started = Date.now();
     let lastNotice = 0;
     while (Date.now() - started < timeoutMs) {
-      if (!(await signIn.isVisible().catch(() => false))) {
+      if (!(await this.signedOut())) {
+        // Enterprise sign-in can finish on a landing page that isn't the
+        // organisation's app; open the link once more so the tab is on it.
+        if (isEnterprise() && !isAppPage(page.url())) {
+          await this.navigate(appUrl()).catch(() => undefined);
+          await this.waitForAppShell().catch(() => undefined);
+          if (await this.signedOut()) continue;
+        }
         console.log("[gemini-code] Signed in — continuing.\n");
         return;
       }
@@ -875,8 +934,16 @@ export class GeminiDriver implements IGeminiDriver {
     // Inside a Gem, "New chat" drops back to a plain Gemini thread and the
     // Gem's expertise silently stops applying. Re-open the Gem's own URL
     // instead, which starts a fresh thread that is still in the Gem.
-    if (this.gem) {
+    if (this.gem && !isEnterprise()) {
       await this.navigate(gemChatUrl(this.gem.id));
+      await this.waitForAppShell();
+      await this.waitForResponsesCleared();
+      return;
+    }
+    // Gemini Enterprise: reopening the organisation's link is the one
+    // reliable way to a fresh thread, whatever its sidebar looks like.
+    if (isEnterprise()) {
+      await this.navigate(appUrl());
       await this.waitForAppShell();
       await this.waitForResponsesCleared();
       return;
@@ -886,7 +953,7 @@ export class GeminiDriver implements IGeminiDriver {
       await newChat.click();
     } else {
       // Fallback: a fresh page load starts a fresh thread too.
-      await this.navigate(GEMINI_URL);
+      await this.navigate(appUrl());
       await this.waitForAppShell();
     }
     await this.waitForResponsesCleared();

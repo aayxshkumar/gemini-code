@@ -55,9 +55,12 @@ import {
   type MenuRow,
 } from "../driver/models.js";
 import { resolveGem } from "../driver/GeminiDriver.js";
-import { selectors } from "../driver/selectors.js";
+import { selectors, applySelectorOverrides } from "../driver/selectors.js";
+import { appUrl, isAppPage, isEnterprise, isSignInPage, parseEnterpriseUrl } from "../driver/site.js";
+import { enterpriseConfigured, setEnterprise } from "../enterprise.js";
+import { envNameFor } from "../config.js";
 import { createAskGemTool } from "../tools/askGem.js";
-import { gemFlag, gemModeFlag, serveArgs } from "../args.js";
+import { gemFlag, gemModeFlag, enterpriseFlag, serveArgs } from "../args.js";
 import { startServer } from "../server/openai.js";
 import { isDialogRace } from "../driver/processGuards.js";
 import {
@@ -1824,6 +1827,102 @@ async function main() {
     assert.ok(menuRowMatches("fast", "Auto\nGemini 3 models"), "the default must work on an Auto-only picker");
     assert.ok(!menuRowMatches("4 Argon", "3.1 Pro\nAdvanced reasoning"));
     assert.ok(!menuRowMatches("fast", "Thinking level"));
+  });
+
+  console.log("Gemini Enterprise:");
+  await test("an Enterprise link is validated and normalised, with its cid", () => {
+    const link = parseEnterpriseUrl("vertexaisearch.cloud.google.com/home/cid/1a2b3c4d-0000-4e5f-9a8b-123456789abc#x");
+    assert.equal(link.url, "https://vertexaisearch.cloud.google.com/home/cid/1a2b3c4d-0000-4e5f-9a8b-123456789abc");
+    assert.equal(link.cid, "1a2b3c4d-0000-4e5f-9a8b-123456789abc");
+    assert.equal(link.knownHost, true);
+    assert.equal(parseEnterpriseUrl("https://business.gemini.google/home/cid/abc").knownHost, true);
+    assert.equal(parseEnterpriseUrl("https://intranet.example.com/gemini/cid/abc").knownHost, false, "unknown hosts are allowed but flagged");
+    assert.throws(() => parseEnterpriseUrl("http://vertexaisearch.cloud.google.com/home/cid/x"), /https/);
+    assert.throws(() => parseEnterpriseUrl("https://gemini.google.com/app"), /consumer/);
+    assert.throws(() => parseEnterpriseUrl("   "), /empty/);
+  });
+
+  await test("the site follows GEMINI_CODE_ENTERPRISE_URL at call time", () => {
+    const prev = process.env.GEMINI_CODE_ENTERPRISE_URL;
+    try {
+      delete process.env.GEMINI_CODE_ENTERPRISE_URL;
+      assert.equal(isEnterprise(), false);
+      assert.equal(appUrl(), "https://gemini.google.com/app");
+      assert.ok(isAppPage("https://gemini.google.com/app/abc123"));
+
+      process.env.GEMINI_CODE_ENTERPRISE_URL = "https://vertexaisearch.cloud.google.com/home/cid/tenant-1";
+      assert.equal(isEnterprise(), true);
+      assert.equal(appUrl(), "https://vertexaisearch.cloud.google.com/home/cid/tenant-1");
+      assert.ok(isAppPage("https://vertexaisearch.cloud.google.com/home/cid/tenant-1/r/session/99"), "a thread in the tenant");
+      assert.ok(!isAppPage("https://vertexaisearch.cloud.google.com/home/cid/tenant-2"), "another organisation's app");
+      assert.ok(!isAppPage("https://gemini.google.com/app"), "the consumer app");
+      assert.ok(isSignInPage("https://accounts.google.com/v3/signin/identifier?continue=x"));
+      assert.ok(isSignInPage("https://auth.cloud.google/signin/locations/global/pools/p"));
+      assert.ok(!isSignInPage("https://vertexaisearch.cloud.google.com/home/cid/tenant-1"));
+
+      for (const off of ["off", "0", ""]) {
+        process.env.GEMINI_CODE_ENTERPRISE_URL = off;
+        assert.equal(isEnterprise(), false, `"${off}" means consumer Gemini`);
+      }
+    } finally {
+      if (prev === undefined) delete process.env.GEMINI_CODE_ENTERPRISE_URL;
+      else process.env.GEMINI_CODE_ENTERPRISE_URL = prev;
+    }
+  });
+
+  await test("Enterprise selectors swap in and back, and user overrides apply on top", () => {
+    const consumerComposer = selectors.composerInput;
+    try {
+      applySelectorOverrides({ enterprise: true });
+      assert.match(selectors.composerInput, /textarea/);
+      assert.match(selectors.responseContainer, /ucs-summary/);
+      const notes = applySelectorOverrides({
+        enterprise: true,
+        overrides: { responseContainer: "ucs-answer", uploadFilesText: "/add files/i", nope: "x", stopButton: 3 },
+      });
+      assert.equal(selectors.responseContainer, "ucs-answer");
+      assert.ok(selectors.uploadFilesText instanceof RegExp && selectors.uploadFilesText.test("Add Files"));
+      assert.ok(notes.some((n) => /unknown selector "nope"/.test(n)));
+      assert.ok(notes.some((n) => /"stopButton" must be a non-empty string/.test(n)));
+      applySelectorOverrides({ enterprise: false });
+      assert.equal(selectors.composerInput, consumerComposer, "back to the consumer set, overrides dropped");
+    } finally {
+      applySelectorOverrides({ enterprise: false });
+    }
+  });
+
+  await test("--enterprise is read, saved to the user config with the rest kept, and 'off' undoes it", async () => {
+    assert.equal(enterpriseFlag(["--enterprise", "https://x.cloud.google.com/home/cid/a"]), "https://x.cloud.google.com/home/cid/a");
+    assert.equal(enterpriseFlag(["--enterprise=off"]), "off");
+    assert.equal(enterpriseFlag(["--model", "pro"]), undefined);
+    assert.equal(envNameFor("enterprise"), "GEMINI_CODE_ENTERPRISE_URL");
+
+    const home = path.resolve(".tmp-test", `ent-home-${Date.now().toString(36)}`);
+    await mkdir(home, { recursive: true });
+    const prevHome = process.env.GEMINI_CODE_HOME;
+    const prevUrl = process.env.GEMINI_CODE_ENTERPRISE_URL;
+    process.env.GEMINI_CODE_HOME = home;
+    try {
+      await writeFile(path.join(home, "config.json"), JSON.stringify({ model: "pro" }));
+      const link = setEnterprise("vertexaisearch.cloud.google.com/home/cid/abc");
+      assert.equal(link?.cid, "abc");
+      assert.equal(process.env.GEMINI_CODE_ENTERPRISE_URL, "https://vertexaisearch.cloud.google.com/home/cid/abc");
+      const saved = JSON.parse(await readFile(path.join(home, "config.json"), "utf8"));
+      assert.deepEqual(saved, { model: "pro", enterprise: "https://vertexaisearch.cloud.google.com/home/cid/abc" });
+      assert.ok(enterpriseConfigured());
+
+      assert.equal(setEnterprise("off"), undefined);
+      assert.equal(isEnterprise(), false);
+      assert.equal(JSON.parse(await readFile(path.join(home, "config.json"), "utf8")).enterprise, "off");
+      assert.ok(enterpriseConfigured(), "an explicit 'off' counts as answered, so the first-start question isn't repeated");
+      assert.throws(() => setEnterprise("not a link at all"), /isn't a link|https/);
+    } finally {
+      if (prevHome === undefined) delete process.env.GEMINI_CODE_HOME;
+      else process.env.GEMINI_CODE_HOME = prevHome;
+      if (prevUrl === undefined) delete process.env.GEMINI_CODE_ENTERPRISE_URL;
+      else process.env.GEMINI_CODE_ENTERPRISE_URL = prevUrl;
+      await rm(home, { recursive: true, force: true });
+    }
   });
 
   console.log("Gems:");

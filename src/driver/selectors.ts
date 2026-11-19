@@ -32,7 +32,7 @@
  * general structure (rich-text composer, Angular Material buttons) — they
  * are NOT guaranteed to match the live DOM. Treat them as a starting point.
  */
-export const selectors = {
+const consumerSelectors = {
   /**
    * Sign-in control shown when the profile isn't authenticated yet.
    *
@@ -138,4 +138,71 @@ export const selectors = {
 
   /** What a model above the account's plan opens instead of switching. */
   upgradeDialog: '[role="dialog"]:has-text("Upgrade"), mat-dialog-container:has-text("Upgrade")',
-} as const;
+};
+
+export type Selectors = { -readonly [K in keyof typeof consumerSelectors]: (typeof consumerSelectors)[K] extends RegExp ? RegExp : string };
+
+/**
+ * Gemini Enterprise (vertexaisearch.cloud.google.com / business.gemini.google)
+ * is a different app: Lit web components (`ucs-*`) with open shadow roots,
+ * which Playwright's CSS engine pierces, and Material 3 buttons. Signing out
+ * there redirects to a separate sign-in host rather than showing a button.
+ *
+ * These are UNIONS with the consumer selectors, written from the app's
+ * general structure: they have not been calibrated against every
+ * organisation's tenant. `gemini-code probe` reports which of them match
+ * on your signed-in page, and ~/.gemini-code/selectors.json overrides any of
+ * them without a rebuild (see applySelectorOverrides).
+ */
+const enterpriseSelectors: Partial<Selectors> = {
+  signInButton: 'button:has-text("Sign in"), a:has-text("Sign in"), md-filled-button:has-text("Sign in")',
+  composerInput: 'div[contenteditable="true"], textarea',
+  sendButton:
+    'button[aria-label^="Send" i], button[aria-label^="Submit" i], md-icon-button[aria-label^="Send" i], md-icon-button[aria-label^="Submit" i]',
+  uploadButton:
+    'button[aria-label^="Upload" i], button[aria-label*="Add file" i], md-icon-button[aria-label^="Upload" i], md-icon-button[aria-label*="Add file" i]',
+  stopButton: 'button[aria-label^="Stop" i], md-icon-button[aria-label^="Stop" i]',
+  responseContainer: 'ucs-summary, [data-message-author-role="model"], .model-response-text',
+  newChatButton:
+    'button[aria-label^="New chat" i], md-text-button:has-text("New chat"), md-filled-tonal-button:has-text("New chat"), button:has-text("New chat")',
+};
+
+/**
+ * The live selector table. Mutable so the Enterprise set and the user's own
+ * overrides can be applied at startup; every module reads it through this
+ * one object, so a change here reaches them all.
+ */
+export const selectors: Selectors = { ...consumerSelectors } as Selectors;
+
+/**
+ * Puts the right selector set in place: consumer or Enterprise, then the
+ * user's overrides from a JSON file of `{ "<name>": "<css>" }` (a value
+ * written as "/text/i" becomes a regular expression). Unknown names are
+ * reported and skipped, so a typo doesn't silently do nothing.
+ */
+export function applySelectorOverrides(opts: { enterprise: boolean; overrides?: Record<string, unknown> }): string[] {
+  Object.assign(selectors, consumerSelectors, opts.enterprise ? enterpriseSelectors : {});
+  const notes: string[] = [];
+  for (const [name, value] of Object.entries(opts.overrides ?? {})) {
+    if (!(name in consumerSelectors)) {
+      notes.push(`unknown selector "${name}" — ignored`);
+      continue;
+    }
+    if (typeof value !== "string" || !value.trim()) {
+      notes.push(`selector "${name}" must be a non-empty string — ignored`);
+      continue;
+    }
+    const isRegex = (consumerSelectors as Record<string, unknown>)[name] instanceof RegExp;
+    const m = value.match(/^\/(.*)\/([a-z]*)$/s);
+    if (isRegex) {
+      try {
+        (selectors as Record<string, unknown>)[name] = m ? new RegExp(m[1], m[2]) : new RegExp(value, "i");
+      } catch (err) {
+        notes.push(`selector "${name}": ${(err as Error).message} — ignored`);
+      }
+    } else {
+      (selectors as Record<string, unknown>)[name] = value;
+    }
+  }
+  return notes;
+}

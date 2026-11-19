@@ -11,6 +11,7 @@
  * No dependencies: node:http is enough for three routes, and it keeps the
  * release tarball as it is.
  */
+import { isEnterprise } from "../driver/site.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { mkdir, rm, writeFile } from "node:fs/promises";
@@ -246,7 +247,7 @@ export async function startServer(opts: ServerOptions): Promise<{ url: string; c
         images = request.messages.flatMap((m) => imagesOf(m.content));
       }
 
-      if (tab.model !== alias) {
+      if (tab.model !== alias && !isEnterprise()) {
         try {
           await tab.driver.setModel(alias);
           tab.model = alias;

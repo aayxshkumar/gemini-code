@@ -6,8 +6,10 @@ import readline from "node:readline/promises";
 import { createRequire } from "node:module";
 import { emitKeypressEvents } from "node:readline";
 import path from "node:path";
-import { GeminiDriver, type Gem } from "./driver/GeminiDriver.js";
-import { gemFlag, gemModeFlag, modelFlag, chooseModelFlag, serveArgs } from "./args.js";
+import { GeminiDriver, applySiteSelectors, type Gem } from "./driver/GeminiDriver.js";
+import { gemFlag, gemModeFlag, modelFlag, chooseModelFlag, enterpriseFlag, serveArgs } from "./args.js";
+import { enterpriseLink, isEnterprise, siteName } from "./driver/site.js";
+import { askForEnterpriseLink, enterpriseConfigured, setEnterprise } from "./enterprise.js";
 import { startServer } from "./server/openai.js";
 import { installDialogRaceGuard } from "./driver/processGuards.js";
 import { createMainSession } from "./agent/mainSession.js";
@@ -55,6 +57,7 @@ export const VERSION: string = (createRequire(import.meta.url)("../package.json"
 import { openChrome, ensureChromeRunning } from "./scripts/openChrome.js";
 import { checkLogin } from "./scripts/login.js";
 import { doctor } from "./scripts/doctor.js";
+import { probe } from "./scripts/probe.js";
 import { configCommand } from "./scripts/configCmd.js";
 import { API_MODELS } from "./server/protocol.js";
 import { c, glyph, ASCII } from "./ui/format.js";
@@ -63,6 +66,8 @@ import { setAsker } from "./ui/prompt.js";
 
 function helpText(): string {
   return `${c.bold("Commands")}
+  ${c.cyan("/enterprise")}       where you sign in: show it, or ${c.cyan("/enterprise <link>")} to use Gemini Enterprise
+  ${c.cyan("/enterprise off")}   go back to gemini.google.com
   ${c.cyan("/model")}            show the current model
   ${c.cyan("/model <name>")}     switch model:
 ${modelHelp()
@@ -185,7 +190,30 @@ async function chooseModelInteractively(driver: GeminiDriver, current: string | 
   return alias;
 }
 
+/**
+ * Settles where to sign in before the driver exists, because its selectors
+ * and every URL it opens depend on it: --enterprise wins, then the config,
+ * and with neither, a terminal is asked once.
+ */
+async function chooseSite(argv: string[]): Promise<void> {
+  const flag = enterpriseFlag(argv);
+  if (flag) {
+    try {
+      const link = setEnterprise(flag);
+      console.log(c.dim(link ? `Gemini Enterprise: ${link.url} (saved)` : "Using gemini.google.com (saved)"));
+      if (link && !link.knownHost) console.log(c.yellow(`  ${link.host} isn't a host Google is known to serve Gemini Enterprise from — continuing anyway.`));
+      if (link && !link.cid) console.log(c.yellow("  That link has no /cid/<id> part; if sign-in lands somewhere else, paste the full link from the address bar."));
+    } catch (err) {
+      throw new Error(`--enterprise: ${(err as Error).message}`);
+    }
+  } else if (!enterpriseConfigured() && process.stdin.isTTY) {
+    await askForEnterpriseLink();
+  }
+  applySiteSelectors();
+}
+
 async function main() {
+  await chooseSite(process.argv.slice(2));
   const driver = new GeminiDriver();
   // Start Chrome ourselves if it isn't already up, so the usual case is a
   // single command. Signing in stays manual, but the profile keeps the
@@ -270,7 +298,8 @@ async function main() {
   // Temporary chats by default: the agent's threads are tool-call noise that
   // would otherwise bury the user's own conversations in Gemini's sidebar and
   // feed its personalisation. GEMINI_CODE_TEMPORARY_CHAT=0 keeps them.
-  driver.temporaryChats = process.env.GEMINI_CODE_TEMPORARY_CHAT !== "0";
+  // Gemini Enterprise has no Temporary chat: its history is the organisation's.
+  driver.temporaryChats = !isEnterprise() && process.env.GEMINI_CODE_TEMPORARY_CHAT !== "0";
   await driver.newConversation();
   const temporary = driver.temporaryChats ? await driver.isTemporaryChat() : false;
 
@@ -278,7 +307,7 @@ async function main() {
   const argv = process.argv.slice(2);
   let startModel = modelFlag(argv) ?? process.env.GEMINI_CODE_MODEL;
   // No model anywhere (fresh machine), or asked to: show the live picker.
-  if (process.stdin.isTTY && (chooseModelFlag(argv) || !startModel)) {
+  if (process.stdin.isTTY && !isEnterprise() && (chooseModelFlag(argv) || !startModel)) {
     startModel = await chooseModelInteractively(driver, startModel);
   }
   startModel ??= DEFAULT_MODEL_ALIAS;
@@ -288,7 +317,11 @@ async function main() {
     ? /^(on|true|yes|1)$/i.test(process.env.GEMINI_CODE_THINKING)
     : DEFAULT_EXTENDED_THINKING;
   let modelName = "unknown";
-  try {
+  // Gemini Enterprise picks its own model per organisation and has no
+  // consumer-style picker to drive, so leave it alone rather than spend a
+  // minute timing out on menus that aren't there.
+  if (isEnterprise()) modelName = `Gemini Enterprise's own ${c.dim("(its model isn't switched from here)")}`;
+  else try {
     modelName = await driver.setModelWithFallback(startModel, {
       onFallback: (wanted, got) =>
         console.log(c.yellow(`${wanted} isn't in this account's model picker — using ${got} instead.`)),
@@ -325,6 +358,7 @@ async function main() {
 ${c.magenta(glyph.star)} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — Claude-Code-style agent on the Gemini web UI`)}
 
   ${c.dim("cwd")}     ${path.basename(process.cwd())}
+  ${c.dim("site")}    ${isEnterprise() ? `Gemini Enterprise ${c.dim(enterpriseLink()!.url)}` : `gemini.google.com ${c.dim("(/enterprise <link> for Gemini Enterprise)")}`}
   ${c.dim("model")}   ${modelName}${levelNote}${
     driver.currentGem
       ? `\n  ${c.dim("gem")}     ${driver.currentGem.name} ${c.dim("(the whole session runs inside it)")}`
@@ -553,10 +587,42 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
         const [cmd, ...rest] = task.slice(1).split(/\s+/);
         const arg = rest.join(" ");
         try {
+          if (isEnterprise() && ["model", "models", "level", "thinking"].includes(cmd.toLowerCase())) {
+            console.log(`  ${c.dim(`Gemini Enterprise chooses its own model; /${cmd.toLowerCase()} only drives gemini.google.com's picker.`)}\n`);
+            continue;
+          }
           switch (cmd.toLowerCase()) {
             case "help":
               console.log(`\n${helpText()}\n`);
               break;
+
+            case "enterprise": {
+              if (!arg) {
+                const link = enterpriseLink();
+                console.log(
+                  link
+                    ? `\n  signing in at ${c.bold("Gemini Enterprise")}: ${link.url}${link.cid ? c.dim(` (cid ${link.cid})`) : ""}\n  ${c.dim("/enterprise <link> changes it, /enterprise off goes back to gemini.google.com")}\n`
+                    : `\n  signing in at ${c.bold("gemini.google.com")}\n  ${c.dim("/enterprise <link> switches to Gemini Enterprise, e.g. /enterprise https://vertexaisearch.cloud.google.com/home/cid/<id>")}\n`
+                );
+                break;
+              }
+              const link = setEnterprise(arg);
+              for (const note of applySiteSelectors()) console.log(c.yellow(`  selectors: ${note}`));
+              driver.temporaryChats = !link && process.env.GEMINI_CODE_TEMPORARY_CHAT !== "0";
+              // A different app: open it in this tab, wait out the sign-in,
+              // and start a thread there with the primer re-sent.
+              await driver.newConversation().catch(() => undefined);
+              await driver.ensureLoggedIn();
+              await driver.newConversation();
+              forgetAll();
+              skills = await skillSummaries();
+              session = makeMainSession(await readMemory());
+              console.log(
+                `  ${c.green(glyph.ok)} now on ${siteName()}${link ? ` (${link.url})` : ""} — saved for next time; fresh thread\n` +
+                  (link && !link.knownHost ? c.yellow(`  ${link.host} isn't a host Google is known to use for Gemini Enterprise.\n`) : "")
+              );
+              break;
+            }
 
             case "model":
               if (!arg) {
@@ -921,13 +987,21 @@ Usage:
   gemini-code skills remove <name>
                               remove an installed skill
   gemini-code bridge          run the agent over JSON lines on stdin/stdout (the desktop UI uses this)
-  gemini-code open-chrome     open a normal Chrome window to sign into (do this first)
+  gemini-code --enterprise <link>
+                              sign in at your Gemini Enterprise link, e.g.
+                              https://vertexaisearch.cloud.google.com/home/cid/<id> (saved; "off" undoes it)
+  gemini-code open-chrome [<link>]
+                              open a normal Chrome window to sign into (do this first); with a
+                              Gemini Enterprise link, saves it and opens it
+  gemini-code probe           on the signed-in tab, report which selectors match (for calibrating
+                              Gemini Enterprise) and save a page outline to ~/.gemini-code/probe.txt
   gemini-code login           check that the signed-in Chrome is reachable
   gemini-code doctor          check Node, Chrome, the profile, PATH and the sign-in state
   gemini-code config          show saved defaults; "config set model pro" saves one
   gemini-code --help          this message
 
 Settings (environment, or "gemini-code config set <key> <value>", or <project>/.gemini-code.json):
+  GEMINI_CODE_ENTERPRISE_URL  your Gemini Enterprise link, or off for gemini.google.com (config key: enterprise)
   GEMINI_CODE_MODEL           thinking (default) | fast | fastest | pro
   GEMINI_CODE_THINKING_LEVEL  low | medium | high (default) — the picker's Thinking level
   GEMINI_CODE_THINKING        on | off — the Extended thinking toggle, where the picker has one
@@ -1050,6 +1124,7 @@ async function cli(): Promise<void> {
     case "--model":
     case "--add-dir":
     case "--choose-model":
+    case "--enterprise":
     case "--pick":
     case "--pick-model":
       return main();
@@ -1059,8 +1134,17 @@ async function cli(): Promise<void> {
       return runBridge();
     case "skills":
       return skillsCommand();
-    case "open-chrome":
+    case "open-chrome": {
+      // `open-chrome <link>` or `open-chrome --enterprise <link>`: save it and open it to sign in.
+      const raw = enterpriseFlag(process.argv.slice(3)) ?? process.argv.slice(3).find((a) => !a.startsWith("-"));
+      if (raw) {
+        const link = setEnterprise(raw);
+        console.log(link ? `[gemini-code] Gemini Enterprise link saved: ${link.url}` : "[gemini-code] Using gemini.google.com (saved)");
+      }
       return void openChrome();
+    }
+    case "probe":
+      return probe();
     case "login":
       return checkLogin();
     case "doctor":
@@ -1078,7 +1162,7 @@ async function cli(): Promise<void> {
       return;
     }
     default:
-      if (cmd.startsWith("--gem=") || cmd.startsWith("--gem-mode=") || cmd.startsWith("--model=") || cmd.startsWith("--add-dir=")) return main();
+      if (cmd.startsWith("--gem=") || cmd.startsWith("--gem-mode=") || cmd.startsWith("--model=") || cmd.startsWith("--add-dir=") || cmd.startsWith("--enterprise=")) return main();
       console.error(`Unknown command "${cmd}"\n\n${USAGE}`);
       process.exitCode = 1;
   }

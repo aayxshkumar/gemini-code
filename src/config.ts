@@ -17,6 +17,7 @@ import path from "node:path";
 
 /** Friendly key -> environment variable it sets. */
 export const CONFIG_KEYS: Record<string, { env: string; hint: string }> = {
+  enterprise: { env: "GEMINI_CODE_ENTERPRISE_URL", hint: "your Gemini Enterprise link, e.g. https://vertexaisearch.cloud.google.com/home/cid/<id> — or off for gemini.google.com" },
   model: { env: "GEMINI_CODE_MODEL", hint: "thinking (default) | auto | fast | fastest | pro | argon, or a picker label like \"3.8 Thinking\"" },
   thinkingLevel: { env: "GEMINI_CODE_THINKING_LEVEL", hint: "low | medium | high (default) — the picker's Thinking level submenu" },
   thinking: { env: "GEMINI_CODE_THINKING", hint: "on | off — the Extended thinking toggle, where the picker has one" },

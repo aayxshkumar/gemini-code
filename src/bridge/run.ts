@@ -1,3 +1,4 @@
+import { appUrl, isEnterprise } from "../driver/site.js";
 import readline from "node:readline";
 import { format } from "node:util";
 import path from "node:path";
@@ -111,13 +112,16 @@ async function startSession(emit: Emit, exit: () => Promise<void>) {
 
   await driver.newConversation();
 
-  if (modelName) {
+  // Gemini Enterprise has no consumer-style picker to drive: leave its model alone.
+  const enterprise = isEnterprise();
+  if (enterprise) log(`Signed in at Gemini Enterprise (${appUrl()}); its model isn't switched from here.`);
+  if (modelName && !enterprise) {
     await driver.setModel(modelName).catch((err: Error) => {
       log(`Couldn't set model to "${modelName}": ${err.message.split("\n")[0]}`);
     });
   }
   const thinkingLevel = process.env.GEMINI_CODE_THINKING;
-  if (thinkingLevel) {
+  if (thinkingLevel && !enterprise) {
     await driver.setThinkingLevel(thinkingLevel).catch((err: Error) => {
       log(`Couldn't set thinking to "${thinkingLevel}": ${err.message.split("\n")[0]}`);
     });
@@ -125,7 +129,8 @@ async function startSession(emit: Emit, exit: () => Promise<void>) {
   const current = await driver.getCurrentModel();
   // A picker that can't be read shouldn't stop the session: it can still work
   // on the selected model, and the app says it has no list.
-  const menu = await driver.listModels().catch((err: Error): ModelMenu => {
+  const noMenu = async (): Promise<ModelMenu> => ({ models: [], thinking: [], current: "Gemini Enterprise" });
+  const menu = enterprise ? await noMenu() : await driver.listModels().catch((err: Error): ModelMenu => {
     log(`Couldn't read the model list: ${err.message.split("\n")[0]}`);
     return { models: [], thinking: [], current };
   });
@@ -159,12 +164,16 @@ async function startSession(emit: Emit, exit: () => Promise<void>) {
   const host: BridgeHost = {
     runTask: (task, options) => session.runTask(task, options),
     latestMarkdown: () => driver.getLastResponseMarkdown().catch(() => ""),
-    listModels: () => driver.listModels(),
+    listModels: () => (isEnterprise() ? noMenu() : driver.listModels()),
     async setModel(name) {
+      if (isEnterprise()) throw new Error("Gemini Enterprise chooses its own model.");
       await driver.setModel(name);
       modelName = name;
     },
-    setThinkingLevel: (level) => driver.setThinkingLevel(level),
+    setThinkingLevel: async (level) => {
+      if (isEnterprise()) throw new Error("Gemini Enterprise has no thinking-level setting to drive.");
+      await driver.setThinkingLevel(level);
+    },
     newThread: freshThread,
     setPlanMode: (on) => session.setPlanMode(on),
     inPlanMode: () => session.inPlanMode,

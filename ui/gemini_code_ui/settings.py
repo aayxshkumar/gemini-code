@@ -51,6 +51,9 @@ SETTINGS: tuple[Setting, ...] = (
     Setting("thinking_level", "Thinking level", PICKER, "text", "", "GEMINI_CODE_THINKING"),
     # Most recent first, for the composer's folder picker.
     Setting("recent_projects", "Recent folders", PICKER, "list", ()),
+    Setting("enterprise_url", "Gemini Enterprise link", GENERAL, "text", "", "GEMINI_CODE_ENTERPRISE_URL",
+            help="Where you sign in, e.g. https://vertexaisearch.cloud.google.com/home/cid/<id>. "
+                 "Empty uses gemini.google.com (or the link saved by the terminal app)."),
     Setting("gem", "Gem", GENERAL, "text", "", "GEMINI_CODE_GEM",
             help="Name or id of a Gem to use. Leave empty for none."),
     Setting("gem_mode", "Gem mode", GENERAL, "choice", "reference", "GEMINI_CODE_GEM_MODE",

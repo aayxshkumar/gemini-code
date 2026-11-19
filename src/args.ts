@@ -35,6 +35,11 @@ export function modelFlag(argv: string[]): string | undefined {
   return flagValue(argv, "model");
 }
 
+/** Reads `--enterprise <link|off>`: where to sign in (Gemini Enterprise) for this and later runs. */
+export function enterpriseFlag(argv: string[]): string | undefined {
+  return flagValue(argv, "enterprise");
+}
+
 /** `--choose-model` / `--pick`: show the live picker and ask, even if a model is configured. */
 export function chooseModelFlag(argv: string[]): boolean {
   return argv.includes("--choose-model") || argv.includes("--pick") || argv.includes("--pick-model");

@@ -1,3 +1,4 @@
+import { appUrl, isEnterprise, siteName } from "../driver/site.js";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -88,7 +89,7 @@ export async function doctor(): Promise<void> {
     try {
       await driver.attach();
       const loggedIn = await driver.isLoggedIn();
-      if (loggedIn) ok("Gemini session: signed in");
+      if (loggedIn) ok(`${siteName()} session: signed in${isEnterprise() ? ` (${appUrl()})` : ""}`);
       else warn("Gemini session: signed OUT — sign in by hand in that Chrome window (gemini-code open-chrome)");
     } catch (err) {
       warn(`couldn't attach to it: ${(err as Error).message.split("\n")[0]}`);

@@ -396,6 +396,55 @@ raw `GEMINI_CODE_*` name from the table.
 | `GEMINI_CODE_SHELL` | Git Bash on Windows, else `sh` | shell commands run in (e.g. `powershell.exe`) |
 | `GEMINI_CODE_CLAUDE_SKILLS` | `1` | `0` = don't use skills from `~/.claude/skills` |
 
+## Gemini Enterprise
+
+If your organisation gives you **Gemini Enterprise** (formerly Agentspace) instead of
+gemini.google.com, point gemini-code at your organisation's link — the address in your
+browser when Gemini Enterprise is open, which ends in `/cid/<id>`:
+
+```text
+https://vertexaisearch.cloud.google.com/home/cid/<id>
+https://business.gemini.google/home/cid/<id>
+```
+
+Any one of these sets it, and it is saved to `~/.gemini-code/config.json` for next time:
+
+| Where | How |
+| --- | --- |
+| First start | gemini-code asks *"Where do you sign in?"* — paste the link, or press Enter for gemini.google.com |
+| While running | `/enterprise <link>` switches the session (fresh thread); `/enterprise` shows it; `/enterprise off` goes back |
+| Command line | `gemini-code --enterprise <link>` or `gemini-code open-chrome <link>` (opens it so you can sign in) |
+| Config | `gemini-code config set enterprise <link>` (or `off`), or `GEMINI_CODE_ENTERPRISE_URL` |
+| Desktop app | Settings › General › *Gemini Enterprise link* |
+
+Chrome then opens your link instead of gemini.google.com. Sign in there by hand (Google
+account, or your organisation's SSO) and gemini-code carries on by itself: a redirect to
+a sign-in page counts as signed out, and it waits until the tab is back on your link.
+
+What changes on Enterprise:
+
+- **Models**: Enterprise picks its own model, so `--model`, `/model`, `/models`, `/level` and
+  `/thinking` don't apply and the startup chooser is skipped.
+- **Temporary chats and Gems** are consumer features; they're off.
+- **New threads** start by reopening your link.
+
+**Calibration.** Enterprise is a different web app from gemini.google.com, and its page
+structure can differ between organisations. gemini-code ships an Enterprise selector set,
+but it hasn't been checked against every tenant. If a prompt doesn't send or a reply isn't
+read, sign in, type a word in the composer, and run:
+
+```powershell
+gemini-code probe
+```
+
+It lists which selectors match on your page and writes an outline of the page's controls to
+`~/.gemini-code/probe.txt`. Put corrected selectors in `~/.gemini-code/selectors.json`, with
+no rebuild needed:
+
+```json
+{ "responseContainer": "ucs-summary", "composerInput": "div.ProseMirror[contenteditable=\"true\"]" }
+```
+
 ## Use it as an OpenAI-compatible API
 
 `gemini-code serve` puts an OpenAI-style HTTP API in front of your signed-in Gemini
