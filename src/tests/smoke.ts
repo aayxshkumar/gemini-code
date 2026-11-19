@@ -87,6 +87,7 @@ import { runParallelTasks, createDelegateTool, MAX_WORKER_REPORT_CHARS } from ".
 import { gitignoreTests } from "./gitignore.js";
 import { multiEditTests } from "./multiEdit.js";
 import { undoTests } from "./undo.js";
+import { apiServerTests } from "./apiServer.js";
 import { Bridge, classifyActivity, parseQuestion, type BridgeEvent, type BridgeHost } from "../bridge/bridge.js";
 
 let passed = 0;
@@ -2125,7 +2126,17 @@ async function main() {
 
   await test("serve options: safe defaults, validated values", () => {
     const d = serveArgs([], {});
-    assert.deepEqual(d, { host: "127.0.0.1", port: 8787, tabs: 2, apiKey: undefined, allowedOrigins: [] });
+    assert.deepEqual(d, {
+      host: "127.0.0.1",
+      port: 8787,
+      tabs: 2,
+      apiKey: undefined,
+      allowedOrigins: [],
+      maxQueue: 8,
+      queueTimeoutMs: 120_000,
+      remoteImages: true,
+      privateImages: false,
+    });
     const custom = serveArgs(["--port", "9000", "--tabs=3", "--api-key", "k", "--cors-origin", "http://localhost:3000/"], {});
     assert.equal(custom.port, 9000);
     assert.equal(custom.tabs, 3);
@@ -3257,6 +3268,9 @@ async function main() {
     assert.ok(ofType("reply").every((r) => r.ok === false));
     setAsker(undefined);
   });
+
+  console.log("API server under real clients:");
+  await apiServerTests(test);
 
   console.log("Safe /undo:");
   await undoTests(test);

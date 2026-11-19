@@ -498,8 +498,36 @@ earlier one plus new turns — how chat clients and agent loops normally work �
 Gemini's own context. Anything else starts a fresh thread with the conversation folded
 into one prompt.
 
-**Concurrency.** Each request gets its own tab (`--tabs`, default 2, max 8); requests
-beyond that wait in line. Tabs open on demand.
+**Concurrency.** Each request gets its own tab (`--tabs`, default 2, max 8). Tabs open on
+demand, and requests beyond that wait in line, served oldest first. The line is bounded:
+past `--queue` waiting requests a new one gets **429** (`rate_limit_error`,
+`queue_full`) at once, and one that waits longer than `--queue-timeout` gets **503**
+(`server_error`, `queue_timeout`). Both carry `Retry-After: 30`.
+
+**Cancelling.** A client that hangs up, by aborting a stream or closing the connection,
+frees its tab:
+- If it was queued, it leaves the queue.
+- If the prompt hadn't been sent yet, it never is.
+- If Gemini was already replying, gemini-code presses Stop (retrying for up to 10 s) and
+  starts the next request on a fresh thread.
+
+The tab is handed on only after the call running on it returns. An error after the prompt
+reached Gemini carries `x-should-retry: false`, so SDKs don't send it twice.
+
+**Image URLs.** `image_url` parts can be `data:` URLs or http(s) URLs. http(s) URLs are
+fetched safely:
+- Every hop is resolved and refused if *any* address is private, local, link-local or
+  cloud metadata (IPv4-mapped, NAT64 and 6to4 forms too).
+- The connection goes to exactly the checked address, and HTTPS still verifies the host
+  name.
+- At most 3 redirects, each checked again.
+- Compressed bodies are refused, and the download stops just past 15 MB.
+- One 30 s deadline covers all of a request's images.
+- The body must really be a PNG, JPEG, GIF or WebP.
+
+`--remote-images off` accepts `data:` URLs only. `--private-images on` allows private
+hosts, for a local setup; every other check still applies. A refused image is a 400
+and leaves the tab's thread as it was.
 
 | Flag | Env | Default |
 | --- | --- | --- |
@@ -508,6 +536,10 @@ beyond that wait in line. Tabs open on demand.
 | `--tabs` | `GEMINI_CODE_API_TABS` | `2` |
 | `--api-key` | `GEMINI_CODE_API_KEY` | none |
 | `--cors-origin` (repeatable) | `GEMINI_CODE_API_CORS` (comma-separated) | none |
+| `--queue` | `GEMINI_CODE_API_QUEUE` | `8` |
+| `--queue-timeout` (seconds) | `GEMINI_CODE_API_QUEUE_TIMEOUT` | `120` |
+| `--remote-images on\|off` | `GEMINI_CODE_API_REMOTE_IMAGES` | `on` |
+| `--private-images on\|off` | `GEMINI_CODE_API_PRIVATE_IMAGES` | `off` |
 
 **Security** — this exposes your Gemini account, so the defaults are strict:
 

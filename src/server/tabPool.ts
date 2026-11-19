@@ -18,6 +18,26 @@ export interface Lease {
   continuation?: ChatMessage[];
 }
 
+/** Every tab is busy and the queue is at its limit: answered 429 at once. */
+export class QueueFullError extends Error {}
+/** Waited the whole queue timeout without a tab: answered 503. */
+export class QueueTimeoutError extends Error {}
+/** The client went away while queued. */
+export class QueueAbortedError extends Error {}
+
+export interface AcquireOptions {
+  /** Aborts the wait (the client disconnected). */
+  signal?: AbortSignal;
+  /** Most requests allowed to wait at once (default 8). */
+  maxQueue?: number;
+  /** How long one request may wait, in ms (default 120 s). */
+  timeoutMs?: number;
+}
+
+interface Waiter {
+  give: (tab: PooledTab) => void;
+}
+
 /**
  * A fixed set of Gemini tabs shared by API requests.
  *
@@ -29,7 +49,8 @@ export interface Lease {
  */
 export class TabPool {
   private readonly tabs: PooledTab[] = [];
-  private readonly waiters: (() => void)[] = [];
+  /** Oldest first: a freed tab goes straight to the head of the queue. */
+  private readonly waiters: Waiter[] = [];
   private spawning = 0;
 
   constructor(
@@ -44,8 +65,65 @@ export class TabPool {
     return { tabs: this.tabs.length, busy: this.tabs.filter((t) => t.busy).length, waiting: this.waiters.length };
   }
 
-  async acquire(messages: ChatMessage[], toolsKey: string): Promise<Lease> {
-    for (;;) {
+  /** The continuation a given tab offers this conversation, if any. */
+  private leaseFor(tab: PooledTab, messages: ChatMessage[], toolsKey: string): Lease {
+    if (tab.toolsKey === toolsKey) {
+      const continuation = continuationOf(tab.history, messages);
+      if (continuation) return { tab, continuation };
+    }
+    return { tab };
+  }
+
+  async acquire(messages: ChatMessage[], toolsKey: string, opts: AcquireOptions = {}): Promise<Lease> {
+    if (opts.signal?.aborted) throw new QueueAbortedError("the client went away");
+    // Others are already waiting: join the back of the queue rather than
+    // jump it, so requests are served in arrival order.
+    if (!this.waiters.length) {
+      const now = await this.tryNow(messages, toolsKey);
+      if (now) return now;
+    }
+    const maxQueue = opts.maxQueue ?? 8;
+    if (this.waiters.length >= maxQueue) {
+      throw new QueueFullError(`all ${this.tabs.length} tab(s) are busy and ${this.waiters.length} request(s) are already waiting`);
+    }
+    const timeoutMs = opts.timeoutMs ?? 120_000;
+    const tab = await new Promise<PooledTab>((resolve, reject) => {
+      let settled = false;
+      const waiter: Waiter = {
+        give: (t) => {
+          if (settled) {
+            // Left in the same instant it was handed a tab: pass it on.
+            this.release(t);
+            return;
+          }
+          settled = true;
+          cleanup();
+          resolve(t);
+        },
+      };
+      const leave = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        const i = this.waiters.indexOf(waiter);
+        if (i !== -1) this.waiters.splice(i, 1);
+        reject(err);
+      };
+      const timer = setTimeout(() => leave(new QueueTimeoutError(`no tab became free within ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
+      const onAbort = () => leave(new QueueAbortedError("the client went away while queued"));
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
+      const cleanup = () => {
+        clearTimeout(timer);
+        opts.signal?.removeEventListener("abort", onAbort);
+      };
+      this.waiters.push(waiter);
+    });
+    return this.leaseFor(tab, messages, toolsKey);
+  }
+
+  /** An idle (or new) tab right now, or undefined. */
+  private async tryNow(messages: ChatMessage[], toolsKey: string): Promise<Lease | undefined> {
+    {
       // Best: an idle tab whose thread IS the start of this conversation, so
       // only the new turn needs sending — how chat clients keep a thread going.
       for (const tab of this.tabs) {
@@ -79,14 +157,19 @@ export class TabPool {
         }
       }
 
-      // Otherwise wait for a release.
-      await new Promise<void>((resolve) => this.waiters.push(resolve));
+      return undefined;
     }
   }
 
+  /** Frees a tab: straight to the oldest waiter if there is one (it stays busy), else idle. */
   release(tab: PooledTab): void {
-    tab.busy = false;
-    this.waiters.shift()?.();
+    const next = this.waiters.shift();
+    if (next) {
+      tab.busy = true;
+      next.give(tab);
+    } else {
+      tab.busy = false;
+    }
   }
 
   /** Forgets a tab's thread, e.g. after a failed request left it in an unknown state. */

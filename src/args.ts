@@ -56,6 +56,21 @@ export interface ServeArgs {
   tabs: number;
   apiKey?: string;
   allowedOrigins: string[];
+  /** Requests allowed to wait for a tab; more get 429. */
+  maxQueue: number;
+  /** Longest wait for a tab before a 503, in ms. */
+  queueTimeoutMs: number;
+  /** Fetch http(s) image URLs at all. */
+  remoteImages: boolean;
+  /** Allow image hosts on private/local addresses. */
+  privateImages: boolean;
+}
+
+function onOff(raw: string | undefined, name: string, fallback: boolean): boolean {
+  if (raw === undefined || raw === "") return fallback;
+  if (/^(on|true|yes|1)$/i.test(raw)) return true;
+  if (/^(off|false|no|0)$/i.test(raw)) return false;
+  throw new Error(`${name} must be on or off, got "${raw}".`);
 }
 
 /**
@@ -85,5 +100,26 @@ export function serveArgs(argv: string[], env: NodeJS.ProcessEnv = process.env):
     .map((o) => o.trim().replace(/\/+$/, ""))
     .filter(Boolean);
 
-  return { host, port, tabs, apiKey, allowedOrigins: [...new Set(origins)] };
+  const queueRaw = flagValue(argv, "queue") ?? env.GEMINI_CODE_API_QUEUE ?? "8";
+  const maxQueue = Number(queueRaw);
+  if (!Number.isInteger(maxQueue) || maxQueue < 0 || maxQueue > 1000) throw new Error(`--queue must be 0-1000, got "${queueRaw}".`);
+
+  const waitRaw = flagValue(argv, "queue-timeout") ?? env.GEMINI_CODE_API_QUEUE_TIMEOUT ?? "120";
+  const waitSeconds = Number(waitRaw);
+  if (!Number.isFinite(waitSeconds) || waitSeconds <= 0 || waitSeconds > 3600) throw new Error(`--queue-timeout must be 1-3600 seconds, got "${waitRaw}".`);
+
+  const remoteImages = onOff(flagValue(argv, "remote-images") ?? env.GEMINI_CODE_API_REMOTE_IMAGES, "--remote-images", true);
+  const privateImages = onOff(flagValue(argv, "private-images") ?? env.GEMINI_CODE_API_PRIVATE_IMAGES, "--private-images", false);
+
+  return {
+    host,
+    port,
+    tabs,
+    apiKey,
+    allowedOrigins: [...new Set(origins)],
+    maxQueue,
+    queueTimeoutMs: Math.round(waitSeconds * 1000),
+    remoteImages,
+    privateImages,
+  };
 }

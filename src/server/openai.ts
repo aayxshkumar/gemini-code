@@ -18,7 +18,8 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { GeminiDriver } from "../driver/GeminiDriver.js";
-import { TabPool, type PooledTab } from "./tabPool.js";
+import { QueueAbortedError, QueueFullError, QueueTimeoutError, TabPool, type PooledTab } from "./tabPool.js";
+import { fetchImage, ImageFetchError, IMAGE_DEADLINE_MS, MAX_IMAGE_BYTES, redactUrl, type ImageFetchOptions } from "./imageFetch.js";
 import {
   API_MODELS,
   buildContinuationPrompt,
@@ -48,11 +49,24 @@ export interface ServerOptions {
   /** Browser origins allowed to call the API (CORS). Default: none. */
   allowedOrigins: string[];
   log: (msg: string) => void;
+  /** Most requests waiting for a tab at once; more get 429 (default 8). */
+  maxQueue?: number;
+  /** How long a request may wait for a tab before a 503, in ms (default 120 s). */
+  queueTimeoutMs?: number;
+  /** Fetch http(s) image_url parts (default true); data: URLs always work. */
+  remoteImages?: boolean;
+  /** Allow image hosts on private/local addresses (default false). */
+  privateImages?: boolean;
+  /** Test seams for the image fetcher (fake resolver, CA, dial log). */
+  imageFetch?: Pick<ImageFetchOptions, "resolve" | "ca" | "onDial" | "dialOverride" | "maxBytes">;
 }
 
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
-const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_IMAGES = 10;
+/** How long to keep pressing Stop on a tab whose client left. */
+const STOP_RETRY_MS = 10_000;
+/** What a busy server asks clients to wait before retrying. */
+const RETRY_AFTER_SECONDS = "30";
 
 export function isLoopback(host: string): boolean {
   return host === "127.0.0.1" || host === "::1" || host === "localhost";
@@ -62,20 +76,25 @@ class HttpError extends Error {
   constructor(
     readonly status: number,
     message: string,
-    readonly type = "invalid_request_error"
+    readonly type = "invalid_request_error",
+    readonly code: string | null = null,
+    readonly headers: Record<string, string> = {}
   ) {
     super(message);
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
+/** The client closed the connection; nothing is written back. Logged as 499. */
+class ClientGoneError extends Error {}
+
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const text = JSON.stringify(body);
-  res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text) });
+  res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text), ...headers });
   res.end(text);
 }
 
-function sendError(res: ServerResponse, status: number, message: string, type = "invalid_request_error"): void {
-  sendJson(res, status, { error: { message, type, code: null, param: null } });
+function sendError(res: ServerResponse, status: number, message: string, type = "invalid_request_error", code: string | null = null, headers: Record<string, string> = {}): void {
+  sendJson(res, status, { error: { message, type, code, param: null } }, headers);
 }
 
 async function readBody(req: IncomingMessage): Promise<unknown> {
@@ -100,8 +119,23 @@ function keyMatches(given: string, expected: string): boolean {
 }
 
 /** Saves request images to temp files, since the web UI uploads files. */
-async function materializeImages(urls: string[], dir: string): Promise<string[]> {
+interface ImagePolicy {
+  remote: boolean;
+  allowPrivate: boolean;
+  seams?: ServerOptions["imageFetch"];
+}
+
+/**
+ * Turns image_url parts into files to attach. http(s) goes through the safe
+ * fetcher (imageFetch.ts) under one deadline for the whole request; the
+ * client hanging up aborts it.
+ */
+async function materializeImages(urls: string[], dir: string, policy: ImagePolicy, signal: AbortSignal): Promise<string[]> {
   if (urls.length > MAX_IMAGES) throw new HttpError(400, `At most ${MAX_IMAGES} images per request.`);
+  if (!urls.length) return [];
+  await mkdir(dir, { recursive: true });
+  const deadline = AbortSignal.timeout(IMAGE_DEADLINE_MS);
+  const both = AbortSignal.any([signal, deadline]);
   const files: string[] = [];
   for (const [i, url] of urls.entries()) {
     let data: Buffer;
@@ -111,13 +145,14 @@ async function materializeImages(urls: string[], dir: string): Promise<string[]>
       ext = dataUrl[1].replace("jpeg", "jpg").replace(/[^a-z0-9]/gi, "") || "png";
       data = Buffer.from(dataUrl[2], "base64");
     } else if (/^https?:\/\//i.test(url)) {
-      const r = await fetch(url, { signal: AbortSignal.timeout(20_000) }).catch((e: Error) => {
-        throw new HttpError(400, `Couldn't fetch image ${url}: ${e.message}`);
-      });
-      if (!r.ok) throw new HttpError(400, `Couldn't fetch image ${url}: HTTP ${r.status}`);
-      const type = r.headers.get("content-type") ?? "";
-      ext = /jpe?g/.test(type) ? "jpg" : /webp/.test(type) ? "webp" : /gif/.test(type) ? "gif" : "png";
-      data = Buffer.from(await r.arrayBuffer());
+      if (!policy.remote) throw new HttpError(400, "Remote image URLs are turned off on this server (--remote-images off). Send the image as a data: URL.");
+      try {
+        ({ data, ext } = await fetchImage(url, { allowPrivate: policy.allowPrivate, signal: both, ...policy.seams }));
+      } catch (err) {
+        if (signal.aborted) throw new ClientGoneError("the client went away while an image downloaded");
+        const why = deadline.aborted ? `took longer than ${IMAGE_DEADLINE_MS / 1000}s` : (err as Error).message;
+        throw new HttpError(400, `Couldn't use image ${redactUrl(url)}: ${why}`);
+      }
     } else {
       throw new HttpError(400, "image_url must be a data: URL or an http(s) URL.");
     }
@@ -219,6 +254,10 @@ export async function startServer(opts: ServerOptions): Promise<{ url: string; c
 
       throw new HttpError(404, `No route for ${req.method} ${url.pathname}.`, "not_found_error");
     } catch (err) {
+      if (err instanceof ClientGoneError) {
+        opts.log(`${req.method} ${url.pathname} -> 499 client closed the connection (${err.message})`);
+        return;
+      }
       const e = err instanceof HttpError ? err : new HttpError(500, (err as Error).message.split("\n")[0], "server_error");
       if (res.headersSent) {
         // Mid-stream: the status is already sent, so report it in-band.
@@ -231,7 +270,7 @@ export async function startServer(opts: ServerOptions): Promise<{ url: string; c
         // Closing with it unread resets the connection, and on macOS the
         // client then sees "fetch failed" instead of the error. Drain first.
         await drainRequest(req);
-        sendError(res, e.status, e.message, e.type);
+        sendError(res, e.status, e.message, e.type, e.code, e.headers);
       }
       opts.log(`${req.method} ${url.pathname} -> ${e.status} ${e.message}`);
     }
@@ -249,22 +288,80 @@ export async function startServer(opts: ServerOptions): Promise<{ url: string; c
     const id = newId("chatcmpl");
     const stamp = Math.floor(Date.now() / 1000);
 
-    const lease = await pool.acquire(request.messages, tKey);
+    // The client hanging up — an aborted stream, a closed socket — is how
+    // SDKs cancel. Without this a cancelled request kept its tab busy until
+    // Gemini finished, and a few of them blocked the whole server.
+    const gone = new AbortController();
+    const onClose = () => {
+      if (!res.writableFinished) gone.abort();
+    };
+    res.on("close", onClose);
+
+    let lease;
+    try {
+      lease = await pool.acquire(request.messages, tKey, { signal: gone.signal, maxQueue: opts.maxQueue, timeoutMs: opts.queueTimeoutMs });
+    } catch (err) {
+      res.off("close", onClose);
+      const retry = { "Retry-After": RETRY_AFTER_SECONDS };
+      if (err instanceof QueueFullError) throw new HttpError(429, `Server busy: ${err.message}. Retry later.`, "rate_limit_error", "queue_full", retry);
+      if (err instanceof QueueTimeoutError) throw new HttpError(503, `Server busy: ${err.message}. Retry later.`, "server_error", "queue_timeout", retry);
+      if (err instanceof QueueAbortedError) throw new ClientGoneError(err.message);
+      throw err;
+    }
     const tab: PooledTab = lease.tab;
     const imageDir = path.join(tmpdir(), "gemini-code-api", id);
     let ok = false;
+    /** Once the prompt is in Gemini, a retry would send it twice: errors say so. */
+    let promptSent = false;
+    /** Whether the tab's thread was touched (a refused image leaves it as it was). */
+    let touched = false;
+    let stopping: Promise<void> | undefined;
+    const stopGemini = () => {
+      stopping ??= (async () => {
+        const stop = (tab.driver as { stopGenerating?: () => Promise<boolean> }).stopGenerating?.bind(tab.driver);
+        if (!stop) return;
+        const until = Date.now() + STOP_RETRY_MS;
+        // The Stop button can appear a moment after sending; keep pressing.
+        while (Date.now() < until) {
+          if (await stop().catch(() => false)) return;
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        opts.log(`couldn't stop Gemini on a cancelled request within ${STOP_RETRY_MS / 1000}s`);
+      })();
+      return stopping;
+    };
+    const onGone = () => {
+      if (promptSent) void stopGemini();
+    };
+    gone.signal.addEventListener("abort", onGone, { once: true });
+    const checkGone = () => {
+      if (gone.signal.aborted) throw new ClientGoneError("the client went away");
+    };
 
     try {
       let prompt: string;
       let images: string[];
+      const fresh = !lease.continuation;
       if (lease.continuation) {
         prompt = buildContinuationPrompt(lease.continuation);
         images = lease.continuation.flatMap((m) => imagesOf(m.content));
       } else {
-        await tab.driver.newConversation();
         prompt = buildFreshPrompt(request);
         images = request.messages.flatMap((m) => imagesOf(m.content));
       }
+
+      // Images first, before anything touches the tab: a refused or slow
+      // image then costs nothing, and the thread is left as it was.
+      const files = await materializeImages(
+        images,
+        imageDir,
+        { remote: opts.remoteImages !== false, allowPrivate: opts.privateImages === true, seams: opts.imageFetch },
+        gone.signal
+      );
+      checkGone();
+
+      touched = true;
+      if (fresh) await tab.driver.newConversation();
 
       if (tab.model !== alias && !isEnterprise()) {
         try {
@@ -276,9 +373,11 @@ export async function startServer(opts: ServerOptions): Promise<{ url: string; c
         }
       }
 
-      await mkdir(imageDir, { recursive: true });
-      const files = await materializeImages(images, imageDir);
+      // Left while the tab was being prepared: the prompt is never sent.
+      checkGone();
       await tab.driver.sendPrompt(prompt, files.length ? { attachFile: files } : {});
+      promptSent = true;
+      if (gone.signal.aborted) void stopGemini();
 
       const streaming = request.stream === true;
       const chunk = (delta: Record<string, unknown>, finish: string | null = null) => ({
@@ -313,6 +412,7 @@ export async function startServer(opts: ServerOptions): Promise<{ url: string; c
         await tab.driver.waitForResponseComplete();
       }
 
+      checkGone();
       const raw = await tab.driver.getLastResponse();
       const markdown = (await tab.driver.getLastResponseMarkdown().catch(() => "")) || raw.text;
       const calls: ToolCall[] | undefined = tools.length ? parseToolCalls(raw, tools) : undefined;
@@ -365,9 +465,23 @@ export async function startServer(opts: ServerOptions): Promise<{ url: string; c
         `chat ${modelId}${streaming ? " stream" : ""}${calls ? ` -> ${calls.length} tool call(s)` : ""}` +
           `${lease.continuation ? " (continued thread)" : ""} ${((Date.now() - started) / 1000).toFixed(1)}s`
       );
+    } catch (err) {
+      if (gone.signal.aborted && !(err instanceof HttpError)) throw new ClientGoneError("the client went away");
+      // After the prompt reached Gemini, an SDK retry would send it again.
+      if (promptSent && !(err instanceof ClientGoneError)) {
+        const e = err instanceof HttpError ? err : new HttpError(500, (err as Error).message.split("\n")[0], "server_error");
+        throw new HttpError(e.status, e.message, e.type, e.code, { ...e.headers, "x-should-retry": "false" });
+      }
+      throw err;
     } finally {
-      // A failed request leaves the thread in an unknown state.
-      if (!ok) pool.reset(tab);
+      gone.signal.removeEventListener("abort", onGone);
+      res.off("close", onClose);
+      // The tab is released only once the driver call on it has returned and
+      // any Stop has been pressed, so a cancelled request can't overlap the next.
+      if (stopping) await stopping;
+      // A failed or cancelled request leaves the thread in an unknown state;
+      // one that never touched the tab leaves it as it was.
+      if (!ok && touched) pool.reset(tab);
       pool.release(tab);
       await rm(imageDir, { recursive: true, force: true }).catch(() => undefined);
     }

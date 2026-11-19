@@ -1005,6 +1005,10 @@ Usage:
       --tabs <n>              parallel Gemini tabs = concurrent requests (default 2)
       --api-key <key>         require "Authorization: Bearer <key>"
       --cors-origin <url>     let a browser app at <url> call it (repeatable)
+      --queue <n>             requests that may wait for a busy tab (default 8); more get 429
+      --queue-timeout <s>     longest wait for a tab before a 503 (default 120)
+      --remote-images on|off  fetch http(s) image_url parts (default on; data: URLs always work)
+      --private-images on|off allow image hosts on private/local addresses (default off)
   gemini-code skills list     show the skills Gemini can use
   gemini-code skills add <owner/repo or GitHub URL> [--all] [--only=a,b]
                               install Claude-compatible skills from GitHub
@@ -1038,6 +1042,8 @@ Settings (environment, or "gemini-code config set <key> <value>", or <project>/.
   GEMINI_CODE_PROFILE         Chrome profile dir (default ~/.gemini-code/profile)
   GEMINI_CODE_API_KEY         same as serve --api-key
   GEMINI_CODE_API_PORT, GEMINI_CODE_API_HOST, GEMINI_CODE_API_TABS, GEMINI_CODE_API_CORS
+  GEMINI_CODE_API_QUEUE, GEMINI_CODE_API_QUEUE_TIMEOUT, GEMINI_CODE_API_REMOTE_IMAGES, GEMINI_CODE_API_PRIVATE_IMAGES
+                              same as serve --queue, --queue-timeout, --remote-images, --private-images
 `;
 
 /** `gemini-code skills`: installing is the user's to do, so it's a command, not a tool. */
@@ -1107,7 +1113,8 @@ ${c.magenta(glyph.star)} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — OpenA
 
   ${c.dim("base url")}  ${c.bold(url)}
   ${c.dim("models")}    ${API_MODELS.map((m) => (m.alias === DEFAULT_MODEL_ALIAS ? `${m.id} (default)` : m.id)).join(", ")}
-  ${c.dim("tabs")}      up to ${args.tabs} parallel (one request per tab)
+  ${c.dim("tabs")}      up to ${args.tabs} parallel (one request per tab); ${args.maxQueue} may wait up to ${args.queueTimeoutMs / 1000}s, then 429/503
+  ${c.dim("images")}    ${args.remoteImages ? `http(s) URLs fetched${args.privateImages ? " — private hosts ALLOWED" : ", private/local addresses refused"}` : "data: URLs only (--remote-images off)"}
   ${c.dim("auth")}      ${args.apiKey ? "Bearer key required" : "none — localhost only"}${
     args.allowedOrigins.length ? `
   ${c.dim("cors")}      ${args.allowedOrigins.join(", ")}` : ""
