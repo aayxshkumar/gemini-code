@@ -50,10 +50,10 @@ export class CheckpointStore {
    * (or that it didn't exist), once per file per task — the first version
    * is the one worth restoring, not the intermediate ones.
    */
-  async recordBeforeWrite(absPath: string): Promise<void> {
-    if (!this.current) return;
+  async recordBeforeWrite(absPath: string): Promise<{ ok: boolean; error?: string }> {
+    if (!this.current) return { ok: true };
     const rel = path.relative(this.root, absPath);
-    if (this.current.changes.some((c) => c.file === rel)) return;
+    if (this.current.changes.some((c) => c.file === rel)) return { ok: true };
 
     const dir = path.resolve(this.root, BACKUP_DIR);
     await mkdir(dir, { recursive: true });
@@ -66,16 +66,21 @@ export class CheckpointStore {
     if (!existed) {
       this.current.changes.push({ file: rel, backup: null });
     } else {
-      const backupName = `${this.current.id}-${rel.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+      // The position in the checkpoint keeps a/b.txt and a_b.txt apart:
+      // flattened, both names were "a_b.txt" and shared one backup.
+      const backupName = `${this.current.id}-${this.current.changes.length}-${rel.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
       const backupPath = path.join(dir, backupName);
       try {
         await copyFile(absPath, backupPath);
         this.current.changes.push({ file: rel, backup: path.relative(this.root, backupPath) });
-      } catch {
+      } catch (err) {
         // A file we can't back up is one we shouldn't claim we can restore.
+        await this.persist();
+        return { ok: false, error: (err as Error).message };
       }
     }
     await this.persist();
+    return { ok: true };
   }
 
   /** Finishes the current checkpoint, keeping it only if anything changed. */

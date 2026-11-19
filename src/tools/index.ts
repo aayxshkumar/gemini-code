@@ -1,6 +1,7 @@
 import type { ToolDefinition } from "../types.js";
 import { readFileTool } from "./readFile.js";
-import { editFileTool, multiEditTool } from "./editFile.js";
+import { editFileTool } from "./editFile.js";
+import { multiEditTool } from "./multiEdit.js";
 import { searchCodeTool } from "./searchCode.js";
 import { findFilesTool } from "./findFiles.js";
 import { gitStatusTool, gitDiffTool, gitLogTool, gitShowTool, gitBlameTool } from "./git.js";

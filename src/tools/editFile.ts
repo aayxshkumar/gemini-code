@@ -89,51 +89,6 @@ function gateMessage(rel: string, reason: "unread" | "stale"): string {
         `Read it again before editing, so old_text matches what is really there now.`;
 }
 
-export const multiEditTool: ToolDefinition = {
-  name: "multi_edit",
-  description:
-    `multi_edit(args: {path: string, edits: [{old_text: string, new_text: string, replace_all?: boolean}]}) -> makes ` +
-    `several edit_file changes to one file in a single call, applied in order, each seeing the result of the last. ` +
-    `All or nothing: if any edit doesn't match, the file is left alone. Use it instead of several edit_file calls.`,
-  async run(args) {
-    const rel = String(args.path ?? "");
-    if (!rel) return { ok: false, output: "Error: 'path' is required." };
-    if (!Array.isArray(args.edits) || args.edits.length === 0) {
-      return { ok: false, output: "Error: 'edits' must be a non-empty array of {old_text, new_text}." };
-    }
-    const resolved = resolveInRoot(rel);
-    if (!resolved.ok) return { ok: false, output: outsideWorkspace("edit") };
-    const gate = await checkEditable(resolved.abs);
-    if (!gate.ok) return { ok: false, output: gateMessage(rel, gate.reason) };
-
-    let content: string;
-    try {
-      content = await readFile(resolved.abs, "utf8");
-    } catch (err) {
-      return { ok: false, output: `Error reading ${rel}: ${(err as Error).message}` };
-    }
-
-    const eol = detectEol(content);
-    let text = normalizeEol(content);
-    let total = 0;
-    for (const [i, raw] of args.edits.entries()) {
-      const edit = raw as Record<string, unknown>;
-      const oldText = String(edit?.old_text ?? "");
-      if (!oldText) return { ok: false, output: `Error in edit ${i + 1}: 'old_text' is required. Nothing was changed.` };
-      const result = applyEdit(rel, text, oldText, String(edit?.new_text ?? ""), Boolean(edit?.replace_all));
-      if (!result.ok) return { ok: false, output: `Edit ${i + 1} of ${args.edits.length} failed, so nothing was changed.\n${result.error}` };
-      text = result.text;
-      total += result.count;
-    }
-
-    if (!(await confirmAction("Edit file?", `${rel} — ${args.edits.length} edit(s), ${total} replacement(s)`, "edit"))) {
-      return { ok: false, output: declinedMessage("make these edits", "edit") };
-    }
-    const failure = await saveEdited(resolved.abs, rel, text, eol);
-    return failure ? { ok: false, output: failure } : { ok: true, output: `Edited ${rel} (${total} replacements).` };
-  },
-};
-
 export const editFileTool: ToolDefinition = {
   name: "edit_file",
   description:

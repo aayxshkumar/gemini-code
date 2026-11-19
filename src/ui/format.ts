@@ -41,7 +41,7 @@ export const c = {
 
 /** Claude Code-style tool-call line: ⏺ read_file(package.json) */
 export function toolCallLine(name: string, args: Record<string, unknown>): string {
-  const summary = summarizeArgs(args);
+  const summary = name === "multi_edit" ? summarizeMultiEdit(args) : summarizeArgs(args);
   return `${c.green(glyph.bullet)} ${c.bold(name)}${c.dim("(")}${summary}${c.dim(")")}`;
 }
 
@@ -54,6 +54,14 @@ export function toolResultLine(ok: boolean, output: string): string {
 
 export function noteLine(text: string): string {
   return `${c.dim(glyph.branch)}${c.dim(text)}`;
+}
+
+/** "4 edits in 3 files: a.ts, b.ts, c.ts" */
+function summarizeMultiEdit(args: Record<string, unknown>): string {
+  const edits = Array.isArray(args.edits) ? (args.edits as Record<string, unknown>[]) : [];
+  const files = [...new Set(edits.map((e) => String(e?.path ?? args.path ?? "?")))];
+  const shown = files.slice(0, 3).join(", ") + (files.length > 3 ? `, +${files.length - 3} more` : "");
+  return c.cyan(`${edits.length} edit${edits.length === 1 ? "" : "s"} in ${files.length} file${files.length === 1 ? "" : "s"}: ${shown}`);
 }
 
 function summarizeArgs(args: Record<string, unknown>): string {

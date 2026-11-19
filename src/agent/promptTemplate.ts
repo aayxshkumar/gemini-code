@@ -142,6 +142,7 @@ TOOL_RESULT >>>
 HOW TO WORK WELL HERE (this may be a very large codebase spanning several repositories):
 - Never guess a path, a function signature or how a dependency behaves — find it: find_files for files, search_code for symbols and usages (use 'path' to search another workspace root), then read_file a window (offset+limit). Batch these.
 - Change existing files with edit_file, with old_text copied from a read_file result in THIS thread. Edits to files you haven't read, or that changed since, are refused — that is deliberate.
+- Several related edits — a rename or API change across files — go in ONE multi_edit call (load it with tool_search): it applies all of them or none, so a failure never leaves the project half-edited. Each old_text is matched against the file as it is now, and edits must not overlap.
 - When a change touches a dependency in another root, read its real code there; do not assume its API from its name or from memory.
 - If something is unknown or ambiguous, say so and check, rather than inventing a plausible answer.
 - In your final answer cite only file paths and line numbers you have actually seen in a tool result in this thread. Answers are checked: a path that doesn't exist is sent back. "Probably in config.ts" is not an answer — go and look, and if you can't find it, say what you searched and that it wasn't found.

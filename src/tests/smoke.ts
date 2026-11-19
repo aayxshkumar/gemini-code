@@ -17,7 +17,8 @@ import { AgentSession } from "../agent/loop.js";
 import { looksLikeUnseenAttachment } from "../agent/toolCallParser.js";
 import type { IGeminiDriver, GeminiResponse } from "../driver/IGeminiDriver.js";
 import { readFileTool } from "../tools/readFile.js";
-import { editFileTool, multiEditTool } from "../tools/editFile.js";
+import { editFileTool } from "../tools/editFile.js";
+import { multiEditTool } from "../tools/multiEdit.js";
 import { searchCode, searchCodeTool, globToRegExp } from "../tools/searchCode.js";
 import { findFilesTool } from "../tools/findFiles.js";
 import { addRoot, displayPath, resolveInWorkspace, rootsFromArgs } from "../workspace.js";
@@ -84,6 +85,7 @@ import { setAsker, setQuestioner } from "../ui/prompt.js";
 import { PlanJournal, readPlan, findResumablePlan, clearPlan, parsePlan, resumeTaskText } from "../context/plan.js";
 import { runParallelTasks, createDelegateTool, MAX_WORKER_REPORT_CHARS } from "../agent/workers.js";
 import { gitignoreTests } from "./gitignore.js";
+import { multiEditTests } from "./multiEdit.js";
 import { Bridge, classifyActivity, parseQuestion, type BridgeEvent, type BridgeHost } from "../bridge/bridge.js";
 
 let passed = 0;
@@ -2461,14 +2463,14 @@ async function main() {
       edits: [{ old_text: "one", new_text: "1" }, { old_text: "missing", new_text: "x" }],
     });
     assert.equal(failed.ok, false);
-    assert.match(failed.output, /Edit 2 of 2/);
+    assert.match(failed.output, /changed nothing[\s\S]*Edit 2 \(/);
     assert.equal(await readFile(file, "utf8"), "one\ntwo\n");
 
     const applied = await multiEditTool.run({
       path: file,
-      edits: [{ old_text: "one", new_text: "1" }, { old_text: "1\ntwo", new_text: "1\n2" }],
+      edits: [{ old_text: "one", new_text: "1" }, { old_text: "two", new_text: "2" }],
     });
-    assert.ok(applied.ok);
+    assert.ok(applied.ok, applied.output);
     assert.equal(await readFile(file, "utf8"), "1\n2\n");
   });
 
@@ -3257,6 +3259,9 @@ async function main() {
     assert.ok(ofType("reply").every((r) => r.ok === false));
     setAsker(undefined);
   });
+
+  console.log("multi_edit:");
+  await multiEditTests(test);
 
   console.log("Ignore rules (.gitignore and the walk policy):");
   await gitignoreTests(test);

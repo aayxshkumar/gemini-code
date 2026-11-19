@@ -617,13 +617,22 @@ the work.
 | Browser tools | `read_page`, `screenshot_page`, `browser_open`, `browser_do`, `browser_close` | on demand |
 | Task | `delegate_tasks` | core |
 | TodoWrite | `update_plan` | core |
-| AskUserQuestion | `ask_user` | on demand |
+| AskUserQuestion | `ask_user` | core |
 | EnterPlanMode, ExitPlanMode | `enter_plan_mode`, `exit_plan_mode` | on demand |
 | Skill | `use_skill`, see [Skills](#skills) | core |
 | ToolSearch | `tool_search` | core |
 | LSP | `code_outline`, `find_symbol`: pattern-based, not a language server | on demand |
 | git through Bash | `git_status`, `git_diff`, and read-only `git_log`, `git_show`, `git_blame` | core, on demand |
 | File operations through Bash | `move_file`, `copy_file`, `delete_file`, all undoable with `/undo` | on demand |
+
+**multi_edit is all or nothing.** It takes `{path, old_text, new_text, replace_all?}` edits
+across one or more existing files. Everything is checked first (workspace, read-before-edit,
+each match, ambiguity, overlaps), and one problem means no file changes. Every `old_text` is
+matched against the file as it is now, so edits can't chain and order doesn't matter. You
+approve once for the whole batch. New contents are written to temp files and renamed into
+place, and a failure partway restores the files already replaced. `/undo` reverts the
+batch together. It doesn't create files, and it replaces each file by rename, so hard links
+to an edited file are broken.
 
 **Loading.** `tool_search` takes keywords, or `select:a,b` to load several in one call,
 which matters because each tool call is a whole Gemini message. Calling a tool that was
