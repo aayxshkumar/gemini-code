@@ -357,7 +357,10 @@ export const multiEditTool: ToolDefinition = {
         };
       }
 
-      for (const f of planned) await markWritten(f.abs);
+      for (const f of planned) {
+        await checkpoints.recordAfterWrite(f.abs);
+        await markWritten(f.abs);
+      }
       const lines = planned.map((f) => {
         const total = f.edits.reduce((n, e) => n + e.count, 0);
         const fuzzy = f.edits.filter((e) => e.how !== "exact").map((e) => `edit ${e.index} matched ignoring ${e.how}`);

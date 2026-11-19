@@ -130,11 +130,15 @@ async function transfer(args: Record<string, unknown>, verb: "Move" | "Copy") {
     return { ok: false, output: `User declined to ${verb.toLowerCase()} this file.` };
   }
   try {
-    await checkpoints.recordBeforeWrite(target.abs);
-    if (verb === "Move") await checkpoints.recordBeforeWrite(source.abs);
+    for (const abs of verb === "Move" ? [target.abs, source.abs] : [target.abs]) {
+      const backup = await checkpoints.recordBeforeWrite(abs);
+      if (!backup.ok) return { ok: false, output: `Not done: ${backup.error} (so /undo couldn't have put it back).` };
+    }
     await mkdir(path.dirname(target.abs), { recursive: true });
     if (verb === "Move") await rename(source.abs, target.abs);
     else await copyFile(source.abs, target.abs);
+    await checkpoints.recordAfterWrite(target.abs);
+    if (verb === "Move") await checkpoints.recordAfterWrite(source.abs);
     return { ok: true, output: `${verb === "Move" ? "Moved" : "Copied"} ${from} to ${to}.` };
   } catch (err) {
     return { ok: false, output: `Error: ${(err as Error).message}` };
@@ -175,8 +179,10 @@ export const deleteFileTool: ToolDefinition = {
       return { ok: false, output: "User declined to delete this file." };
     }
     try {
-      await checkpoints.recordBeforeWrite(resolved.abs);
+      const backup = await checkpoints.recordBeforeWrite(resolved.abs);
+      if (!backup.ok) return { ok: false, output: `Not deleted: ${backup.error} (so /undo couldn't have put it back).` };
       await rm(resolved.abs);
+      await checkpoints.recordAfterWrite(resolved.abs);
       return { ok: true, output: `Deleted ${rel}.` };
     } catch (err) {
       return { ok: false, output: `Error deleting ${rel}: ${(err as Error).message}` };

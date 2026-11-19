@@ -86,6 +86,7 @@ import { PlanJournal, readPlan, findResumablePlan, clearPlan, parsePlan, resumeT
 import { runParallelTasks, createDelegateTool, MAX_WORKER_REPORT_CHARS } from "../agent/workers.js";
 import { gitignoreTests } from "./gitignore.js";
 import { multiEditTests } from "./multiEdit.js";
+import { undoTests } from "./undo.js";
 import { Bridge, classifyActivity, parseQuestion, type BridgeEvent, type BridgeHost } from "../bridge/bridge.js";
 
 let passed = 0;
@@ -1009,10 +1010,8 @@ async function main() {
     await writeFileTool.run({ path: path.join(".tmp-test", "keep.txt"), content: "ORIGINAL" });
 
     store.begin("do some damage");
-    await store.recordBeforeWrite(existing);
-    await writeFile(existing, "CLOBBERED", "utf8");
-    await store.recordBeforeWrite(fresh);
-    await writeFile(fresh, "brand new", "utf8");
+    await store.writeFile(existing, "CLOBBERED");
+    await store.writeFile(fresh, "brand new");
     await store.commit();
 
     const result = await store.undoLast();
@@ -1030,10 +1029,8 @@ async function main() {
     await writeFile(f, "v1", "utf8");
 
     store.begin("edit twice");
-    await store.recordBeforeWrite(f);
-    await writeFile(f, "v2", "utf8");
-    await store.recordBeforeWrite(f);
-    await writeFile(f, "v3", "utf8");
+    await store.writeFile(f, "v2");
+    await store.writeFile(f, "v3");
     await store.commit();
 
     await store.undoLast();
@@ -2483,7 +2480,8 @@ async function main() {
     assert.ok((await moveFileTool.run({ from: a, to: b })).ok);
     assert.ok((await deleteFileTool.run({ path: b })).ok);
     await store.commit();
-    await store.undoLast();
+    const undone = await store.undoLast();
+    assert.ok(undone.ok, undone.message);
     assert.equal(await readFile(a, "utf8"), "A", "the original is back");
     await assert.rejects(readFile(c, "utf8"), "the copy is gone");
   });
@@ -3259,6 +3257,9 @@ async function main() {
     assert.ok(ofType("reply").every((r) => r.ok === false));
     setAsker(undefined);
   });
+
+  console.log("Safe /undo:");
+  await undoTests(test);
 
   console.log("multi_edit:");
   await multiEditTests(test);

@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import type { ToolDefinition } from "../types.js";
 import { resolveInRoot, outsideWorkspace } from "./paths.js";
 import { checkEditable, markWritten } from "./fileState.js";
@@ -72,8 +72,7 @@ function applyEdit(
 async function saveEdited(abs: string, rel: string, edited: string, eol: string): Promise<string | undefined> {
   const updated = eol === "\r\n" ? edited.replace(/\n/g, "\r\n") : edited;
   try {
-    await checkpoints.recordBeforeWrite(abs);
-    await writeFile(abs, updated, "utf8");
+    await checkpoints.writeFile(abs, updated);
     await markWritten(abs);
     return undefined;
   } catch (err) {

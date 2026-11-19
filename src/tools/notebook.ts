@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import type { ToolDefinition } from "../types.js";
 import { resolveInRoot } from "./paths.js";
 import { confirmAction } from "./confirm.js";
@@ -114,8 +114,7 @@ export const notebookEditTool: ToolDefinition = {
       return { ok: false, output: "User declined this edit." };
     }
     try {
-      await checkpoints.recordBeforeWrite(abs);
-      await writeFile(abs, `${JSON.stringify(notebook, null, 1)}\n`, "utf8");
+      await checkpoints.writeFile(abs, `${JSON.stringify(notebook, null, 1)}\n`);
       return { ok: true, output: `Notebook updated: ${mode} cell ${index}. It has ${notebook.cells.length} cells.` };
     } catch (err) {
       return { ok: false, output: `Error writing ${rel}: ${(err as Error).message}` };

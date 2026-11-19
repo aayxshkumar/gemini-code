@@ -283,10 +283,8 @@ export async function multiEditTests(test: Test): Promise<void> {
     await writeFile(path.join(root, "a_b.txt"), "flat");
     const store = new CheckpointStore(root);
     store.begin("names");
-    await store.recordBeforeWrite(path.join(root, "a", "b.txt"));
-    await store.recordBeforeWrite(path.join(root, "a_b.txt"));
-    await writeFile(path.join(root, "a", "b.txt"), "X");
-    await writeFile(path.join(root, "a_b.txt"), "Y");
+    await store.writeFile(path.join(root, "a", "b.txt"), "X");
+    await store.writeFile(path.join(root, "a_b.txt"), "Y");
     await store.commit();
     await store.undoLast();
     assert.equal(await readFile(path.join(root, "a", "b.txt"), "utf8"), "nested");

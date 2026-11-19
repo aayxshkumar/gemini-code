@@ -41,7 +41,7 @@ import { MAX_PARALLEL_WORKERS } from "./agent/workers.js";
 import { createAskGemTool } from "./tools/askGem.js";
 import type { ToolDefinition } from "./types.js";
 import { PlanJournal, findResumablePlan, readPlan, clearPlan, resumeTaskText, PLAN_FILENAME } from "./context/plan.js";
-import { checkpoints } from "./context/checkpoint.js";
+import { checkpoints, STATE_TEXT } from "./context/checkpoint.js";
 import { readClipboardImageDetailed, isImagePath, normalizeDroppedPath } from "./context/clipboard.js";
 import { existsSync } from "node:fs";
 
@@ -87,7 +87,9 @@ ${modelHelp()
   ${c.cyan("/clear")}            start a fresh conversation thread
   ${c.cyan("/paste")} or ${c.cyan("Ctrl+V")}  attach an image from the clipboard
   ${c.cyan("/image <path>")}     attach an image file (or just drag one in)
-  ${c.cyan("/undo")}             revert the file changes from the last task
+  ${c.cyan("/undo")}             revert the last task's file changes (refuses if you edited them since)
+  ${c.cyan("/undo --force")}     undo anyway, keeping your versions as <file>.conflict
+  ${c.cyan("/undo list")}        the tasks that can be undone, and what undoing each would do
   ${c.cyan("/plan")}             show the current plan / progress journal
   ${c.cyan("/plan clear")}       delete ${PLAN_FILENAME}
   ${c.cyan("/resume")}           continue the interrupted task in ${PLAN_FILENAME} (or just type "continue")
@@ -842,7 +844,29 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
             }
 
             case "undo": {
-              const result = await checkpoints.undoLast();
+              if (arg === "list") {
+                const saved = await checkpoints.list().catch((err: Error) => {
+                  console.log(`  ${c.yellow("!")} ${err.message}\n`);
+                  return undefined;
+                });
+                if (!saved) break;
+                if (!saved.length) {
+                  console.log(`  ${c.dim("nothing to undo")}\n`);
+                  break;
+                }
+                console.log(`  ${c.bold("Tasks /undo can revert, newest first")} ${c.dim("(each /undo goes back one)")}`);
+                for (const [i, ck] of [...saved].reverse().entries()) {
+                  console.log(`  ${c.bold(String(i + 1))}. ${ck.task.slice(0, 70)} ${c.dim(new Date(ck.at).toLocaleString())}`);
+                  for (const s of ck.states) {
+                    const bad = !["restore", "already-original", "unknown"].includes(s.state);
+                    console.log(`     ${s.file} ${bad ? c.yellow(`— ${STATE_TEXT[s.state]}`) : c.dim(`— ${STATE_TEXT[s.state]}`)}`);
+                  }
+                }
+                console.log("");
+                break;
+              }
+              const force = /(^|\s)--force\b/.test(arg);
+              const result = await checkpoints.undoLast({ force });
               console.log(`  ${result.ok ? c.green(glyph.ok) : c.yellow("!")} ${result.message}\n`);
               break;
             }

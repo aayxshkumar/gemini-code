@@ -324,7 +324,7 @@ Type a task. `/help` lists commands. `exit` quits.
 | `/model <name>` | switch model: an alias (`thinking`, `auto`, `fast`, `fastest`, `pro`, `argon`), a number from `/models`, or a picker label such as `3.8 Thinking` |
 | `/level low\|medium\|high` | the picker's Thinking level (default `high`; the account default is Low) |
 | `/thinking on\|off` | the Extended thinking toggle, on pickers that have one |
-| `/undo` | revert all file changes from the last task |
+| `/undo` | revert the last task's file changes; refuses, changing nothing, if you edited them since (`/undo --force` keeps yours as `.conflict`; `/undo list` shows what each undo would do) |
 | `/plan`, `/plan clear` | show / delete the progress journal |
 | `/resume` or typing `continue` | pick up the interrupted task in `GEMINI-PLAN.md`, in its original Gemini thread when it still exists |
 | `/memory`, `/remember <note>` | show / append durable project memory |
@@ -994,11 +994,22 @@ as little text through the thread as possible:
   would make every edit fail to match.
 - **`git_status` / `git_diff`** let it review what it actually changed before
   calling a task done. Read-only, so no confirmation.
-- **`/undo`** reverts every file change from the last task — restoring what was
-  overwritten and deleting what was created. Snapshots are taken before each
-  write, grouped per task, which matters most with `GEMINI_CODE_AUTO_APPROVE=1`
-  where nobody is eyeballing each edit. Repeated edits to one file in a task
-  still restore the *pre-task* version, not an intermediate one.
+- **`/undo`** reverts the last task's file changes: what was overwritten comes back
+  byte for byte (CRLF, BOM, binary), and what it created is removed. Each `/undo`
+  goes back one more task (the last 10 are kept), and `/undo list` shows them.
+  **On a conflict it changes nothing.** That covers a file you edited or deleted after
+  the agent, one changed by someone else while the task ran, and a write that never
+  finished. It lists the conflicting files and keeps the checkpoint, because undoing
+  would destroy your work. `/undo --force` saves each of those as `<file>.conflict`
+  (never over an existing one) and then undoes everything.
+
+  Snapshots are taken before each write and stored once per content. The record is
+  saved before the file is touched, and a write whose backup fails is refused. The
+  history file is written atomically, and a damaged one is set aside and reported,
+  never treated as empty. Checkpoints from 0.13.0 still work; since they have no
+  record of what the agent wrote, the current versions are saved to
+  `.gemini-code-tmp/backups/before-undo-*` first. Not covered: file permissions,
+  and changes made through `run_bash`.
 
 A real run against a 600-line file: `search_code` → `read_file` (9 lines) →
 `edit_file` (1 replacement), with all 199 functions intact.

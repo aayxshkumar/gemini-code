@@ -259,7 +259,8 @@ export class Bridge {
         return { gem: await this.onTab(() => this.host.setGem(text || null)) };
 
       case "undo":
-        return checkpoints.undoLast();
+        // text "force": keep conflicting files as .conflict copies and undo anyway.
+        return checkpoints.undoLast({ force: text === "force" });
 
       case "plan":
         return { plan: (await readPlan())?.raw ?? null };
