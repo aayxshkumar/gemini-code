@@ -2,23 +2,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { MEMORY_FILENAME } from "./memory.js";
 import { PLAN_FILENAME } from "./plan.js";
-
-const IGNORED_DIRS = new Set([
-  "node_modules",
-  ".git",
-  "dist",
-  "build",
-  "out",
-  ".next",
-  ".cache",
-  "coverage",
-  ".venv",
-  "venv",
-  "__pycache__",
-  ".gemini-code-profile",
-  ".gemini-code-tmp",
-  ".tmp-test",
-]);
+import { WalkPolicy } from "../walk.js";
 
 export interface ProjectDoc {
   /** Path relative to the project root. */
@@ -101,6 +85,7 @@ export async function collectProjectDocs(opts: DocsOptions = {}): Promise<Projec
     }
   }
 
+  const policy = new WalkPolicy(root);
   async function walk(dir: string, depth: number): Promise<void> {
     if (depth > maxDepth) return;
     let entries;
@@ -110,8 +95,10 @@ export async function collectProjectDocs(opts: DocsOptions = {}): Promise<Projec
       return;
     }
     for (const entry of entries) {
-      if (IGNORED_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
+      // Dot-folders hold tooling (.github templates…), not project docs.
+      if (entry.name.startsWith(".")) continue;
       const full = path.join(dir, entry.name);
+      if (entry.isDirectory() ? !policy.enterDir(full) : !policy.includeFile(full)) continue;
       if (entry.isDirectory()) await walk(full, depth + 1);
       else if (
         /\.mdx?$/i.test(entry.name) &&

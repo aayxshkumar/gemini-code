@@ -817,7 +817,8 @@ What keeps it honest at scale, borrowed from Claude Code, OpenCode and Codex:
 - **Edits echo the result.** Every successful edit returns the changed region with
   a few lines of context, so a misplaced edit is visible immediately.
 - **Find, don't guess.** `find_files` (glob) and `search_code` run on ripgrep or
-  `git grep` where available, honour `.gitignore`, and take a `path` scope — a
+  `git grep` where available, and on a walk that applies the same `.gitignore` rules
+  where not (`.env` files are never listed or searched), and take a `path` scope — a
   subdirectory, another root, or a vendored tree such as `node_modules/some-dep`
   (ignore rules are dropped when the scope itself is ignored). A `read_file` on a
   path that doesn't exist answers with the closest real paths.

@@ -16,7 +16,8 @@
     "prepublishOnly": "npm run build && npm test",
     "prepare": "node scripts/prepare.mjs",
     "setup": "node scripts/setup.mjs",
-    "doctor": "node dist/cli.js doctor"
+    "doctor": "node dist/cli.js doctor",
+    "test:gitignore": "tsx src/tests/gitignore.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

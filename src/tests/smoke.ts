@@ -83,6 +83,7 @@ import { confirmAction } from "../tools/confirm.js";
 import { setAsker, setQuestioner } from "../ui/prompt.js";
 import { PlanJournal, readPlan, findResumablePlan, clearPlan, parsePlan, resumeTaskText } from "../context/plan.js";
 import { runParallelTasks, createDelegateTool, MAX_WORKER_REPORT_CHARS } from "../agent/workers.js";
+import { gitignoreTests } from "./gitignore.js";
 import { Bridge, classifyActivity, parseQuestion, type BridgeEvent, type BridgeHost } from "../bridge/bridge.js";
 
 let passed = 0;
@@ -3256,6 +3257,9 @@ async function main() {
     assert.ok(ofType("reply").every((r) => r.ok === false));
     setAsker(undefined);
   });
+
+  console.log("Ignore rules (.gitignore and the walk policy):");
+  await gitignoreTests(test);
 
   console.log("Context (tree + memory):");
   await test("project tree renders and excludes noise directories", async () => {

@@ -1,28 +1,6 @@
 import { readdir } from "node:fs/promises";
 import path from "node:path";
-
-/** Directories never worth showing the model — noise that also blows the entry budget. */
-const IGNORED_DIRS = new Set([
-  "node_modules",
-  ".git",
-  "dist",
-  "build",
-  "out",
-  ".next",
-  ".nuxt",
-  ".cache",
-  "coverage",
-  ".venv",
-  "venv",
-  "__pycache__",
-  ".pytest_cache",
-  ".mypy_cache",
-  ".gradle",
-  "target",
-  ".gemini-code-profile",
-  ".gemini-code-tmp",
-  ".tmp-test",
-]);
+import { WalkPolicy } from "../walk.js";
 
 export interface TreeOptions {
   root?: string;
@@ -42,6 +20,7 @@ export async function buildProjectTree(opts: TreeOptions = {}): Promise<string> 
   const maxEntries = opts.maxEntries ?? 400;
   const maxDepth = opts.maxDepth ?? 6;
 
+  const policy = new WalkPolicy(root);
   const lines: string[] = [`${path.basename(root)}/`];
   let count = 0;
   let truncated = false;
@@ -56,9 +35,9 @@ export async function buildProjectTree(opts: TreeOptions = {}): Promise<string> 
       return; // unreadable dir — skip rather than fail the whole tree
     }
 
+    // The shared walk policy (.gitignore, always-skipped folders, secrets).
     const visible = entries
-      .filter((e) => !IGNORED_DIRS.has(e.name))
-      .filter((e) => !e.name.startsWith(".") || e.name === ".env.example")
+      .filter((e) => (e.isDirectory() ? policy.enterDir(path.join(dir, e.name)) : policy.includeFile(path.join(dir, e.name))))
       .sort((a, b) => {
         if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
         return a.name.localeCompare(b.name);

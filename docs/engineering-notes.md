@@ -356,6 +356,31 @@ is uploaded as a file** once it outgrows the composer's practical budget.
   inline (`src/agent/loop.ts`), with the original file extension preserved
   so Gemini parses it as code rather than opaque text.
 
+## Ignore rules and walking the disk
+
+Listing and search use ripgrep, then `git ls-files` / `git grep`, then a
+JavaScript walk. The walk used to skip a hard-coded folder list (copied into
+three files) and ignore `.gitignore`, so on a machine without rg or git —
+a fresh Windows laptop — the agent saw build output and ignored notes.
+
+Now `src/gitignore.ts` implements git's matching (nested files, negation,
+the no-re-include-under-an-excluded-folder rule, anchoring, `**`, folder-only
+patterns, classes, escapes, trailing spaces, BOM/CRLF, `.git/info/exclude`,
+`.git` files), and `src/walk.ts` is the one policy every walk uses on top:
+`.git`, `node_modules` and gemini-code's own folders are never entered,
+`.env` / `.env.*` are never listed or searched (templates are), and the old
+noise list applies only when no ignore rules do. A walk scoped into a folder
+that is itself ignored drops the rules, decided by the module rather than
+`git check-ignore -q .` (which misread CRLF files with blank lines). Outside
+a repository, rules start at the workspace root, never above it. `git grep`
+now searches untracked files too.
+
+Tests: unit cases per rule, and a differential test against git — random
+trees and .gitignore files from a pool aimed at the hard rules, compared with
+`git ls-files --others --exclude-standard` (global and system config off).
+150 seeded cases run in `npm test`; `npm run test:gitignore` runs 2,000.
+Not read: the global `core.excludesFile` (the git engine still honours it).
+
 ## Project layout
 
 ```

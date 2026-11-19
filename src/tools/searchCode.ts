@@ -1,26 +1,10 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
+import { walkProject } from "../walk.js";
 import path from "node:path";
 import type { ToolDefinition } from "../types.js";
 import { resolveInRoot, outsideWorkspace } from "./paths.js";
 import { grep } from "./fileIndex.js";
 import { displayPath } from "../workspace.js";
-
-const IGNORED_DIRS = new Set([
-  "node_modules",
-  ".git",
-  "dist",
-  "build",
-  "out",
-  ".next",
-  ".cache",
-  "coverage",
-  ".venv",
-  "venv",
-  "__pycache__",
-  ".gemini-code-profile",
-  ".gemini-code-tmp",
-  ".tmp-test",
-]);
 
 /** Skip anything that isn't text — a match inside a binary is noise. */
 const BINARY_EXT = /\.(png|jpe?g|gif|webp|bmp|ico|pdf|zip|gz|tar|mp4|mov|mp3|wav|woff2?|ttf|eot|so|dylib|exe|bin|lock)$/i;
@@ -69,21 +53,8 @@ export function globToRegExp(glob: string): RegExp {
   return new RegExp("^" + re + "$", "i");
 }
 
-/** Every file in the project, skipping build output, caches and hidden directories. */
-export async function* walkProject(dir: string): AsyncGenerator<{ full: string; name: string }> {
-  let entries;
-  try {
-    entries = await readdir(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    if (IGNORED_DIRS.has(entry.name) || (entry.name.startsWith(".") && entry.isDirectory())) continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) yield* walkProject(full);
-    else yield { full, name: entry.name };
-  }
-}
+/** The shared walk (gitignore-aware); re-exported for files.ts. */
+export { walkProject };
 
 export async function searchCode(opts: {
   pattern: string;

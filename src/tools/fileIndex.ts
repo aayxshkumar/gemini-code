@@ -9,15 +9,9 @@
  * tools above don't care which ran.
  */
 import { spawn } from "node:child_process";
-import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { globToRegExp } from "./searchCode.js";
-
-const IGNORED_DIRS = new Set([
-  "node_modules", ".git", "dist", "build", "out", ".next", ".nuxt", ".cache", "coverage",
-  ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".gradle", "target",
-  ".gemini-code-profile", ".gemini-code-tmp", ".tmp-test",
-]);
+import { isSecretFile, walkProject, WalkPolicy } from "../walk.js";
 
 let rgAvailable: boolean | undefined;
 const DEBUG = process.env.GEMINI_CODE_SEARCH_DEBUG === "1";
@@ -59,11 +53,20 @@ async function isGitRepo(dir: string): Promise<boolean> {
  * Is this directory itself gitignored? When the model deliberately scopes
  * a search to node_modules/some-dep or a generated tree, honouring the
  * repo's ignore rules would hide exactly what it asked for — so ignore
- * rules are dropped for a scope that is itself ignored.
+ * rules are dropped for a scope that is itself ignored. Decided by
+ * gitignore.ts rather than `git check-ignore -q .`, so it's the same answer
+ * with or without git (and a CRLF .gitignore with a blank line no longer
+ * makes every folder look ignored).
  */
-async function isIgnoredDir(dir: string): Promise<boolean> {
-  const { code } = await run("git", ["check-ignore", "-q", "."], dir);
-  return code === 0;
+function isIgnoredDir(dir: string): boolean {
+  return new WalkPolicy(dir).scopedIntoIgnored;
+}
+
+/** What no engine may return, whatever it thinks: secrets files and gemini-code's own folders. */
+function allowedPath(rel: string): boolean {
+  const parts = rel.split("/");
+  if (isSecretFile(parts[parts.length - 1])) return false;
+  return !parts.slice(0, -1).some((d) => d === ".git" || d === ".gemini-code-tmp" || d === ".gemini-code-profile");
 }
 
 /**
@@ -80,11 +83,11 @@ export async function listFiles(root: string, opts: { glob?: string; max?: numbe
     return globRe.test(onPath ? rel : path.posix.basename(rel));
   };
   const finish = (all: string[], engine: string) => {
-    const files = all.filter(keep);
+    const files = all.filter((f) => allowedPath(f) && keep(f));
     return { files: files.slice(0, max), truncated: files.length > max, engine };
   };
 
-  const scopedIntoIgnored = await isIgnoredDir(root);
+  const scopedIntoIgnored = isIgnoredDir(root);
   if (await hasRipgrep()) {
     const args = ["--files", "--hidden", "-g", "!.git", "-g", "!.gemini-code-tmp"];
     if (scopedIntoIgnored) args.push("--no-ignore");
@@ -96,23 +99,13 @@ export async function listFiles(root: string, opts: { glob?: string; max?: numbe
     const { code, out } = await run("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], root);
     if (code === 0) return finish(out.split("\0").filter(Boolean), "git");
   }
+  // No rg, no git (or scoped into an ignored folder): the shared walk,
+  // which honours .gitignore the same way git does.
   const all: string[] = [];
-  const walk = async (dir: string): Promise<void> => {
-    if (all.length > max * 5) return;
-    let entries;
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      if (IGNORED_DIRS.has(e.name) || (e.name.startsWith(".") && e.isDirectory())) continue;
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) await walk(full);
-      else all.push(path.relative(root, full).split(path.sep).join("/"));
-    }
-  };
-  await walk(root);
+  for await (const { full } of walkProject(root)) {
+    all.push(path.relative(root, full).split(path.sep).join("/"));
+    if (all.length > max * 5) break;
+  }
   return finish(all, "walk");
 }
 
@@ -144,7 +137,7 @@ export async function grep(
         return m ? [{ file: m[1].split(path.sep).join("/"), line: Number(m[2]), text: m[3].trim().slice(0, 200) }] : [];
       });
 
-  const scopedIntoIgnored = await isIgnoredDir(root);
+  const scopedIntoIgnored = isIgnoredDir(root);
   if (await hasRipgrep()) {
     const args = ["-n", "--no-heading", "--color", "never", "--max-columns", "400", "-e", pattern];
     if (scopedIntoIgnored) args.push("--no-ignore", "--hidden", "-g", "!.git");
@@ -153,17 +146,18 @@ export async function grep(
     args.push("-g", "!.gemini-code-tmp", "-g", "!GEMINI-PLAN.md");
     const { code, out } = await run("rg", args, root);
     if (code === 0 || code === 1) {
-      const hits = parse(out);
+      const hits = parse(out).filter((h) => allowedPath(h.file));
       return { hits: hits.slice(0, max), truncated: hits.length > max, engine: "rg" };
     }
     // exit 2 = rg error (bad regex, unreadable path): try the next engine.
   }
   if (!scopedIntoIgnored && (await isGitRepo(root))) {
-    const args = ["grep", "-n", "-I", "-E", "--no-color", ...(opts.caseSensitive ? [] : ["-i"]), "-e", pattern, "--"];
+    // --untracked: a file you just created is part of the project too.
+    const args = ["grep", "-n", "-I", "-E", "--no-color", "--untracked", ...(opts.caseSensitive ? [] : ["-i"]), "-e", pattern, "--"];
     if (opts.glob) args.push(opts.glob.includes("/") ? opts.glob : `*${opts.glob.replace(/^\*+/, "")}`);
     const { code, out } = await run("git", args, root);
     if (code === 0 || code === 1) {
-      const hits = parse(out);
+      const hits = parse(out).filter((h) => allowedPath(h.file));
       return { hits: hits.slice(0, max), truncated: hits.length > max, engine: "git grep" };
     }
   }
