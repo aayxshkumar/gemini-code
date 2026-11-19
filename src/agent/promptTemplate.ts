@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "../types.js";
 import { MEMORY_FILENAME } from "../context/memory.js";
+import { describeEnvironment } from "../context/environment.js";
 import type { ProjectDoc } from "../context/projectDocs.js";
 
 export interface PrimerContext {
@@ -15,7 +16,12 @@ export interface PrimerContext {
   roots?: { name: string; display: string; dir: string; tree: string }[];
   /** A handoff note from the previous thread, after a context reset (/compact). */
   handoff?: string;
+  /** Installed skills. Only these two fields: the rest loads through use_skill. */
+  skills?: { name: string; description: string }[];
 }
+
+const MAX_SKILLS_LISTED = 40;
+const MAX_SKILL_DESCRIPTION_CHARS = 240;
 
 /**
  * The RULES half of the primer: tool list + the tool-call protocol.
@@ -90,14 +96,28 @@ You have been given one self-contained piece of a larger job by an orchestrator.
   return "";
 }
 
-export function buildSystemPrimer(toolList: ToolDefinition[], role: AgentRole = "solo"): string {
-  const toolDocs = toolList.map((t) => `- ${t.description}`).join("\n");
+export function buildSystemPrimer(
+  toolList: ToolDefinition[],
+  role: AgentRole = "solo",
+  environment: string = describeEnvironment()
+): string {
+  const toolDocs = toolList
+    .filter((t) => !t.deferred)
+    .map((t) => `- ${t.description}`)
+    .join("\n");
+  const deferred = toolList.filter((t) => t.deferred).map((t) => t.name);
+  const onDemand = deferred.length
+    ? `\n\nMORE TOOLS, available on demand. You know only their names until you load them with tool_search, ` +
+      `so do that first when one would help:\n${deferred.join(", ")}`
+    : "";
 
   return `You are an autonomous coding agent working in a local project directory.
 You do not have direct filesystem, shell, or network access — instead you have these tools,
 which a local program will execute on your behalf:
 
-${toolDocs}
+${toolDocs}${onDemand}
+
+${environment}
 
 RULES FOR USING TOOLS:
 - To use a tool, reply with ONLY a code block (a \`\`\`json fenced block is fine), containing exactly this JSON and nothing else:
@@ -203,6 +223,18 @@ export function buildContextDocument(context: PrimerContext): string | undefined
     );
   }
 
+  if (context.skills?.length) {
+    const shown = context.skills.slice(0, MAX_SKILLS_LISTED);
+    const more = context.skills.length - shown.length;
+    const list = shown
+      .map((s) => `- ${s.name}${s.description ? `: ${s.description.slice(0, MAX_SKILL_DESCRIPTION_CHARS)}` : ""}`)
+      .join("\n");
+    sections.push(
+      `## Skills\n\nInstructions for particular kinds of task. When one fits, load it with use_skill and follow it ` +
+        `rather than working it out yourself.\n\n${list}${more ? `\n\n(${more} more: call use_skill with no name.)` : ""}`
+    );
+  }
+
   if (context.resumePlan) {
     sections.push(
       `## UNFINISHED WORK FROM A PREVIOUS SESSION
@@ -255,6 +287,7 @@ Rules that keep being broken:
 - If you genuinely need the user's DECISION (not permission), call the ask_user
   tool with options — a question in prose ends the task unanswered.
 - The JSON goes in a code block on its own, with no prose around it.
+- If you've lost track of a tool, tool_search finds it: {"name": "tool_search", "args": {"query": "keywords"}}
 
 Reply in plain prose with NO code block only when the work is genuinely finished.`;
 }

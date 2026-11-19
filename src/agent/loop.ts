@@ -2,6 +2,8 @@ import { mkdir, writeFile, rm, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { IGeminiDriver } from "../driver/IGeminiDriver.js";
 import { tools } from "../tools/index.js";
+import { createPlanModeTools, planModeRefusal, READ_ONLY_TOOLS, type PlanModeState } from "../tools/planMode.js";
+import { createToolSearchTool } from "../tools/toolSearch.js";
 import type { ToolDefinition, ToolResult } from "../types.js";
 import {
   buildSystemPrimer,
@@ -64,6 +66,11 @@ const COMPOSER_MAX_CHARS = 30_000;
 const MAX_INLINE_CONTEXT_CHARS = 2_500;
 
 const TMP_DIR = ".gemini-code-tmp";
+
+/** Prepended to a task when the user turned plan mode on before sending it. */
+const PLAN_MODE_NOTE =
+  `PLAN MODE IS ON. Only read-only tools will run. Look into this task, then call exit_plan_mode ` +
+  `with your plan for the user to approve. Do not start the work until they do.`;
 
 /**
  * How often the tool-call contract is restated, and how many times a reply
@@ -128,11 +135,10 @@ const taskTimeoutMin = () => Math.max(0, Number(process.env.GEMINI_CODE_TASK_TIM
 /** How long to wait for the network to come back before giving up a turn. */
 const OFFLINE_WAIT_MS = Math.max(0, Number(process.env.GEMINI_CODE_OFFLINE_WAIT_MS ?? 5 * 60_000));
 
-/** Tools that only look. Used by the exploring-forever nudge. */
-const READ_ONLY_TOOLS = new Set([
-  "read_file", "search_code", "find_files", "list_files", "git_status", "git_diff", "check_output",
-  "web_search", "fetch_url", "read_page", "browser_open", "browser_do", "browser_close", "screenshot_page",
-  "ask_gem", "update_plan",
+/** Tools that only look. Used by the exploring-forever nudge (ask_user and the plan tools don't count as exploring). */
+const EXPLORE_TOOLS = new Set([
+  ...[...READ_ONLY_TOOLS].filter((t) => !["ask_user", "enter_plan_mode", "exit_plan_mode"].includes(t)),
+  "browser_open", "browser_do", "browser_close", "screenshot_page",
 ]);
 
 /** Thrown inside exchange() when the tab was lost and replaced: the thread must be re-primed. */
@@ -165,6 +171,13 @@ export interface RunTaskOptions {
    * so the next task can resume.
    */
   cancelSignal?: AbortSignal;
+  /**
+   * A reply the loop pushed back on instead of accepting as final. A plain
+   * question gets its real answer here and only "that was complete" as the
+   * final reply, so a chat UI needs to show this one too. Awaited before the
+   * nudge is sent, so the reply is still the last thing on the page.
+   */
+  onInterimReply?: (text: string) => void | Promise<void>;
 }
 
 export class AgentSession {
@@ -179,6 +192,9 @@ export class AgentSession {
   private readonly tools: ToolDefinition[];
   private readonly toolsByName: Record<string, ToolDefinition>;
   private readonly toolNames: ReadonlySet<string>;
+  /** Deferred tools whose definition has reached this thread. */
+  private readonly loadedTools = new Set<string>();
+  private readonly planMode: PlanModeState = { active: false };
 
   constructor(
     private readonly driver: IGeminiDriver,
@@ -192,9 +208,52 @@ export class AgentSession {
     /** Shapes the primer: orchestrator delegates, worker reports back short. */
     private readonly role: AgentRole = "solo"
   ) {
-    this.tools = [...tools, ...extraTools];
+    this.tools = [
+      ...tools,
+      ...extraTools,
+      createToolSearchTool(() => this.tools, this.loadedTools),
+      // A worker can't hold up a brief it was given to wait for sign-off.
+      ...(role === "worker" ? [] : createPlanModeTools(this.planMode)),
+    ];
     this.toolsByName = Object.fromEntries(this.tools.map((t) => [t.name, t]));
     this.toolNames = new Set(Object.keys(this.toolsByName));
+  }
+
+  get toolList(): string[] {
+    return this.tools.map((t) => t.name);
+  }
+
+  /** Read-only until the user approves a plan, whoever turned it on. */
+  setPlanMode(active: boolean): void {
+    this.planMode.active = active;
+  }
+
+  get inPlanMode(): boolean {
+    return this.planMode.active;
+  }
+
+  /**
+   * A tool's result, or the reason it didn't run. Calling a deferred tool that
+   * was never loaded doesn't fail: the model has guessed its args, so it gets
+   * the definition back and can send the call again. Nothing ran, and it isn't
+   * a failure to count towards giving up.
+   */
+  private async runTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+    const tool = this.toolsByName[name];
+    if (!tool) {
+      return { ok: false, output: `Error: unknown tool "${name}". Available: ${Object.keys(this.toolsByName).join(", ")}` };
+    }
+    if (this.planMode.active && !READ_ONLY_TOOLS.has(name)) {
+      return { ok: false, output: planModeRefusal(name) };
+    }
+    if (tool.deferred && !this.loadedTools.has(name)) {
+      this.loadedTools.add(name);
+      return {
+        ok: true,
+        output: `${name} did NOT run: it wasn't loaded yet. It is now. Its definition:\n- ${tool.description}\nSend the call again.`,
+      };
+    }
+    return this.runWithWatchdog(tool, args);
   }
 
   /** Runs one user task to completion, including any tool-call back-and-forth. Returns Gemini's final plain-text answer. */
@@ -207,6 +266,7 @@ export class AgentSession {
     const log = options.onEvent ?? (() => {});
 
     await this.journal?.begin(userTask);
+    if (this.planMode.active) userTask = `${PLAN_MODE_NOTE}\n\n${userTask}`;
     let message = userTask;
     let attachFile: string[] = [...(options.attachments ?? [])];
     let driftNudges = 0;
@@ -370,6 +430,7 @@ export class AgentSession {
         // wording to match on — just the fact that no tool ran.
         if (toolCallsMade === 0 && idleNudges < maxIdleNudges()) {
           idleNudges++;
+          await options.onInterimReply?.(parsed.text);
           log(noteLine("answered without using any tool — asking it to act instead"));
           await this.journal?.log("idle nudge: reply used no tools");
           message =
@@ -389,6 +450,7 @@ export class AgentSession {
         const stoppedEarly = pending.length > 0 || looksUnfinished(reply);
         if (continueNudges < MAX_CONTINUE_NUDGES && stoppedEarly) {
           continueNudges++;
+          await options.onInterimReply?.(parsed.text);
           const why = pending.length
             ? `${pending.length} plan step(s) still open`
             : "the reply describes work still in progress";
@@ -442,10 +504,7 @@ export class AgentSession {
         const { name, args } = batch[i];
         toolCallsMade++;
         log(toolCallLine(name, args));
-        const tool = this.toolsByName[name];
-        const result: ToolResult = tool
-          ? await this.runWithWatchdog(tool, args)
-          : { ok: false, output: `Error: unknown tool "${name}". Available: ${Object.keys(this.toolsByName).join(", ")}` };
+        const result: ToolResult = await this.runTool(name, args);
 
         log(toolResultLine(result.ok, result.output));
 
@@ -474,7 +533,7 @@ export class AgentSession {
         }
 
         // Exploring forever is its own kind of stall.
-        if (READ_ONLY_TOOLS.has(name)) readOnlyStreak++;
+        if (EXPLORE_TOOLS.has(name)) readOnlyStreak++;
         else {
           readOnlyStreak = 0;
           exploreNoted = false;

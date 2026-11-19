@@ -117,6 +117,25 @@ export const selectors = {
   /** Opens the model/mode picker. Its aria-label also reports the current model. */
   modePicker: 'button[aria-label*="mode picker" i]',
 
-  /** Items inside the opened model picker menu. */
-  modeMenuItem: '[role="menuitem"]',
+  /**
+   * Items inside the opened model picker menu. A prefix match, because the
+   * models became `menuitemradio` in November 2026, leaving `menuitem` matching
+   * only "Thinking level", so no model could be listed or picked.
+   */
+  modeMenuItem: '[role^="menuitem"]',
+
+  /**
+   * The padlock on a model above the account's plan. Locked rows used to carry
+   * "upsell" in their id; since November 2026 only this icon marks them.
+   */
+  lockIcon: '[fonticon="lock"], [data-mat-icon-name="lock"]',
+
+  /** The picker entry that opens the Thinking level submenu, on hover. */
+  thinkingLevelMenu: 'gem-menu-item[value="thinking_level"]',
+
+  /** Low / Medium / High in that submenu. They carry no id of their own. */
+  thinkingLevelItem: 'gem-menu-item:not([data-test-id^="bard-mode-option"]):not([value="thinking_level"])',
+
+  /** What a model above the account's plan opens instead of switching. */
+  upgradeDialog: '[role="dialog"]:has-text("Upgrade"), mat-dialog-container:has-text("Upgrade")',
 } as const;

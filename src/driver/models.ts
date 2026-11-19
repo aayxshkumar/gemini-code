@@ -76,7 +76,9 @@ export const MODELS: ModelChoice[] = [
     // everyday help" / "High thinking — Complex problem solving" with no
     // model family named at all. Match both, or tabs on the newer menu
     // silently stay on whatever model they started with.
-    matches: (t) => (/flash/i.test(t) && !/lite/i.test(t)) || /standard thinking|everyday help/i.test(t),
+    // A third variant has no Flash at all, only "Auto", so that's what the
+    // default means there.
+    matches: (t) => (/flash/i.test(t) && !/lite/i.test(t)) || /standard thinking|everyday help/i.test(t) || /^auto\b/i.test(t),
   },
   {
     name: "Pro",
@@ -161,4 +163,65 @@ export function modelWithFallbacks(choice: ModelChoice): ModelChoice[] {
 
 export function modelHelp(): string {
   return MODELS.map((m) => `  ${m.aliases[0].padEnd(10)} ${m.name} — ${m.hint}`).join("\n");
+}
+
+/** One row of the open picker, as read off the page. */
+export interface MenuRow {
+  text: string;
+  testId: string;
+  selected: boolean;
+  /** Shows a padlock. */
+  locked?: boolean;
+}
+
+export interface MenuEntry {
+  /** First line of the row, e.g. "3.1 Pro". */
+  name: string;
+  /** Second line, e.g. "Advanced reasoning". */
+  description: string;
+  selected: boolean;
+}
+
+export interface LiveModel extends MenuEntry {
+  /**
+   * Above the account's plan. Selecting it opens an upgrade dialog rather than
+   * switching, so nothing should click it. Google has marked these with
+   * "upsell" in the row's id, and later with only a padlock icon.
+   */
+  locked: boolean;
+}
+
+/** What the account can pick right now: the source of truth, unlike MODELS. */
+export interface ModelMenu {
+  models: LiveModel[];
+  thinking: MenuEntry[];
+  /** The picker's own label, e.g. "Gemini Auto". */
+  current: string;
+}
+
+function menuEntry(row: MenuRow): MenuEntry {
+  const [name, ...rest] = row.text.split("\n").map((line) => line.trim()).filter(Boolean);
+  return { name, description: rest.join(" "), selected: row.selected };
+}
+
+/** The models in a picker's rows, leaving out blanks and the thinking control. */
+export function parseModelRows(rows: MenuRow[]): LiveModel[] {
+  return rows
+    .filter((row) => row.text && !EXTENDED_THINKING.matches(row.text) && !THINKING_LEVEL_MENU.entry.test(row.text.split("\n")[0]))
+    .map((row) => ({ ...menuEntry(row), locked: Boolean(row.locked) || /upsell/i.test(row.testId) }));
+}
+
+export function parseThinkingRows(rows: MenuRow[]): MenuEntry[] {
+  return rows.filter((row) => row.text).map(menuEntry);
+}
+
+/**
+ * Does a picker row answer to this name: either of its lines, or a friendly
+ * alias? Either line, because rows have been "3.1 Pro / Advanced reasoning" and
+ * then "Code & analysis / 4 Argon", with the model's name on whichever.
+ */
+export function menuRowMatches(wanted: string, rowText: string): boolean {
+  const needle = wanted.trim().toLowerCase();
+  const lines = rowText.split("\n").map((line) => line.trim().toLowerCase());
+  return lines.includes(needle) || (resolveModel(wanted)?.matches(rowText) ?? false);
 }

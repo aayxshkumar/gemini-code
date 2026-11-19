@@ -19,6 +19,7 @@
     "doctor": "node dist/cli.js doctor"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "playwright": "^1.47.0"
   },
   "devDependencies": {

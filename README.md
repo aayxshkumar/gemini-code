@@ -1,8 +1,11 @@
+<p align="center"><img src="ui/gemini_code_ui/assets/logo.png" width="112" alt="gemini-code logo"></p>
+
 # gemini-code
 
-A Claude-Code-style terminal coding agent that runs on the **Gemini web UI**
-(**3.8 Thinking** by default), for people who have a Gemini web subscription but
-no Gemini API or CLI access.
+A Claude-Code-style coding agent that runs on the **Gemini web UI** (**3.8 Thinking**
+by default) — or on **Gemini Enterprise** — for people who have a Gemini web
+subscription but no Gemini API or CLI access. Use it in the terminal, or as a
+[desktop app](#desktop-app).
 
 It drives a real, logged-in Chrome tab with Playwright: your prompt goes into the
 composer, Gemini's reply is parsed back out, and any tools it asks for run
@@ -254,12 +257,16 @@ The installer and the release tarball (`npm run package`, ~4 MB) are the honest
 version of the same idea: one command, no build. They need Node on the machine,
 which is a small ask next to Chrome, which is needed anyway.
 
+The [desktop app's exe](#desktop-app) gets around this without bundling Playwright: it's
+an archive that carries Node and real `node_modules`, and unpacks them when it starts.
+
 ## Versioning
 
 Semantic versioning, reported by `gemini-code --version`.
 
 | Version | Highlights |
 | --- | --- |
+| **0.14.0** | **Gemini Enterprise**: sign in at your organisation's Gemini Enterprise link (`--enterprise <url>`, `/enterprise`, `gemini-code config set enterprise <url>`). **Upstream merged** (Muruganandham18/gemini-code through its 0.12.0): desktop app and standalone Windows exe, Mac app, MCP servers, Claude-compatible skills (`gemini-code skills add`), on-demand tool loading with `tool_search`, plan mode, `multi_edit`, `read_files`, notebooks, code outline/symbols, git log/show/blame, `search_code` context lines, a folder per chat, and the model picker fixed after Gemini's November 2026 menu change |
 | **0.13.0** | **Crash resume**: the journal records the Gemini thread; after a crash, `continue` (or `/resume`) reopens that exact thread and picks up from the first unfinished step, with the plan's steps carried over; falls back to a journal-primed fresh thread when the thread is gone |
 | **0.12.0** | **Windows first**: Microsoft Edge works as the browser; command shell is Git Bash → PowerShell → cmd (never the WSL launcher) with the model told which syntax to write; ASCII output on the legacy console; `npm run setup` works on Windows; `install.ps1` and `setup.ps1` run in CI on a Windows runner; README leads with the Windows path |
 | **0.11.1** | Windows: `search_code` parsed nothing from `git grep` on CRLF checkouts (every hit ended in `\r`); walk results now use forward slashes; CI green on Ubuntu, macOS and Windows |
@@ -385,7 +392,9 @@ raw `GEMINI_CODE_*` name from the table.
 | `GEMINI_CODE_REMINDER_TURNS` | `5` | how often the tool-call contract is restated |
 | `GEMINI_CODE_DRIFT_NUDGES` | `2` | nudges when a reply abandons the protocol |
 | `GEMINI_CODE_BASH_TIMEOUT_MS` | `60000` | foreground command timeout |
+| `GEMINI_CODE_MCP_TIMEOUT_MS` | `60000` | how long one MCP tool call may take |
 | `GEMINI_CODE_SHELL` | Git Bash on Windows, else `sh` | shell commands run in (e.g. `powershell.exe`) |
+| `GEMINI_CODE_CLAUDE_SKILLS` | `1` | `0` = don't use skills from `~/.claude/skills` |
 
 ## Use it as an OpenAI-compatible API
 
@@ -466,6 +475,182 @@ streaming arrives in bursts rather than token by token, because it's read off th
 as Gemini renders it; and latency is that of the web UI — a few seconds for a short
 answer. It's your personal Gemini session, so keep it for your own tools rather than
 putting it behind a public service.
+
+## Desktop app
+
+A native app (PySide6, no web server) with the chat and every setting in one window.
+
+Download it from the [latest release](https://github.com/Muruganandham18/gemini-code/releases/latest).
+Node.js and the agent are inside, so Google Chrome is all you need installed.
+
+- **Windows:** `gemini-code.exe`. It's one file that unpacks itself to a temp folder when
+  it starts. It isn't code-signed, so SmartScreen may warn you the first time: choose
+  **More info**, then **Run anyway**.
+- **Mac (Apple Silicon):** `gemini-code-macos-arm64.zip`. Unzip it and move
+  `gemini-code.app` to Applications. It isn't signed by Apple, so the first time macOS says
+  it can't be opened: open **System Settings → Privacy & Security** and choose **Open
+  Anyway**, or run `xattr -dr com.apple.quarantine /Applications/gemini-code.app`. Intel
+  Macs can use the [terminal install](#install) instead.
+
+To run it from a checkout instead, which needs Node.js and Python 3.10+:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ui\setup.ps1
+```
+
+Then double-click `ui\gemini-code-ui.bat`. On macOS or Linux, `npm install && npm run
+build`, make a venv, `pip install -r ui/requirements.txt`, and from `ui/` run
+`python -m gemini_code_ui`. `ui\build_exe.ps1` builds the exe yourself, and `ui/build_mac.sh`
+the Mac app.
+
+Choose a project folder and the agent starts there. The first time, Chrome opens for
+you to sign in by hand; the app carries on by itself once you have.
+
+| Page | What's there |
+| --- | --- |
+| **Chat** | Tasks and questions, live tool activity, rendered answers, and Allow/Deny for each write, command and network request. Typing during a task steers it, and **Stop** ends it before the next turn. Attach images with the button, by pasting, or by dropping them on the composer. The terminal's slash commands work; `/help` lists them. |
+| **Plan** | `GEMINI-PLAN.md`, the journal of the current task |
+| **Memory** | `GEMINI.md`, the durable project memory |
+| **Skills** | Your skills, and installing more from GitHub |
+| **MCP servers** | How each server is doing, and an editor for the project's `.mcp.json` |
+| **Settings** | Every `GEMINI_CODE_*` variable in [Environment](#environment), with the same defaults. Model and thinking live in the composer's picker instead |
+| **API server** | Start and stop `gemini-code serve`, with its address, port, tabs, key and CORS origins |
+| **Logs** | Everything the agent reported |
+
+The picker in the composer lists exactly what Gemini's own picker offers your account,
+read from the browser each time it opens, so it follows new models and plan changes by
+itself. Models above your plan show **Upgrade** and can't be chosen: Gemini answers those
+with a paid upgrade dialog, so the agent refuses them without clicking.
+
+Model, thinking and Gem changes apply at once. Saving **Settings** restarts the agent,
+because it reads most of them only at startup, and that starts a new Gemini thread.
+
+**Stop** can't interrupt Gemini mid-reply, or worker tabs that are already running: it
+takes effect at the next turn of the main tab. **Restart agent** is the hard stop.
+
+Settings are kept in `~/.gemini-code/ui-settings.json`, including the API key if you set
+one, unencrypted.
+
+The app runs the agent as a child process and talks to it over `gemini-code bridge`:
+one JSON object per line on stdin and stdout, documented in
+[`src/bridge/bridge.ts`](src/bridge/bridge.ts). Anything else could drive it the same way.
+
+```bash
+python ui/tests/test_app.py        # the app against a fake agent, no browser
+python ui/tests/real_bridge.py     # the real agent over its pipes
+```
+
+## Tools
+
+Gemini is told which system it's working on: Windows, macOS or Linux, which shell its
+commands run in (Git Bash, cmd or PowerShell on Windows), whether the tools are BSD or GNU,
+and which of `python`/`python3`, `node` and `git` are actually installed. Windows Python is
+found by running it, since a Store install is invisible to a file check and Windows ships a
+fake `python.exe` that only opens the Store.
+
+Gemini sees a small core set in full. The rest are named and nothing more, and it loads
+what it needs with `tool_search`, so the first message stays small and context goes on
+the work.
+
+| Claude Code | Here | Loaded |
+| --- | --- | --- |
+| Read | `read_file`, and `read_files` for several at once | core, on demand |
+| Write | `write_file` | core |
+| Edit, MultiEdit | `edit_file`, `multi_edit` | core, on demand |
+| Glob | `find_files` | core |
+| Grep | `search_code` | core |
+| Bash | `run_bash` | core |
+| BashOutput, KillShell | `check_output`, `kill_process` | core, on demand |
+| Monitor | `wait_for_output` | on demand |
+| LS | `list_files`, `file_info` | core, on demand |
+| NotebookRead, NotebookEdit | `notebook_read`, `notebook_edit` | on demand |
+| WebFetch, WebSearch | `fetch_url`, `web_search` | on demand |
+| Browser tools | `read_page`, `screenshot_page`, `browser_open`, `browser_do`, `browser_close` | on demand |
+| Task | `delegate_tasks` | core |
+| TodoWrite | `update_plan` | core |
+| AskUserQuestion | `ask_user` | on demand |
+| EnterPlanMode, ExitPlanMode | `enter_plan_mode`, `exit_plan_mode` | on demand |
+| Skill | `use_skill`, see [Skills](#skills) | core |
+| ToolSearch | `tool_search` | core |
+| LSP | `code_outline`, `find_symbol`: pattern-based, not a language server | on demand |
+| git through Bash | `git_status`, `git_diff`, and read-only `git_log`, `git_show`, `git_blame` | core, on demand |
+| File operations through Bash | `move_file`, `copy_file`, `delete_file`, all undoable with `/undo` | on demand |
+
+**Loading.** `tool_search` takes keywords, or `select:a,b` to load several in one call,
+which matters because each tool call is a whole Gemini message. Calling a tool that was
+never loaded runs nothing and returns its definition, so a guess at its arguments costs a
+turn rather than doing the wrong thing. Worker tabs load their own.
+
+**Plan mode.** Only tools on an explicit read-only list run, so a new tool is blocked
+until someone decides it's safe. Gemini can enter it with `enter_plan_mode`, or you can
+with the **Plan mode** button in the app. It ends when you approve a plan through
+`exit_plan_mode`.
+
+Not here: git worktrees, and scheduled or cloud agents.
+
+## MCP servers
+
+Tools from other programs arrive as `mcp__<server>__<tool>`, loaded on demand like the
+rest, so a server with fifty tools costs fifty names rather than fifty schemas. List them
+in `.mcp.json` in the project, in the same format as Claude Code, or in
+`~/.gemini-code/mcp.json` for every project. The desktop app's **MCP servers** page shows
+how each is doing and edits the project's file.
+
+```json
+{
+  "mcpServers": {
+    "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] },
+    "tracker": { "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer ${TRACKER_TOKEN}" } }
+  }
+}
+```
+
+A project's config can name any command, so opening a repository never runs one:
+
+- Each server in a project's `.mcp.json` needs your approval before it starts, **even with
+  auto-approve on**. It's remembered until its config changes.
+- Each tool call asks first, like any other side effect.
+- Plan mode blocks all MCP tools, whatever a server says about them.
+- A server gets a minimal environment, not your shell's secrets. `${VAR}` in the config
+  passes one on deliberately.
+
+Servers run over stdio, Streamable HTTP, or SSE (`"type": "sse"`). OAuth sign-in isn't
+supported, so an HTTP server needs a token in `headers`. In the exe and Mac app, a server
+started with `node` uses the bundled Node, so it works without Node installed; one started
+with `npx` or `python` still needs that installed. `/mcp` lists servers in the terminal.
+
+## Skills
+
+Skills use the same format as Claude Code: a folder with a `SKILL.md`, plus whatever scripts
+and references it bundles. Install them from any public GitHub repository:
+
+```bash
+gemini-code skills add anthropics/skills --only=pdf,docx
+gemini-code skills add https://github.com/owner/repo/tree/main/skills/my-skill
+gemini-code skills list
+gemini-code skills remove pdf
+```
+
+In the desktop app, the **Skills** page does the same: paste a repository, tick what you
+want, and install. A repository with several skills asks which you want, and `--all` takes
+them all. Installed skills go in `~/.gemini-code/skills`.
+
+Skills are also picked up from `.gemini-code/skills` and `.claude/skills` in the project and
+from `~/.claude/skills`, so what you already have for Claude Code works here. Gemini sees
+each skill's name and description at the start of a thread and loads the rest with
+`use_skill` when one fits, including its bundled files. `${CLAUDE_SKILL_DIR}`, `{baseDir}`
+and `$ARGUMENTS` work, and Claude Code's tool names are translated to the ones here.
+
+Worth knowing:
+
+- **A skill is instructions the agent follows, so only install ones you trust.** Installing
+  shows how many scripts a skill bundles. Running one still asks first, like any command.
+- **Only you can install a skill.** No tool does it, so a page Gemini reads can't add one.
+- **Names and descriptions go to Gemini**, including those in `~/.claude/skills`. Turn that
+  folder off with `GEMINI_CODE_CLAUDE_SKILLS=0`, or in Settings.
+- **Some skills can't work here.** One that depends on a Claude-only feature, or on a tool
+  that doesn't exist here, will run into that when followed.
+- New skills join Gemini's list at the next new chat.
 
 ## How it works
 
@@ -873,7 +1058,9 @@ src/
   scripts/    open-chrome, login, doctor, config subcommands
   ui/         terminal formatting
   config.ts   ~/.gemini-code/config.json and <project>/.gemini-code.json -> env
+  bridge/     the agent as JSON lines over stdio, for the desktop app
   cli.ts      REPL, slash commands, orchestrator wiring
+ui/           the desktop app (Python, PySide6)
 ```
 
 The non-obvious failures found while building this — the ones that cost real

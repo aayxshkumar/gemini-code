@@ -8,6 +8,7 @@
  * selector calibration (see README.md).
  */
 import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseGeminiReply, looksLikeAbandonedWork, looksUnfinished, looksLikeGeminiError } from "../agent/toolCallParser.js";
@@ -15,22 +16,46 @@ import { formatToolResult, buildContextDocument, buildSystemPrimer } from "../ag
 import { AgentSession } from "../agent/loop.js";
 import { looksLikeUnseenAttachment } from "../agent/toolCallParser.js";
 import type { IGeminiDriver, GeminiResponse } from "../driver/IGeminiDriver.js";
-import type { ToolDefinition } from "../types.js";
 import { readFileTool } from "../tools/readFile.js";
-import { editFileTool } from "../tools/editFile.js";
-import { searchCodeTool, globToRegExp } from "../tools/searchCode.js";
+import { editFileTool, multiEditTool } from "../tools/editFile.js";
+import { searchCode, searchCodeTool, globToRegExp } from "../tools/searchCode.js";
 import { findFilesTool } from "../tools/findFiles.js";
 import { addRoot, displayPath, resolveInWorkspace, rootsFromArgs } from "../workspace.js";
 import { autoApproved } from "../tools/confirm.js";
 import { detectEol, findSpans, reindent, nearestContext } from "../tools/matchText.js";
-import { gitStatusTool, gitDiffTool } from "../tools/git.js";
+import { gitStatusTool, gitDiffTool, gitLogTool, gitShowTool, gitBlameTool } from "../tools/git.js";
 import { writeFileTool } from "../tools/writeFile.js";
 import { listFilesTool } from "../tools/listFiles.js";
-import { bashTool, checkOutputTool, killProcessTool, looksLongRunning, resolveShell } from "../tools/bash.js";
+import { tools } from "../tools/index.js";
+import type { ToolDefinition } from "../types.js";
+import { createToolSearchTool } from "../tools/toolSearch.js";
+import { createPlanModeTools, READ_ONLY_TOOLS } from "../tools/planMode.js";
+import { copyFileTool, deleteFileTool, fileInfoTool, moveFileTool, readFilesTool } from "../tools/files.js";
+import { notebookEditTool, notebookReadTool } from "../tools/notebook.js";
+import { codeOutlineTool, findSymbolTool, outline } from "../tools/code.js";
+import { findSkills, parseFrontmatter, renderSkill, useSkillTool } from "../tools/skills.js";
+import { discoverSkills, installSkills, listInstalled, parseSkillSource, removeSkill } from "../tools/skillInstall.js";
+import { askUserTool } from "../tools/askUser.js";
+import { checkpoints } from "../context/checkpoint.js";
+import { expandEnv, loadMcpConfig, McpManager } from "../tools/mcp.js";
+import { describeEnvironment, onPath, type EnvironmentInfo } from "../context/environment.js";
+import { bashTool, checkOutputTool, killProcessTool, looksLongRunning, resolveShell, waitForOutputTool } from "../tools/bash.js";
 import { fetchUrlTool } from "../tools/fetchUrl.js";
 import { webSearchTool, parseResults } from "../tools/webSearch.js";
-import { resolveModel, modelWithFallbacks, resolveThinkingLevel, THINKING_LEVEL_MENU, DEFAULT_MODEL_ALIAS, EXTENDED_THINKING } from "../driver/models.js";
+import {
+  resolveModel,
+  modelWithFallbacks,
+  resolveThinkingLevel,
+  THINKING_LEVEL_MENU,
+  DEFAULT_MODEL_ALIAS,
+  EXTENDED_THINKING,
+  menuRowMatches,
+  parseModelRows,
+  parseThinkingRows,
+  type MenuRow,
+} from "../driver/models.js";
 import { resolveGem } from "../driver/GeminiDriver.js";
+import { selectors } from "../driver/selectors.js";
 import { createAskGemTool } from "../tools/askGem.js";
 import { gemFlag, gemModeFlag, serveArgs } from "../args.js";
 import { startServer } from "../server/openai.js";
@@ -52,9 +77,10 @@ import { isImagePath, normalizeDroppedPath } from "../context/clipboard.js";
 import { CheckpointStore } from "../context/checkpoint.js";
 import { createUpdatePlanTool } from "../tools/updatePlan.js";
 import { confirmAction } from "../tools/confirm.js";
-import { setAsker } from "../ui/prompt.js";
+import { setAsker, setQuestioner } from "../ui/prompt.js";
 import { PlanJournal, readPlan, findResumablePlan, clearPlan, parsePlan, resumeTaskText } from "../context/plan.js";
 import { runParallelTasks, createDelegateTool, MAX_WORKER_REPORT_CHARS } from "../agent/workers.js";
+import { Bridge, classifyActivity, parseQuestion, type BridgeEvent, type BridgeHost } from "../bridge/bridge.js";
 
 let passed = 0;
 let failed = 0;
@@ -68,6 +94,10 @@ async function test(name: string, fn: () => Promise<void> | void) {
     failed++;
     console.log(`  FAIL - ${name}`);
     console.log(`    ${(err as Error).stack ?? err}`);
+    // Shows on the run's page, where logs alone need a sign-in to read.
+    if (process.env.GITHUB_ACTIONS) {
+      console.log(`::error title=${name}::${String((err as Error).message ?? err).slice(0, 800).replace(/\r?\n/g, "%0A")}`);
+    }
   }
 }
 
@@ -728,27 +758,24 @@ async function main() {
     const id = String(result.output.match(/"(bg_[a-z0-9]+)"/)?.[1]);
     assert.ok(id.startsWith("bg_"), "returns a handle to read later");
 
-    // It should actually be serving. Poll: a Windows runner can take several
-    // seconds to start Python under Git Bash, and a fixed sleep made this flaky.
-    const up = async (): Promise<boolean> => fetch("http://localhost:8911").then((r) => r.ok).catch(() => false);
-    let alive = false;
-    for (let i = 0; i < 40 && !alive; i++) {
-      alive = await up();
-      if (!alive) await new Promise((r) => setTimeout(r, 250));
-    }
-    assert.ok(alive, "the backgrounded server should really be running");
+    // Polled rather than a fixed wait: Python took longer than 1.5s to start
+    // on a busy CI machine, which failed this for nothing. 127.0.0.1 because
+    // http.server binds IPv4 and localhost can resolve to IPv6 first.
+    const serving = () => fetch("http://127.0.0.1:8911").then((r) => r.ok).catch(() => false);
+    const until = async (wanted: boolean) => {
+      for (let i = 0; i < 80 && (await serving()) !== wanted; i++) await new Promise((r) => setTimeout(r, 250));
+      return serving();
+    };
+
+    // It should actually be serving.
+    assert.ok(await until(true), "the backgrounded server should really be running");
 
     const logs = await checkOutputTool.run({ id });
     assert.match(logs.output, /running/);
 
     // And killing it must take down the whole tree, not just the shell.
     await killProcessTool.run({ id });
-    let stillAlive = true;
-    for (let i = 0; i < 20 && stillAlive; i++) {
-      await new Promise((r) => setTimeout(r, 250));
-      stillAlive = await up();
-    }
-    assert.equal(stillAlive, false, "killing must stop the server, leaving no orphan holding the port");
+    assert.equal(await until(false), false, "killing must stop the server, leaving no orphan holding the port");
   });
 
   await test("surfaces the error from the MIDDLE of a huge failing build", async () => {
@@ -1744,6 +1771,61 @@ async function main() {
     assert.ok(!EXTENDED_THINKING.labelMarker.test("Flash"));
   });
 
+  // Rows as read from a live free-plan picker, Nov 2026.
+  const liveMenu: MenuRow[] = [
+    { text: "", testId: "local-images-files-uploader-button", selected: false },
+    { text: "Auto\nGemini 3 models", testId: "bard-mode-option-cf41b0e0dd7d53e5", selected: true },
+    { text: "3.1 Pro\nAdvanced reasoning", testId: "bard-mode-option-upsell_MODE_CATEGORY_PRO", selected: false },
+    { text: "4 Argon\nComplex tasks", testId: "bard-mode-option-upsell_MODE_CATEGORY_ULTRA", selected: false },
+    { text: "Thinking level", testId: "", selected: false },
+  ];
+
+  await test("reads the live menu, marking models above the plan as locked", () => {
+    assert.deepEqual(parseModelRows(liveMenu), [
+      { name: "Auto", description: "Gemini 3 models", selected: true, locked: false },
+      { name: "3.1 Pro", description: "Advanced reasoning", selected: false, locked: true },
+      { name: "4 Argon", description: "Complex tasks", selected: false, locked: true },
+    ]);
+  });
+
+  // The same menu two weeks later: radio items, and a padlock instead of an id.
+  const liveMenuNov17: MenuRow[] = [
+    { text: "Auto\nAdapts to your needs", testId: "bard-mode-option-cf41b0e0dd7d53e5", selected: true },
+    { text: "Code & analysis\n4 Argon", testId: "bard-mode-option-argon", selected: false, locked: true },
+    { text: "Thinking level", testId: "", selected: false },
+  ];
+
+  await test("a padlock marks a locked model when its id no longer does", () => {
+    assert.deepEqual(parseModelRows(liveMenuNov17), [
+      { name: "Auto", description: "Adapts to your needs", selected: true, locked: false },
+      { name: "Code & analysis", description: "4 Argon", selected: false, locked: true },
+    ]);
+  });
+
+  await test("a row answers to the name on either of its lines", () => {
+    assert.ok(menuRowMatches("4 Argon", "Code & analysis\n4 Argon"));
+    assert.ok(menuRowMatches("code & analysis", "Code & analysis\n4 Argon"));
+    assert.ok(!menuRowMatches("Argon", "Code & analysis\n4 Argon"), "a part of a name isn't a match");
+  });
+
+  await test("the picker selector matches radio items, which is what models are now", () => {
+    const matches = (role: string) => new RegExp(`^${selectors.modeMenuItem.match(/\^="(\w+)"/)![1]}`).test(role);
+    for (const role of ["menuitem", "menuitemradio", "menuitemcheckbox"]) assert.ok(matches(role), role);
+  });
+
+  await test("reads thinking levels from the submenu", () => {
+    const levels = parseThinkingRows([{ text: "Low\nQuick and efficient", testId: "", selected: true }]);
+    assert.deepEqual(levels, [{ name: "Low", description: "Quick and efficient", selected: true }]);
+  });
+
+  await test("a picker row answers to its own name, or a friendly alias", () => {
+    assert.ok(menuRowMatches("3.1 Pro", "3.1 Pro\nAdvanced reasoning"));
+    assert.ok(menuRowMatches("pro", "3.1 Pro\nAdvanced reasoning"));
+    assert.ok(menuRowMatches("fast", "Auto\nGemini 3 models"), "the default must work on an Auto-only picker");
+    assert.ok(!menuRowMatches("4 Argon", "3.1 Pro\nAdvanced reasoning"));
+    assert.ok(!menuRowMatches("fast", "Thinking level"));
+  });
+
   console.log("Gems:");
   await test("picks a Gem by id, exact name or unambiguous partial", () => {
     const gems = [
@@ -2121,6 +2203,955 @@ async function main() {
       startServer({ driver: makeFakeDriver([]) as never, host: "0.0.0.0", port: 18999, tabs: 1, allowedOrigins: [], log: () => {} }),
       /without an API key/
     );
+  });
+
+  /** Runs with real prompts, answering from a list the test fills in. */
+  const withPrompts = async (fn: (answers: string[]) => Promise<void>) => {
+    const answers: string[] = [];
+    delete process.env.GEMINI_CODE_AUTO_APPROVE;
+    setAsker(async () => answers.shift() ?? "");
+    try {
+      await fn(answers);
+    } finally {
+      process.env.GEMINI_CODE_AUTO_APPROVE = "1";
+      setAsker(undefined);
+    }
+  };
+
+  console.log("On-demand tools:");
+  const sessionReplies = (replies: GeminiResponse[], extra: ToolDefinition[] = []) => {
+    const driver = new FakeDriver(replies);
+    return { driver, session: new AgentSession(driver, {}, extra) };
+  };
+  const echo = (ran: string[]): ToolDefinition => ({
+    name: "echo_later",
+    deferred: true,
+    description: "echo_later(args: {text: string}) -> says it back. UNIQUE-ECHO-DOC",
+    async run(args) {
+      ran.push(String(args.text));
+      return { ok: true, output: "echoed" };
+    },
+  });
+
+  await test("the primer names deferred tools without describing them", () => {
+    const primer = buildSystemPrimer(tools);
+    for (const tool of tools) {
+      assert.ok(primer.includes(tool.name), `${tool.name} isn't even named`);
+      assert.equal(primer.includes(tool.description), !tool.deferred, tool.name);
+    }
+    assert.ok(primer.includes("tool_search"));
+  });
+
+  await test("every tool describes its own name and args", () => {
+    assert.equal(new Set(tools.map((t) => t.name)).size, tools.length, "duplicate tool name");
+    for (const tool of tools) assert.ok(tool.description.startsWith(`${tool.name}(`), tool.name);
+  });
+
+  await test("keywords find a tool, and select loads several at once", async () => {
+    const loaded = new Set<string>();
+    const search = createToolSearchTool(() => tools, loaded);
+    const byKeyword = await search.run({ query: "notebook" });
+    assert.ok(byKeyword.ok && byKeyword.output.includes("notebook_read("));
+    assert.ok(loaded.has("notebook_read"));
+
+    loaded.clear();
+    const selected = await search.run({ query: "select:git_log, git_blame,no_such_tool" });
+    assert.deepEqual([...loaded].sort(), ["git_blame", "git_log"]);
+    assert.match(selected.output, /Not found: no_such_tool/);
+    assert.ok(selected.output.includes(gitLogTool.description));
+  });
+
+  await test("a search that finds nothing lists what exists", async () => {
+    const search = createToolSearchTool(() => tools, new Set());
+    const result = await search.run({ query: "zzzqqq" });
+    assert.equal(result.ok, false);
+    assert.match(result.output, /delete_file/);
+  });
+
+  await test("a deferred tool runs once tool_search has loaded it", async () => {
+    const ran: string[] = [];
+    const { session, driver } = sessionReplies(
+      [
+        toolCallResponse("tool_search", { query: "select:echo_later" }),
+        toolCallResponse("echo_later", { text: "hi" }),
+        finalResponse("done"),
+      ],
+      [echo(ran)]
+    );
+    assert.equal(await session.runTask("go"), "done");
+    assert.deepEqual(ran, ["hi"]);
+    assert.ok(!driver.sentMessages[0].includes("UNIQUE-ECHO-DOC"), "its docs must stay out of the primer");
+    assert.ok(driver.sentMessages[1].includes("UNIQUE-ECHO-DOC"), "and arrive when searched for");
+  });
+
+  await test("calling an unloaded tool returns its definition and runs nothing", async () => {
+    const ran: string[] = [];
+    const { session, driver } = sessionReplies(
+      [
+        toolCallResponse("echo_later", { guess: "x" }),
+        toolCallResponse("echo_later", { text: "fixed" }),
+        finalResponse("done"),
+      ],
+      [echo(ran)]
+    );
+    await session.runTask("go");
+    assert.deepEqual(ran, ["fixed"], "the first call, on guessed args, must not run");
+    assert.match(driver.sentMessages[1], /did NOT run[\s\S]*UNIQUE-ECHO-DOC/);
+  });
+
+  console.log("Plan mode:");
+  await test("plan mode allow-lists tools, so a new tool is blocked by default", async () => {
+    const ran: string[] = [];
+    const { session, driver } = sessionReplies(
+      [toolCallResponse("tool_search", { query: "select:echo_later" }), toolCallResponse("echo_later", { text: "x" }), finalResponse("ok")],
+      [echo(ran)]
+    );
+    session.setPlanMode(true);
+    await session.runTask("look");
+    assert.deepEqual(ran, []);
+    assert.match(driver.sentMessages.join("\n"), /Plan mode is on, so echo_later did not run/);
+    assert.match(driver.sentMessages[0], /PLAN MODE IS ON/);
+  });
+
+  await test("nothing that changes anything is on the read-only list", () => {
+    for (const name of ["write_file", "edit_file", "multi_edit", "run_bash", "delete_file", "move_file", "copy_file",
+      "notebook_edit", "delegate_tasks", "browser_do", "remember", "kill_process"]) {
+      assert.ok(!READ_ONLY_TOOLS.has(name), name);
+    }
+  });
+
+  await test("a declined plan stays in plan mode, an approved one leaves it", async () => {
+    await withPrompts(async (answers) => {
+      const state = { active: true };
+      const exit = createPlanModeTools(state).find((t) => t.name === "exit_plan_mode")!;
+      answers.push("n");
+      assert.match((await exit.run({ plan: "Rewrite it" })).output, /did not approve/);
+      assert.equal(state.active, true);
+      answers.push("y");
+      await exit.run({ plan: "Rewrite it" });
+      assert.equal(state.active, false);
+    });
+  });
+
+  console.log("Claude Code tools:");
+  const scratchFile = (name: string) => path.join(".tmp-test", name);
+
+  await test("find_files matches filenames and paths", async () => {
+    assert.match((await findFilesTool.run({ pattern: "smoke.ts" })).output, /src\/tests\/smoke\.ts/);
+    assert.match((await findFilesTool.run({ pattern: "src/**/*Gem*.ts" })).output, /askGem\.ts/);
+    assert.match((await findFilesTool.run({ pattern: "*.nothing" })).output, /No files match/);
+  });
+
+  await test("read_files reads several, and refuses to leave the project", async () => {
+    await writeFile(scratchFile("a.txt"), "alpha");
+    const { output } = await readFilesTool.run({ paths: [scratchFile("a.txt"), "../outside.txt", scratchFile("gone.txt")] });
+    assert.match(output, /alpha/);
+    assert.match(output, /escapes the project root/);
+    assert.match(output, /Error reading it/);
+  });
+
+  await test("multi_edit is all or nothing", async () => {
+    const file = scratchFile("multi.txt");
+    await writeFile(file, "one\ntwo\n");
+    const unread = await multiEditTool.run({ path: file, edits: [{ old_text: "one", new_text: "1" }] });
+    assert.match(unread.output, /haven't read/, "multi_edit has the same read-before-edit gate as edit_file");
+    await readFilesTool.run({ paths: [file] });
+    const failed = await multiEditTool.run({
+      path: file,
+      edits: [{ old_text: "one", new_text: "1" }, { old_text: "missing", new_text: "x" }],
+    });
+    assert.equal(failed.ok, false);
+    assert.match(failed.output, /Edit 2 of 2/);
+    assert.equal(await readFile(file, "utf8"), "one\ntwo\n");
+
+    const applied = await multiEditTool.run({
+      path: file,
+      edits: [{ old_text: "one", new_text: "1" }, { old_text: "1\ntwo", new_text: "1\n2" }],
+    });
+    assert.ok(applied.ok);
+    assert.equal(await readFile(file, "utf8"), "1\n2\n");
+  });
+
+  await test("move, copy and delete can all be undone", async () => {
+    const store = checkpoints;
+    const [a, b, c] = ["undo-a.txt", "undo-b.txt", "undo-c.txt"].map(scratchFile);
+    await writeFile(a, "A");
+    store.begin("files");
+    assert.ok((await copyFileTool.run({ from: a, to: c })).ok);
+    assert.ok((await moveFileTool.run({ from: a, to: b })).ok);
+    assert.ok((await deleteFileTool.run({ path: b })).ok);
+    await store.commit();
+    await store.undoLast();
+    assert.equal(await readFile(a, "utf8"), "A", "the original is back");
+    await assert.rejects(readFile(c, "utf8"), "the copy is gone");
+  });
+
+  await test("move and copy won't overwrite unless told to, or leave the project", async () => {
+    const [a, b] = ["keep-a.txt", "keep-b.txt"].map(scratchFile);
+    await writeFile(a, "A");
+    await writeFile(b, "B");
+    assert.match((await moveFileTool.run({ from: a, to: b })).output, /already exists/);
+    assert.equal(await readFile(b, "utf8"), "B");
+    assert.ok((await copyFileTool.run({ from: a, to: b, overwrite: true })).ok);
+    assert.equal(await readFile(b, "utf8"), "A");
+    assert.match((await moveFileTool.run({ from: a, to: "../stolen.txt" })).output, /escapes/);
+    assert.match((await deleteFileTool.run({ path: ".tmp-test" })).output, /isn't a file/);
+  });
+
+  await test("file_info reports size and lines, and says when nothing's there", async () => {
+    await writeFile(scratchFile("info.txt"), "a\nb\n");
+    assert.match((await fileInfoTool.run({ path: scratchFile("info.txt") })).output, /file, 4 bytes, 3 lines/);
+    assert.match((await fileInfoTool.run({ path: scratchFile("none.txt") })).output, /does not exist/);
+  });
+
+  await test("notebook cells can be read, replaced, inserted and deleted", async () => {
+    const file = scratchFile("n.ipynb");
+    const original = {
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [
+        { id: "a", cell_type: "markdown", metadata: {}, source: ["# Title\n"] },
+        { id: "b", cell_type: "code", metadata: {}, execution_count: 3, source: ["print(1)\n", "print(2)"],
+          outputs: [{ output_type: "stream", name: "stdout", text: ["1\n2\n"] }] },
+      ],
+    };
+    await writeFile(file, JSON.stringify(original));
+
+    const { output } = await notebookReadTool.run({ path: file });
+    assert.match(output, /cell 1 \(code\)[\s\S]*print\(2\)[\s\S]*--- output ---\n1\n2/);
+
+    assert.ok((await notebookEditTool.run({ path: file, cell: 1, source: "print(3)\nprint(4)" })).ok);
+    let saved = JSON.parse(await readFile(file, "utf8"));
+    assert.deepEqual(saved.cells[1].source, ["print(3)\n", "print(4)"]);
+    assert.deepEqual(saved.cells[1].outputs, [], "stale output must not outlive the code");
+    assert.equal(saved.cells[1].execution_count, null);
+
+    assert.ok((await notebookEditTool.run({ path: file, cell: 2, mode: "insert", source: "x", cell_type: "markdown" })).ok);
+    saved = JSON.parse(await readFile(file, "utf8"));
+    assert.equal(saved.cells[2].cell_type, "markdown");
+    assert.ok(saved.cells[2].id, "format 4.5 needs a cell id");
+
+    assert.ok((await notebookEditTool.run({ path: file, cell: 0, mode: "delete" })).ok);
+    assert.equal(JSON.parse(await readFile(file, "utf8")).cells.length, 2);
+    assert.match((await notebookEditTool.run({ path: file, cell: 9, source: "x" })).output, /between 0 and 1/);
+    assert.match((await notebookReadTool.run({ path: "package.json" })).output, /isn't a .ipynb/);
+  });
+
+  await test("outlines definitions across languages, and not control flow", () => {
+    const names = (src: string) => outline(src).map((d) => `${d.kind} ${d.name}`);
+    assert.deepEqual(names("export class Foo {\n  async bar(x: string): Promise<void> {\n    if (x) {\n    }\n  }\n}"), [
+      "class Foo",
+      "method bar",
+    ]);
+    assert.deepEqual(names("def run(a):\n    pass\nclass B:\n    def go(self):\n        pass"), ["def run", "class B", "def go"]);
+    assert.deepEqual(names("func (s *Server) Start() error {\n}\nfunc main() {\n}"), ["method Start", "func main"]);
+    assert.deepEqual(names("pub fn parse() {}\nstruct Token;"), ["fn parse", "struct Token"]);
+    assert.deepEqual(names("export const add = (a, b) => a + b;"), ["function add"]);
+  });
+
+  await test("code_outline and find_symbol work on this project", async () => {
+    assert.match((await codeOutlineTool.run({ path: "src/tools/toolSearch.ts" })).output, /function createToolSearchTool/);
+    const found = await findSymbolTool.run({ name: "createToolSearchTool", references: true, glob: "src/**/*.ts" });
+    assert.match(found.output, /src.tools.toolSearch\.ts:\d+: export function createToolSearchTool/);
+    assert.match(found.output, /Used at:[\s\S]*loop\.ts/);
+    assert.match((await findSymbolTool.run({ name: "a b(" })).output, /plain identifier/);
+  });
+
+  await test("search_code shows context and can list just the files", async () => {
+    const file = scratchFile("ctx.ts");
+    const hits = await searchCode({ pattern: "createToolSearchTool\\(", glob: "src/tools/toolSearch.ts", context: 1 });
+    assert.ok(hits.hits[0].before?.length && hits.hits[0].after?.length, file);
+    const { output } = await searchCodeTool.run({ pattern: "createToolSearchTool", glob: "src/**/*.ts", filesOnly: true });
+    assert.ok(!/:\d+:/.test(output), "no line numbers in a file list");
+    assert.match(output, /loop\.ts/);
+  });
+
+  await test("git history tools read this repository", async () => {
+    assert.match((await gitLogTool.run({ count: 2 })).output.split("\n")[0], /^[0-9a-f]{7,} \d{4}-\d\d-\d\d /);
+    assert.match((await gitShowTool.run({ ref: "HEAD", stat: true })).output, /commit [0-9a-f]+/);
+    assert.match((await gitBlameTool.run({ path: "package.json", start: 1, end: 2 })).output, /gemini-code|\{/);
+  });
+
+  await test("a git ref can't smuggle in an option, which could write files", async () => {
+    const trap = scratchFile("pwned.txt");
+    assert.equal((await gitShowTool.run({ ref: `--output=${trap}` })).ok, false);
+    assert.equal((await gitLogTool.run({ ref: `--output=${trap}` })).ok, false);
+    await assert.rejects(readFile(trap, "utf8"), "no file may have been written");
+  });
+
+  await test("wait_for_output waits for a line, and reports an exit without one", async () => {
+    const start = async (script: string) => {
+      const { output } = await bashTool.run({ command: `node -e "${script}"`, background: true });
+      return /"(bg_\w+)"/.exec(output)![1];
+    };
+    const ready = await start(`setTimeout(()=>{console.log('listening on 3000');setTimeout(()=>{},300)},300)`);
+    assert.match((await waitForOutputTool.run({ id: ready, pattern: "listening", timeout_seconds: 10 })).output, /Matched: listening on 3000/);
+
+    await new Promise((r) => setTimeout(r, 5));
+    const quiet = await start(`console.log('nope')`);
+    const missed = await waitForOutputTool.run({ id: quiet, pattern: "listening", timeout_seconds: 10 });
+    assert.equal(missed.ok, false);
+    assert.match(missed.output, /without a matching line/);
+    assert.match((await waitForOutputTool.run({ id: "bg_none" })).output, /No command/);
+  });
+
+  await test("ask_user asks in the terminal, and a number picks an option", async () => {
+    await withPrompts(async (answers) => {
+      answers.push("2");
+      assert.match((await askUserTool.run({ question: "Which?", options: ["red", "blue"] })).output, /answered: blue/);
+      answers.push("green");
+      assert.match((await askUserTool.run({ question: "Which?", options: ["red"] })).output, /answered: green/);
+    });
+  });
+
+  await test("ask_user still asks under auto-approve, and copes with nobody there", async () => {
+    const prev = process.env.GEMINI_CODE_PROMPT_UNATTENDED;
+    const prevApprove = process.env.GEMINI_CODE_AUTO_APPROVE;
+    process.env.GEMINI_CODE_PROMPT_UNATTENDED = "1";
+    process.env.GEMINI_CODE_AUTO_APPROVE = "all";
+    try {
+      setAsker(async () => "yes");
+      assert.match((await askUserTool.run({ question: "Sure?" })).output, /answered: yes/);
+      setAsker(undefined);
+      const alone = await askUserTool.run({ question: "Anyone?" });
+      assert.match(alone.output, /No one is available/);
+    } finally {
+      if (prev === undefined) delete process.env.GEMINI_CODE_PROMPT_UNATTENDED;
+      else process.env.GEMINI_CODE_PROMPT_UNATTENDED = prev;
+      if (prevApprove === undefined) delete process.env.GEMINI_CODE_AUTO_APPROVE;
+      else process.env.GEMINI_CODE_AUTO_APPROVE = prevApprove;
+    }
+  });
+
+  await test("skills are listed with descriptions and read by name", async () => {
+    const dir = path.resolve(".gemini-code", "skills", "smoke-skill");
+    await mkdir(dir, { recursive: true });
+    try {
+      await writeFile(path.join(dir, "SKILL.md"), "---\nname: smoke-skill\ndescription: Does a smoke test\n---\nStep one.");
+      assert.match((await useSkillTool.run({})).output, /- smoke-skill: Does a smoke test/);
+      assert.match((await useSkillTool.run({ name: "smoke-skill" })).output, /Step one\./);
+      assert.equal((await useSkillTool.run({ name: "../../package" })).ok, false);
+    } finally {
+      await rm(path.resolve(".gemini-code"), { recursive: true, force: true });
+    }
+  });
+
+  console.log("MCP:");
+  const fixture = path.resolve("src", "tests", "fixtures", "mcp-server.mjs");
+  /** A throwaway project and home folder, so real approvals are never touched. */
+  const mcpFolders = async (servers: Record<string, unknown>, file = ".mcp.json") => {
+    const base = path.resolve(".tmp-test", `mcp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`);
+    const root = path.join(base, "project");
+    const home = path.join(base, "home");
+    await mkdir(root, { recursive: true });
+    await mkdir(home, { recursive: true });
+    await writeFile(path.join(file === ".mcp.json" ? root : home, file), JSON.stringify({ mcpServers: servers }));
+    return { root, home };
+  };
+  const stdioServer = { command: process.execPath, args: [fixture] };
+
+  await test("a project's server doesn't start until the user approves it", async () => {
+    await withPrompts(async (answers) => {
+      const { root, home } = await mcpFolders({ demo: stdioServer });
+      const declined = new McpManager(root, home);
+      answers.push("n");
+      await declined.connectAll();
+      assert.equal(declined.status[0].state, "declined");
+      assert.equal(declined.tools.length, 0);
+
+      const approved = new McpManager(root, home);
+      answers.push("y");
+      await approved.connectAll();
+      assert.equal(approved.status[0].state, "connected");
+      await approved.close();
+    });
+  });
+
+  await test("auto-approve doesn't start a project's server", async () => {
+    const { root, home } = await mcpFolders({ demo: stdioServer });
+    let asked = 0;
+    setAsker(async () => {
+      asked++;
+      return "n";
+    });
+    process.env.GEMINI_CODE_AUTO_APPROVE = "1";
+    const manager = new McpManager(root, home);
+    await manager.connectAll();
+    setAsker(undefined);
+    assert.equal(asked, 1, "the question must still be asked");
+    assert.equal(manager.status[0].state, "declined");
+  });
+
+  await test("approval is remembered, until the command changes", async () => {
+    await withPrompts(async (answers) => {
+      const { root, home } = await mcpFolders({ demo: stdioServer });
+      answers.push("y");
+      const first = new McpManager(root, home);
+      await first.connectAll();
+      await first.close();
+
+      const again = new McpManager(root, home);
+      await again.connectAll();
+      assert.equal(again.status[0].state, "connected", "no second question");
+      await again.close();
+
+      await writeFile(path.join(root, ".mcp.json"), JSON.stringify({ mcpServers: { demo: { ...stdioServer, args: [fixture, "--changed"] } } }));
+      answers.push("n");
+      const changed = new McpManager(root, home);
+      await changed.connectAll();
+      assert.equal(changed.status[0].state, "declined", "a changed command needs approving again");
+    });
+  });
+
+  await test("a personal server starts without asking", async () => {
+    const { root, home } = await mcpFolders({ mine: stdioServer }, "mcp.json");
+    const manager = new McpManager(root, home);
+    await manager.connectAll();
+    assert.equal(manager.status[0].source, "personal");
+    assert.equal(manager.status[0].state, "connected");
+    await manager.close();
+  });
+
+  await test("server tools are deferred, confirmed, and report errors and images", async () => {
+    const { root, home } = await mcpFolders({ "my server": stdioServer }, "mcp.json");
+    const manager = new McpManager(root, home);
+    await manager.connectAll();
+    const tool = (name: string) => manager.tools.find((t) => t.name === name)!;
+    assert.deepEqual(manager.status[0].tools, [
+      "mcp__my_server__add",
+      "mcp__my_server__secret_env",
+      "mcp__my_server__fail",
+      "mcp__my_server__picture",
+    ]);
+    assert.ok(manager.tools.every((t) => t.deferred));
+    assert.match(tool("mcp__my_server__add").description, /Adds two numbers[\s\S]*my server/);
+
+    assert.deepEqual(await tool("mcp__my_server__add").run({ a: 2, b: 3 }), { ok: true, output: "5" });
+    const failed = await tool("mcp__my_server__fail").run({});
+    assert.equal(failed.ok, false);
+    assert.equal(failed.output, "it broke");
+    const picture = await tool("mcp__my_server__picture").run({});
+    assert.ok(picture.attachment && (await readFile(picture.attachment)).length > 0);
+
+    await withPrompts(async (answers) => {
+      answers.push("n");
+      assert.match((await tool("mcp__my_server__add").run({ a: 1, b: 1 })).output, /declined/);
+    });
+    await manager.close();
+  });
+
+  await test("a stdio server gets only what its config names, not our secrets", async () => {
+    process.env.GEMINI_CODE_SMOKE_SECRET = "leaked";
+    const { root, home } = await mcpFolders({ s: { ...stdioServer, env: { GIVEN: "${GEMINI_CODE_SMOKE_SECRET}" } } }, "mcp.json");
+    const manager = new McpManager(root, home);
+    await manager.connectAll();
+    const env = manager.tools.find((t) => t.name.endsWith("secret_env"))!;
+    assert.equal((await env.run({ name: "GEMINI_CODE_SMOKE_SECRET" })).output, "(unset)");
+    assert.equal((await env.run({ name: "GIVEN" })).output, "leaked", "${VAR} expands when the config asks for it");
+    await manager.close();
+    delete process.env.GEMINI_CODE_SMOKE_SECRET;
+  });
+
+  await test("connects to a server over HTTP", async () => {
+    const child = spawn(process.execPath, [fixture, "--http"], { stdio: ["ignore", "pipe", "inherit"] });
+    try {
+      const url = await new Promise<string>((resolve) => child.stdout.once("data", (d) => resolve(String(d).trim())));
+      const { root, home } = await mcpFolders({ remote: { url } }, "mcp.json");
+      const manager = new McpManager(root, home);
+      await manager.connectAll();
+      assert.equal(manager.status[0].state, "connected", manager.status[0].error);
+      assert.equal((await manager.tools[0].run({ a: 4, b: 5 })).output, "9");
+      await manager.close();
+    } finally {
+      child.kill();
+    }
+  });
+
+  await test("a server that won't start is reported, and the rest still connect", async () => {
+    const { root, home } = await mcpFolders(
+      { broken: { command: "this-command-does-not-exist-anywhere" }, good: stdioServer, empty: {} },
+      "mcp.json"
+    );
+    const manager = new McpManager(root, home);
+    await manager.connectAll();
+    const state = Object.fromEntries(manager.status.map((s) => [s.name, s.state]));
+    assert.deepEqual(state, { broken: "failed", good: "connected", empty: "failed" });
+    assert.ok(manager.status.find((s) => s.name === "broken")?.error);
+    await manager.close();
+  });
+
+  await test("a broken config file is a warning, not a crash", async () => {
+    const { root, home } = await mcpFolders({});
+    await writeFile(path.join(root, ".mcp.json"), "{not json");
+    const warnings: string[] = [];
+    assert.deepEqual(loadMcpConfig(root, home, (m) => warnings.push(m)), []);
+    assert.match(warnings[0], /Ignoring/);
+  });
+
+  await test("a config saved with a BOM, as Windows PowerShell writes it, still loads", async () => {
+    const { root, home } = await mcpFolders({});
+    await writeFile(path.join(root, ".mcp.json"), "﻿" + JSON.stringify({ mcpServers: { bom: { command: "x" } } }));
+    const warnings: string[] = [];
+    assert.deepEqual(loadMcpConfig(root, home, (m) => warnings.push(m)).map((e) => e.name), ["bom"]);
+    assert.deepEqual(warnings, []);
+  });
+
+  await test("a project's server replaces a personal one of the same name", async () => {
+    const { root, home } = await mcpFolders({ same: { command: "personal" } }, "mcp.json");
+    await writeFile(path.join(root, ".mcp.json"), JSON.stringify({ mcpServers: { same: { command: "project" } } }));
+    assert.deepEqual(loadMcpConfig(root, home).map((e) => [e.source, e.config.command]), [["project", "project"]]);
+  });
+
+  await test("expands variables and defaults", () => {
+    assert.equal(expandEnv("${A}-${B:-fallback}-${C}", { A: "1" }), "1-fallback-");
+  });
+
+  await test("plan mode blocks MCP tools, whatever a server says about them", () => {
+    assert.ok(![...READ_ONLY_TOOLS].some((name) => name.startsWith("mcp__")));
+  });
+
+  console.log("Environment:");
+  const machine = (platform: NodeJS.Platform, shell: string, have: string[]): EnvironmentInfo => ({
+    platform,
+    release: "1.0",
+    arch: "x64",
+    shell,
+    commands: Object.fromEntries(["python3", "python", "node", "git", "brew"].map((c) => [c, have.includes(c)])),
+  });
+
+  await test("Windows with Git Bash: bash syntax, Windows paths", () => {
+    const text = describeEnvironment(machine("win32", "bash.exe", ["python", "node", "git"]));
+    assert.match(text, /^ENVIRONMENT: Windows 1\.0 \(x64\)/);
+    assert.match(text, /Git Bash, so write bash/);
+    assert.match(text, /C:\/Users/);
+    assert.match(text, /Python is `python`/);
+    assert.match(describeEnvironment(machine("win32", "bash.exe", ["python3", "python"])), /Python is `python`/,
+      "on Windows, python is preferred when both work");
+  });
+
+  await test("Windows with cmd or PowerShell gets their own syntax, not bash's", () => {
+    assert.match(describeEnvironment(machine("win32", "cmd.exe", [])), /write cmd: dir, del[\s\S]*no ls, rm, grep/);
+    assert.match(describeEnvironment(machine("win32", "powershell.exe", [])), /write PowerShell[\s\S]*no `&&`/);
+  });
+
+  await test("macOS is told about BSD tools, Linux about GNU ones", () => {
+    const mac = describeEnvironment(machine("darwin", "sh", ["python3", "git", "brew"]));
+    assert.match(mac, /^ENVIRONMENT: macOS/);
+    assert.match(mac, /sed -i ''/);
+    assert.match(mac, /Python is `python3`; install packages with `python3 -m pip`/);
+    assert.match(mac, /Not installed: node/);
+    assert.match(describeEnvironment(machine("linux", "sh", ["python3"])), /GNU tools/);
+  });
+
+  await test("the primer carries the real machine's environment", () => {
+    const primer = buildSystemPrimer([]);
+    const expected = { win32: "Windows", darwin: "macOS", linux: "Linux" }[process.platform as string] ?? process.platform;
+    assert.match(primer, new RegExp(`ENVIRONMENT: ${expected} `));
+    assert.match(buildSystemPrimer([], "worker"), /ENVIRONMENT:/, "workers run commands too");
+  });
+
+  await test("PATH lookup finds a command by its Windows extension, and not a missing one", async () => {
+    const dir = path.resolve(".tmp-test", "path-lookup");
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "tool.CMD"), "");
+    assert.equal(onPath("tool", { PATH: dir, PATHEXT: ".EXE;.CMD" }, "win32"), true);
+    assert.equal(onPath("absent", { PATH: dir, PATHEXT: ".EXE;.CMD" }, "win32"), false);
+  });
+
+  console.log("Skills:");
+  /** Writes files under a fresh folder. Each key is a path, each value its content. */
+  const tree = async (files: Record<string, string>) => {
+    const base = path.resolve(".tmp-test", `skill-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`);
+    for (const [name, content] of Object.entries(files)) {
+      await mkdir(path.dirname(path.join(base, name)), { recursive: true });
+      await writeFile(path.join(base, name), content);
+    }
+    await mkdir(base, { recursive: true });
+    return base;
+  };
+  /** Stands in for GitHub: a real archive, laid out the way codeload's are. */
+  const fakeGithub = async (files: Record<string, string>) => {
+    const prefixed = Object.fromEntries(Object.entries(files).map(([k, v]) => [`repo-main/${k}`, v]));
+    const base = await tree(prefixed);
+    await tree({});
+    const system = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe");
+    execFileSync(process.platform === "win32" ? system : "tar", ["-czf", path.join(base, "repo.tgz"), "-C", base, "repo-main"]);
+    return { home: await tree({}), download: async (_url: string, file: string) => writeFile(file, await readFile(path.join(base, "repo.tgz"))) };
+  };
+  const skillMd = (name: string, description: string, body = "Do the thing.") =>
+    `---\nname: ${name}\ndescription: ${description}\n---\n${body}\n`;
+
+  await test("reads every way of naming a GitHub skill", () => {
+    assert.deepEqual(parseSkillSource("anthropics/skills"), { owner: "anthropics", repo: "skills" });
+    assert.deepEqual(parseSkillSource("https://github.com/anthropics/skills.git"), { owner: "anthropics", repo: "skills" });
+    assert.deepEqual(parseSkillSource("a/b/skills/pdf"), { owner: "a", repo: "b", subpath: "skills/pdf" });
+    assert.deepEqual(parseSkillSource("a/b@v2"), { owner: "a", repo: "b", ref: "v2" });
+    assert.deepEqual(parseSkillSource("https://github.com/a/b/tree/main/skills/pdf/"), {
+      owner: "a", repo: "b", ref: "main", subpath: "skills/pdf",
+    });
+    assert.deepEqual(parseSkillSource("https://github.com/a/b/blob/dev/x/SKILL.md"), { owner: "a", repo: "b", ref: "dev", subpath: "x" });
+  });
+
+  await test("refuses anything that isn't a GitHub repository", () => {
+    for (const bad of ["", "justaname", "https://evil.example/a/b", "a/b/../../etc", "a b/c"]) {
+      assert.throws(() => parseSkillSource(bad), /isn't a GitHub repository/, bad);
+    }
+  });
+
+  await test("reads frontmatter, quoted and folded onto several lines", () => {
+    assert.deepEqual(parseFrontmatter(`---\nname: "pdf"\ndescription: >\n  Reads PDFs\n  and fills forms\nlicense: MIT\n---\nBody`), {
+      name: "pdf",
+      description: "Reads PDFs and fills forms",
+      license: "MIT",
+    });
+    assert.deepEqual(parseFrontmatter("no frontmatter here"), {});
+  });
+
+  await test("finds skills in the project, at home and in Claude's folder, project first", async () => {
+    const root = await tree({
+      ".gemini-code/skills/mine/SKILL.md": skillMd("mine", "Project one"),
+      ".claude/skills/shared/SKILL.md": skillMd("shared", "From the project"),
+    });
+    const home = await tree({ "skills/installed/SKILL.md": skillMd("installed", "Installed") });
+    const claude = await tree({
+      "skills/synced/nested/SKILL.md": skillMd("nested", "Deep in a folder"),
+      "skills/shared/SKILL.md": skillMd("shared", "From home"),
+    });
+    const found = await findSkills(root, home, claude);
+    assert.deepEqual([...found.keys()].sort(), ["installed", "mine", "nested", "shared"]);
+    assert.equal(found.get("shared")?.description, "From the project");
+    assert.equal(found.get("nested")?.source, "claude");
+  });
+
+  await test("Claude's own skills can be turned off", async () => {
+    const claude = await tree({ "skills/hidden/SKILL.md": skillMd("hidden", "Private") });
+    process.env.GEMINI_CODE_CLAUDE_SKILLS = "0";
+    try {
+      assert.equal((await findSkills(await tree({}), await tree({}), claude)).size, 0);
+    } finally {
+      delete process.env.GEMINI_CODE_CLAUDE_SKILLS;
+    }
+  });
+
+  await test("a skill loads with its folder, its files and Claude's tool names translated", async () => {
+    const root = await tree({
+      ".gemini-code/skills/pdf/SKILL.md": skillMd("pdf", "PDFs", "Run ${CLAUDE_SKILL_DIR}/scripts/go.py on $ARGUMENTS. See {baseDir}/ref.md"),
+      ".gemini-code/skills/pdf/scripts/go.py": "print(1)",
+      ".gemini-code/skills/pdf/ref.md": "reference",
+    });
+    const skill = (await findSkills(root, await tree({}), await tree({}))).get("pdf")!;
+    const text = await renderSkill(skill, "invoice.pdf");
+    const dir = skill.dir!.split(path.sep).join("/");
+    assert.ok(text.includes(`Run ${dir}/scripts/go.py on invoice.pdf. See ${dir}/ref.md`), text);
+    assert.match(text, /It bundles: .*scripts\/go\.py/);
+    assert.match(text, /Read=read_file/);
+    assert.ok(!text.includes("description: PDFs"), "the frontmatter isn't instructions");
+  });
+
+  await test("arguments reach a skill that doesn't ask for them by name", async () => {
+    const root = await tree({ ".gemini-code/skills/plain/SKILL.md": skillMd("plain", "x") });
+    const skill = (await findSkills(root, await tree({}), await tree({}))).get("plain")!;
+    assert.match(await renderSkill(skill, "extra"), /Arguments given: extra/);
+  });
+
+  await test("use_skill reads bundled files, and only those", async () => {
+    const dir = path.resolve(".gemini-code", "skills", "bundle");
+    await mkdir(path.join(dir, "refs"), { recursive: true });
+    try {
+      await writeFile(path.join(dir, "SKILL.md"), skillMd("bundle", "x"));
+      await writeFile(path.join(dir, "refs", "a.md"), "bundled text");
+      assert.equal((await useSkillTool.run({ name: "bundle", file: "refs/a.md" })).output, "bundled text");
+      for (const file of ["../../../package.json", "..", "missing.md", path.resolve("package.json")]) {
+        assert.equal((await useSkillTool.run({ name: "bundle", file })).ok, false, file);
+      }
+    } finally {
+      await rm(path.resolve(".gemini-code"), { recursive: true, force: true });
+    }
+  });
+
+  await test("discovering a repo installs nothing, and shows what it would run", async () => {
+    const github = await fakeGithub({
+      "README.md": "not a skill",
+      "skills/pdf/SKILL.md": skillMd("pdf", "Reads PDFs"),
+      "skills/pdf/scripts/fill.py": "x",
+      "skills/docx/SKILL.md": skillMd("docx", "Reads Word files"),
+    });
+    const found = await discoverSkills("a/b", github);
+    assert.deepEqual(found.map((s) => s.name), ["docx", "pdf"]);
+    assert.deepEqual(found[1].scripts, ["scripts/fill.py"]);
+    assert.deepEqual(await listInstalled(github.home), []);
+  });
+
+  await test("installs what's chosen, with its files, and won't guess among several", async () => {
+    const github = await fakeGithub({
+      "skills/pdf/SKILL.md": skillMd("pdf", "Reads PDFs"),
+      "skills/pdf/scripts/fill.py": "print('fill')",
+      "skills/docx/SKILL.md": skillMd("docx", "Reads Word files"),
+    });
+    await assert.rejects(installSkills("a/b", [], github), /has 2 skills, so choose/);
+    await assert.rejects(installSkills("a/b", ["nope"], github), /Not in that repository: nope/);
+
+    await installSkills("a/b", ["pdf"], github);
+    const installed = await listInstalled(github.home);
+    assert.deepEqual(installed.map((s) => [s.name, s.source]), [["pdf", "a/b"]]);
+    assert.equal(await readFile(path.join(github.home, "skills", "pdf", "scripts", "fill.py"), "utf8"), "print('fill')");
+  });
+
+  await test("a repo that is one skill, or one folder of a repo, installs directly", async () => {
+    const single = await fakeGithub({ "SKILL.md": "# no frontmatter", "helper.md": "x" });
+    assert.deepEqual((await installSkills("me/my-skill", [], single)).map((s) => s.name), ["my-skill"]);
+
+    const many = await fakeGithub({ "x/one/SKILL.md": skillMd("one", "1"), "x/two/SKILL.md": skillMd("two", "2") });
+    assert.deepEqual((await installSkills("a/b/x/two", [], many)).map((s) => s.name), ["two"]);
+    await assert.rejects(installSkills("a/b/missing", [], many), /no folder "missing"/);
+  });
+
+  await test("reinstalling replaces the old copy, and removing deletes only that skill", async () => {
+    const first = await fakeGithub({ "SKILL.md": skillMd("demo", "v1"), "old.md": "x" });
+    await installSkills("a/demo", [], first);
+    const second = await fakeGithub({ "SKILL.md": skillMd("demo", "v2") });
+    await installSkills("a/demo", [], { ...second, home: first.home });
+    assert.equal((await listInstalled(first.home))[0].description, "v2");
+    await assert.rejects(readFile(path.join(first.home, "skills", "demo", "old.md"), "utf8"));
+
+    await assert.rejects(removeSkill("other", first.home), /isn't installed/);
+    await removeSkill("demo", first.home);
+    assert.deepEqual(await listInstalled(first.home), []);
+  });
+
+  await test("a skill's name can't put it outside the skills folder", async () => {
+    const github = await fakeGithub({ "SKILL.md": skillMd("../../escaped", "x") });
+    await installSkills("a/b", [], github);
+    await assert.rejects(readFile(path.join(github.home, "..", "escaped", "SKILL.md"), "utf8"));
+    assert.equal((await listInstalled(github.home)).length, 1);
+  });
+
+  await test("a repo with no skills says so", async () => {
+    const github = await fakeGithub({ "README.md": "nothing" });
+    await assert.rejects(installSkills("a/b", [], github), /No skills found/);
+  });
+
+  await test("nothing Gemini can call installs a skill", () => {
+    assert.ok(!tools.some((t) => /install|skill_add/i.test(t.name)));
+    assert.ok(!READ_ONLY_TOOLS.has("skill_install"));
+  });
+
+  await test("the context lists skills, and caps how many", () => {
+    const skills = Array.from({ length: 45 }, (_, i) => ({ name: `s${i}`, description: "d".repeat(500) }));
+    const doc = buildContextDocument({ skills })!;
+    assert.match(doc, /load it with use_skill/);
+    assert.match(doc, /- s39:/);
+    assert.ok(!doc.includes("- s40:"));
+    assert.match(doc, /5 more/);
+    assert.ok(!doc.includes("d".repeat(300)), "a long description is cut");
+  });
+
+  console.log("Desktop bridge:");
+  const bridgeFixture = (replies: GeminiResponse[]) => {
+    const events: BridgeEvent[] = [];
+    const calls: string[] = [];
+    const session = new AgentSession(new FakeDriver(replies));
+    const host: BridgeHost = {
+      runTask: (task, options) => session.runTask(task, options),
+      latestMarkdown: async () => "",
+      listModels: async () => {
+        calls.push("list");
+        return { models: [], thinking: [], current: "Gemini Auto" };
+      },
+      setModel: async (name) => {
+        calls.push(`model start ${name}`);
+        await new Promise((r) => setTimeout(r, 5));
+        calls.push(`model end ${name}`);
+      },
+      setThinkingLevel: async () => undefined,
+      newThread: async () => undefined,
+      setPlanMode: (on) => session.setPlanMode(on),
+      inPlanMode: () => session.inPlanMode,
+      connectMcp: async () => undefined,
+      mcpStatus: () => [],
+      listGems: async () => [],
+      setGem: async (name) => name,
+      markInterrupted: async () => undefined,
+      shutdown: async () => undefined,
+    };
+    const bridge = new Bridge(host, (e) => void events.push(e));
+    const send = (command: Record<string, unknown>) => bridge.handleLine(JSON.stringify(command));
+    const ofType = (type: string) => events.filter((e) => e.type === type);
+    const until = async (type: string) => {
+      while (!ofType(type).length) await new Promise((r) => setTimeout(r, 2));
+      return ofType(type)[0];
+    };
+    return { bridge, events, calls, send, ofType, until };
+  };
+  const withConfirmations = async (fn: () => Promise<void>) => {
+    delete process.env.GEMINI_CODE_AUTO_APPROVE;
+    try {
+      await fn();
+    } finally {
+      process.env.GEMINI_CODE_AUTO_APPROVE = "1";
+      setAsker(undefined);
+    }
+  };
+
+  await test("sorts the loop's log lines, worker tags included", () => {
+    assert.deepEqual(classifyActivity("⏺ read_file(a.ts)"), { kind: "tool", text: "read_file(a.ts)", worker: undefined });
+    assert.equal(classifyActivity("[api] ⏺ run_bash(ls)").worker, "api");
+    assert.equal(classifyActivity("[api]   ⎿ 3 lines (40 B)").kind, "detail");
+    assert.equal(classifyActivity("  ⎿ Exit code 1").failed, true);
+    assert.equal(classifyActivity("[api] opening tab…").kind, "note");
+  });
+
+  await test("reads the label and detail out of a confirmation question", () => {
+    const q = parseQuestion("\n[gemini-code] Run this command?\n  npm test\n  (y/N) ");
+    assert.deepEqual(q, { label: "Run this command?", detail: "npm test" });
+  });
+
+  await test("runs a task and reports tools, then the answer, then the end", async () => {
+    const { bridge, send, ofType } = bridgeFixture([
+      toolCallResponse("list_files", { path: "." }),
+      finalResponse("All done."),
+    ]);
+    await send({ id: 1, cmd: "task", text: "look around" });
+    await bridge.idle();
+    assert.deepEqual(ofType("reply")[0], { type: "reply", id: 1, ok: true, data: undefined });
+    assert.ok(ofType("activity").some((e) => e.kind === "tool" && String(e.text).startsWith("list_files")));
+    assert.equal(ofType("answer")[0].text, "All done.");
+    assert.equal(ofType("task_end")[0].status, "done");
+  });
+
+  await test("a plain question keeps its real answer, not just the nudge's reply", async () => {
+    process.env.GEMINI_CODE_IDLE_NUDGES = "1";
+    try {
+      const { bridge, send, ofType } = bridgeFixture([
+        finalResponse("Paris is the capital of France."),
+        finalResponse("That answer is complete."),
+      ]);
+      await send({ cmd: "task", text: "capital of France?" });
+      await bridge.idle();
+      const answers = ofType("answer");
+      assert.equal(answers[0].text, "Paris is the capital of France.");
+      assert.equal(answers[0].interim, true);
+      assert.equal(answers[1].text, "That answer is complete.");
+    } finally {
+      process.env.GEMINI_CODE_IDLE_NUDGES = "0";
+    }
+  });
+
+  await test("a confirmation waits for the UI, and only that request is answered", async () => {
+    await withConfirmations(async () => {
+      const target = path.join(".tmp-test", "bridge-approved.txt");
+      const { bridge, send, ofType, until } = bridgeFixture([
+        toolCallResponse("write_file", { path: target, content: "hi" }),
+        finalResponse("Wrote it."),
+      ]);
+      await send({ cmd: "task", text: "write it" });
+      const ask = await until("confirm");
+      assert.match(String(ask.label), /write/i);
+
+      await send({ id: 2, cmd: "confirm", confirm_id: Number(ask.id) + 1, approve: true });
+      assert.equal(ofType("reply").at(-1)?.ok, false, "a stale id must not approve anything");
+
+      await send({ id: 3, cmd: "confirm", confirm_id: ask.id, approve: true });
+      await bridge.idle();
+      assert.equal(await readFile(target, "utf8"), "hi");
+    });
+  });
+
+  await test("stop refuses the pending confirmation and ends at the next turn", async () => {
+    await withConfirmations(async () => {
+      const target = path.join(".tmp-test", "bridge-stopped.txt");
+      const { bridge, send, ofType, until } = bridgeFixture([
+        toolCallResponse("write_file", { path: target, content: "no" }),
+        finalResponse("should never be read"),
+      ]);
+      await send({ cmd: "task", text: "write it" });
+      await until("confirm");
+      await send({ cmd: "stop" });
+      await bridge.idle();
+      assert.equal(ofType("task_end")[0].status, "stopped");
+      assert.equal(ofType("confirm_closed").length, 1);
+      await assert.rejects(readFile(target, "utf8"), "the refused write must not have happened");
+    });
+  });
+
+  await test("refuses commands that would disturb a running task", async () => {
+    await withConfirmations(async () => {
+      const { bridge, send, ofType, until } = bridgeFixture([
+        toolCallResponse("write_file", { path: path.join(".tmp-test", "bridge-busy.txt"), content: "x" }),
+        finalResponse("Done."),
+      ]);
+      await send({ cmd: "task", text: "write it" });
+      const ask = await until("confirm");
+      await send({ id: 9, cmd: "new_chat" });
+      assert.match(String(ofType("reply").at(-1)?.error), /while a task is running/);
+      await send({ cmd: "confirm", confirm_id: ask.id, approve: false });
+      await bridge.idle();
+    });
+  });
+
+  await test("commands that use the tab's menus run one at a time", async () => {
+    const { calls, send } = bridgeFixture([]);
+    await Promise.all([send({ cmd: "model", text: "Auto" }), send({ cmd: "model", text: "Pro" })]);
+    assert.deepEqual(calls, ["model start Auto", "model end Auto", "list", "model start Pro", "model end Pro", "list"]);
+    setAsker(undefined);
+  });
+
+  await test("a question waits for the user, and stale answers are refused", async () => {
+    const { bridge, send, ofType, until } = bridgeFixture([
+      toolCallResponse("tool_search", { query: "select:ask_user" }),
+      toolCallResponse("ask_user", { question: "Which database?", options: ["Postgres", "SQLite"] }),
+      finalResponse("Going with SQLite."),
+    ]);
+    await send({ cmd: "task", text: "set up storage" });
+    const asked = await until("question");
+    assert.deepEqual(asked.options, ["Postgres", "SQLite"]);
+    await send({ id: 2, cmd: "answer", question_id: Number(asked.id) + 1, text: "SQLite" });
+    assert.equal(ofType("reply").at(-1)?.ok, false);
+    await send({ cmd: "answer", question_id: asked.id, text: "SQLite" });
+    await bridge.idle();
+    assert.equal(ofType("question_closed")[0].answer, "SQLite");
+    assert.equal(ofType("answer")[0].text, "Going with SQLite.");
+    setAsker(undefined);
+    setQuestioner(undefined);
+  });
+
+  await test("stop closes a pending question", async () => {
+    const { bridge, send, ofType, until } = bridgeFixture([
+      toolCallResponse("tool_search", { query: "select:ask_user" }),
+      toolCallResponse("ask_user", { question: "Which?" }),
+      finalResponse("never read"),
+    ]);
+    await send({ cmd: "task", text: "go" });
+    await until("question");
+    await send({ cmd: "stop" });
+    await bridge.idle();
+    assert.equal(ofType("task_end")[0].status, "stopped");
+    setAsker(undefined);
+    setQuestioner(undefined);
+  });
+
+  await test("task_end reports plan mode, which the model can end itself", async () => {
+    const { bridge, send, ofType } = bridgeFixture([
+      toolCallResponse("tool_search", { query: "select:exit_plan_mode" }),
+      toolCallResponse("exit_plan_mode", { plan: "Do it." }),
+      finalResponse("Done."),
+    ]);
+    await send({ id: 1, cmd: "plan_mode", on: true });
+    await send({ cmd: "task", text: "plan it" });
+    await bridge.idle();
+    assert.equal(ofType("task_end")[0].planMode, false);
+    setAsker(undefined);
+    setQuestioner(undefined);
+  });
+
+  await test("bad input gets an error reply rather than killing the bridge", async () => {
+    const { bridge, send, ofType } = bridgeFixture([]);
+    await bridge.handleLine("not json");
+    await send({ id: 1, cmd: "nonsense" });
+    assert.equal(ofType("reply").length, 2);
+    assert.ok(ofType("reply").every((r) => r.ok === false));
+    setAsker(undefined);
   });
 
   console.log("Context (tree + memory):");

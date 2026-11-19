@@ -4,6 +4,8 @@ dist/
 .gemini-code-tmp/
 .tmp-test/
 *.log
+__pycache__/
+ui/test_geminicode/
 
 # Runtime state this tool generates in whatever project it runs in.
 # Ignored HERE because they're just artifacts of testing the tool on itself.

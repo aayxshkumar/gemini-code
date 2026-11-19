@@ -1,5 +1,5 @@
 import readline from "node:readline/promises";
-import { getAsker } from "../ui/prompt.js";
+import { getAsker, getQuestioner } from "../ui/prompt.js";
 
 /**
  * Serializes prompts. With parallel worker tabs, several tools can want
@@ -38,31 +38,69 @@ export function autoApproved(kind: ActionKind, env = process.env.GEMINI_CODE_AUT
   return kinds.some((k) => names[kind].includes(k));
 }
 
+/** True when nobody can answer a prompt: no terminal and no front end (the desktop app) asking for us. */
+export function unattended(): boolean {
+  return !process.stdin.isTTY && !getQuestioner() && process.env.GEMINI_CODE_PROMPT_UNATTENDED !== "1";
+}
+
 /**
  * Shared y/N confirmation gate for any tool that takes a side-effecting
  * local action. One place so they stay in sync, and one escape-hatch env
  * var. Read at call time, not module load, so tests/scripts can toggle it
  * per-invocation.
+ *
+ * The third argument is the action's kind, or `{ kind, always }`: `always`
+ * is for trust decisions, which auto-approve must not make for the user.
  */
-export async function confirmAction(promptLabel: string, detail: string, kind: ActionKind = "command"): Promise<boolean> {
-  if (autoApproved(kind)) return true;
+export async function confirmAction(
+  promptLabel: string,
+  detail: string,
+  kindOrOpts: ActionKind | { kind?: ActionKind; always?: boolean } = "command"
+): Promise<boolean> {
+  const opts = typeof kindOrOpts === "string" ? { kind: kindOrOpts } : kindOrOpts;
+  const kind = opts.kind ?? "command";
+  if (!opts.always && autoApproved(kind)) return true;
 
   // Unattended (piped stdin, CI, a script): nobody can type "y", so a
   // question would hang the run until a timeout. Decline at once and say
   // how to allow it — the model gets the same message and can adapt.
   // GEMINI_CODE_PROMPT_UNATTENDED=1 keeps asking anyway, for callers that
-  // deliberately pipe answers in (and for the tests).
-  if (!process.stdin.isTTY && process.env.GEMINI_CODE_PROMPT_UNATTENDED !== "1") {
+  // deliberately pipe answers in (and for the tests). The desktop app runs
+  // us with piped stdin but answers through its questioner, so it counts
+  // as attended.
+  if (unattended()) {
     console.log(
       `\n[gemini-code] ${promptLabel} — declined automatically: no terminal to confirm in.\n` +
         `  ${detail.split("\n")[0]}\n` +
-        `  Allow this kind of action unattended with GEMINI_CODE_AUTO_APPROVE=${kind === "edit" ? "edits" : kind === "command" ? "edits,commands" : "all"}.`
+        (opts.always
+          ? `  This is a trust decision and is never approved automatically.`
+          : `  Allow this kind of action unattended with GEMINI_CODE_AUTO_APPROVE=${kind === "edit" ? "edits" : kind === "command" ? "edits,commands" : "all"}.`)
     );
     return false;
   }
 
   const run = queue.then(() => ask(promptLabel, detail));
   // Keep the chain alive even if one prompt rejects.
+  queue = run.catch(() => undefined);
+  return run;
+}
+
+/**
+ * Asks the user a question and returns the reply, or undefined when nobody is
+ * there to answer. In the same queue as confirmations, and unaffected by
+ * auto-approve: that skips permission, and an answer isn't a permission.
+ */
+export function askQuestion(question: string, options: string[] = []): Promise<string | undefined> {
+  const run = queue.then(async () => {
+    const questioner = getQuestioner();
+    if (questioner) return questioner(question, options);
+
+    const asker = getAsker();
+    if (!asker) return undefined;
+    const choices = options.map((option, i) => `  ${i + 1}. ${option}\n`).join("");
+    const answer = (await asker(`\n[gemini-code] ${question}\n${choices}  > `)).trim();
+    return options[Number(answer) - 1] ?? answer;
+  });
   queue = run.catch(() => undefined);
   return run;
 }
@@ -91,7 +129,7 @@ async function ask(promptLabel: string, detail: string): Promise<boolean> {
 
 /** What the model is told when an action wasn't approved. */
 export function declinedMessage(what: string, kind: ActionKind): string {
-  if (!process.stdin.isTTY && process.env.GEMINI_CODE_PROMPT_UNATTENDED !== "1") {
+  if (unattended()) {
     return (
       `Not allowed: this session is unattended (no terminal), so nobody could approve the request to ${what}, ` +
       `and ${kind === "edit" ? "file changes" : kind === "command" ? "shell commands" : "network requests"} are not ` +

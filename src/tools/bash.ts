@@ -52,7 +52,7 @@ export function resolveShell(): string | true {
 }
 
 const SHELL = resolveShell();
-const SHELL_NAME =
+export const SHELL_NAME =
   SHELL === true ? (IS_WINDOWS ? "cmd.exe" : "sh") : (SHELL.split(/[\\/]/).pop() ?? SHELL);
 export const SHELL_FLAVOUR: "bash" | "powershell" | "cmd" = /bash/i.test(SHELL_NAME)
   ? "bash"
@@ -493,6 +493,57 @@ export const checkOutputTool: ToolDefinition = {
         : "";
 
     return { ok: true, output: `${header}\n\n${body || "(no output yet)"}${hint}` };
+  },
+};
+
+const MAX_WAIT_SECONDS = 120;
+const WAIT_POLL_MS = 500;
+
+export const waitForOutputTool: ToolDefinition = {
+  name: "wait_for_output",
+  description:
+    `wait_for_output(args: {id: string, pattern?: string, timeout_seconds?: number}) -> waits for a background ` +
+    `command, until a line matches 'pattern' (a regular expression, like "listening on|ready") or, with no pattern, ` +
+    `until it exits. Use it instead of checking a dev server over and over. Gives up after timeout_seconds ` +
+    `(default 30, at most ${MAX_WAIT_SECONDS}).`,
+  async run(args) {
+    const id = String(args.id ?? "");
+    const proc = backgroundProcesses.get(id);
+    if (!proc) {
+      return { ok: false, output: `No command "${id}". Known: ${[...backgroundProcesses.keys()].join(", ") || "(none)"}` };
+    }
+
+    let pattern: RegExp | undefined;
+    try {
+      pattern = args.pattern ? new RegExp(String(args.pattern), "i") : undefined;
+    } catch (err) {
+      return { ok: false, output: `Invalid 'pattern' regular expression: ${(err as Error).message}` };
+    }
+
+    const seconds = Math.min(Math.max(Number(args.timeout_seconds) || 30, 1), MAX_WAIT_SECONDS);
+    const deadline = Date.now() + seconds * 1000;
+    while (true) {
+      let content = "";
+      try {
+        content = readFileSync(proc.logPath, "utf8");
+      } catch {
+        /* no output written yet */
+      }
+      const hit = pattern ? toLines(content).find((line) => pattern.test(line)) : undefined;
+      if (hit !== undefined) return { ok: true, output: `Matched: ${hit.trim().slice(0, 300)}` };
+      if (proc.exitCode !== null) {
+        return {
+          ok: !pattern && proc.exitCode === 0,
+          output:
+            `"${id}" exited with code ${proc.exitCode}` +
+            `${pattern ? " without a matching line" : ""}.\n${summarizeLog(content, proc.exitCode).text}`,
+        };
+      }
+      if (Date.now() >= deadline) {
+        return { ok: false, output: `Gave up after ${seconds}s: "${id}" is still running. check_output shows what it has printed.` };
+      }
+      await new Promise((r) => setTimeout(r, WAIT_POLL_MS));
+    }
   },
 };
 

@@ -103,7 +103,7 @@ export async function runParallelTasks(
           const retryNote = attempt > 0 ? c.yellow(` (retry ${attempt}/${retries})`) : "";
           log(`${tag} ${c.dim("opening tab…")}${retryNote}`);
           tab = await parent.spawnTab(task.name);
-          if (modelAlias) await tab.setModel(modelAlias).catch(() => undefined);
+          if (modelAlias) await tab.setModelWithFallback(modelAlias).catch(() => undefined);
 
           const session = createSession(tab, context);
           const answer = await session.runTask(task.prompt, (msg) => log(`${tag} ${msg}`));

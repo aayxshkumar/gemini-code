@@ -31,6 +31,80 @@ function truncate(text: string): string {
     : text;
 }
 
+/**
+ * A ref comes from the model and goes in git's argument list, where something
+ * like "--output=file" is an option, and turns a read-only tool into a write.
+ */
+function badRef(ref: string): boolean {
+  return ref.startsWith("-");
+}
+
+export const gitLogTool: ToolDefinition = {
+  name: "git_log",
+  description:
+    `git_log(args: {count?: number, path?: string, grep?: string, author?: string, ref?: string}) -> commit history, ` +
+    `one line each: hash, date, author, subject. 'path' limits it to one file or folder and 'grep' searches messages. ` +
+    `Shows the last 20 by default.`,
+  async run(args) {
+    const ref = typeof args.ref === "string" ? args.ref.trim() : "";
+    if (badRef(ref)) return { ok: false, output: `Error: "${ref}" isn't a ref.` };
+    const count = Math.min(Math.max(Number(args.count) || 20, 1), 200);
+
+    const argv = ["log", `-n${count}`, "--date=short", "--pretty=format:%h %ad %an: %s"];
+    if (typeof args.grep === "string" && args.grep) argv.push(`--grep=${args.grep}`, "-i");
+    if (typeof args.author === "string" && args.author) argv.push(`--author=${args.author}`);
+    if (ref) argv.push(ref);
+    if (typeof args.path === "string" && args.path.trim()) argv.push("--", args.path.trim());
+
+    const result = await git(argv);
+    if (!result.ok) return { ok: false, output: `git log failed: ${result.out.trim()}` };
+    return { ok: true, output: result.out.trim() || "No commits found." };
+  },
+};
+
+export const gitShowTool: ToolDefinition = {
+  name: "git_show",
+  description:
+    `git_show(args: {ref: string, path?: string, stat?: boolean}) -> one commit's message and diff. 'stat' gives just ` +
+    `the files and line counts, 'path' limits it to one file.`,
+  async run(args) {
+    const ref = String(args.ref ?? "").trim();
+    if (!ref || badRef(ref)) return { ok: false, output: "Error: 'ref' must be a commit, such as a hash or HEAD~1." };
+
+    const argv = ["show", "--date=short"];
+    if (args.stat) argv.push("--stat");
+    argv.push(ref);
+    if (typeof args.path === "string" && args.path.trim()) argv.push("--", args.path.trim());
+
+    const result = await git(argv);
+    if (!result.ok) return { ok: false, output: `git show failed: ${result.out.trim()}` };
+    return { ok: true, output: truncate(result.out.trim()) };
+  },
+};
+
+export const gitBlameTool: ToolDefinition = {
+  name: "git_blame",
+  description:
+    `git_blame(args: {path: string, start?: number, end?: number}) -> who last changed each line of a file and in ` +
+    `which commit. Give a line range when you can: a whole file is long.`,
+  async run(args) {
+    const file = String(args.path ?? "").trim();
+    if (!file) return { ok: false, output: "Error: 'path' is required." };
+
+    const argv = ["blame", "--date=short"];
+    const start = Number(args.start);
+    if (Number.isInteger(start) && start > 0) {
+      const end = Number(args.end);
+      argv.push(`-L${start},${Number.isInteger(end) && end >= start ? end : ""}`);
+    }
+    argv.push("--", file);
+
+    const result = await git(argv);
+    if (!result.ok) return { ok: false, output: `git blame failed: ${result.out.trim()}` };
+    return { ok: true, output: truncate(result.out.trim()) };
+  },
+};
+
 export const gitStatusTool: ToolDefinition = {
   name: "git_status",
   description:

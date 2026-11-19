@@ -20,3 +20,16 @@ export function setAsker(fn: Asker | undefined): void {
 export function getAsker(): Asker | undefined {
   return asker;
 }
+
+/** A question with choices, for a front end that can show them as choices. */
+export type Questioner = (question: string, options: string[]) => Promise<string>;
+
+let questioner: Questioner | undefined;
+
+export function setQuestioner(fn: Questioner | undefined): void {
+  questioner = fn;
+}
+
+export function getQuestioner(): Questioner | undefined {
+  return questioner;
+}

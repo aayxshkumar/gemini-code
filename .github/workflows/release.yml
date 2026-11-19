@@ -1,25 +1,97 @@
-# Pushing a tag like v0.8.0 builds the release tarball and attaches it to a
-# GitHub release, which is what `install.sh` / `install.ps1` download. With
-# no release published, the installers fall back to building from source.
-name: release
+# Pushing a tag like v0.10.0 tests it, builds every download and publishes a release.
+# Changing this pipeline does a dry run on the branch: everything but publishing.
+#
+# The tarball isn't optional: install.sh and install.ps1 look for a .tar.gz on the
+# latest release, so a release without one would break them.
+name: Release
+
 on:
   push:
     tags: ["v*"]
-permissions:
-  contents: write
+    branches: ["**"]
+    # Applies to the branches only: GitHub ignores it for tags.
+    paths:
+      - .github/workflows/release.yml
+      - ui/build_exe.ps1
+      - ui/build_mac.sh
+      - scripts/package-release.sh
+
 jobs:
-  release:
+  tarball:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm test
-      - run: npm run package
-      - uses: softprops/action-gh-release@v2
+      - run: bash scripts/package-release.sh
+      - uses: actions/upload-artifact@v4
         with:
-          files: .release/*.tar.gz
-          generate_release_notes: true
+          name: tarball
+          path: .release/*.tar.gz
+          if-no-files-found: error
+          # .release counts as hidden, and hidden paths are skipped by default.
+          include-hidden-files: true
+
+  exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci
+      - run: npm test
+      - run: pip install -r ui/requirements-build.txt
+      - run: python ui/tests/test_app.py
+      - run: ./ui/build_exe.ps1 -Python python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exe
+          path: .release/exe/gemini-code.exe
+          if-no-files-found: error
+          include-hidden-files: true
+
+  # Apple Silicon. Intel Macs can use the tarball and install.sh.
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci
+      - run: npm test
+      - run: pip install -r ui/requirements-build.txt
+      - run: python ui/tests/test_app.py
+      - run: PYTHON=python bash ui/build_mac.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: .release/mac/*.zip
+          if-no-files-found: error
+          include-hidden-files: true
+
+  publish:
+    needs: [tarball, exe, mac]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" gemini-code.exe gemini-code-macos-*.zip *.tar.gz --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

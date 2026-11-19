@@ -17,7 +17,12 @@ export interface ToolResult {
 
 export interface ToolDefinition {
   name: string;
-  /** Shown to Gemini in the priming prompt so it knows the tool exists and its args. */
+  /** Gemini's only documentation of the tool: what it does and its args. */
   description: string;
+  /**
+   * Left out of the primer, which names it and nothing more. Gemini reads the
+   * description when it wants the tool, through tool_search.
+   */
+  deferred?: boolean;
   run(args: Record<string, unknown>): Promise<ToolResult>;
 }

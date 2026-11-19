@@ -10,7 +10,8 @@ import { GeminiDriver, type Gem } from "./driver/GeminiDriver.js";
 import { gemFlag, gemModeFlag, modelFlag, chooseModelFlag, serveArgs } from "./args.js";
 import { startServer } from "./server/openai.js";
 import { installDialogRaceGuard } from "./driver/processGuards.js";
-import { AgentSession } from "./agent/loop.js";
+import { createMainSession } from "./agent/mainSession.js";
+import { runBridge } from "./bridge/run.js";
 import { buildProjectTree } from "./context/projectTree.js";
 import { collectProjectDocs, collectRootSummaryDocs, type ProjectDoc } from "./context/projectDocs.js";
 import { addRoot, extraRoots, rootsFromArgs, displayPath } from "./workspace.js";
@@ -31,14 +32,13 @@ import { readConfigFile, userConfigPath, writeUserConfig } from "./config.js";
 import type { PickerEntry } from "./driver/GeminiDriver.js";
 import { tools } from "./tools/index.js";
 import { killAllBackgroundProcesses } from "./tools/bash.js";
-import { createDelegateTool, MAX_PARALLEL_WORKERS } from "./agent/workers.js";
+import { McpManager, MCP_CONFIG_FILENAME } from "./tools/mcp.js";
+import { discoverSkills, installSkills, listInstalled, removeSkill } from "./tools/skillInstall.js";
+import { findSkills, skillSummaries } from "./tools/skills.js";
+import { MAX_PARALLEL_WORKERS } from "./agent/workers.js";
 import { createAskGemTool } from "./tools/askGem.js";
 import type { ToolDefinition } from "./types.js";
 import { PlanJournal, findResumablePlan, readPlan, clearPlan, resumeTaskText, PLAN_FILENAME } from "./context/plan.js";
-import { createUpdatePlanTool } from "./tools/updatePlan.js";
-import { createScreenshotTool } from "./tools/screenshot.js";
-import { createBrowsePageTool } from "./tools/browsePage.js";
-import { createBrowserTools } from "./tools/browser.js";
 import { checkpoints } from "./context/checkpoint.js";
 import { readClipboardImageDetailed, isImagePath, normalizeDroppedPath } from "./context/clipboard.js";
 import { existsSync } from "node:fs";
@@ -89,6 +89,7 @@ ${modelHelp()
   ${c.cyan("/memory")}           show ${MEMORY_FILENAME}
   ${c.cyan("/remember <note>")}  append a note to ${MEMORY_FILENAME}
   ${c.cyan("/tools")}            list tools available to Gemini
+  ${c.cyan("/mcp")}              show MCP servers
   ${c.cyan("/help")}             this message
   ${c.cyan("/exit")}             quit (or Ctrl+C)
 
@@ -124,7 +125,7 @@ import * as modelsModule from "./driver/models.js";
 async function chooseModelInteractively(driver: GeminiDriver, current: string | undefined): Promise<string | undefined> {
   let entries: PickerEntry[];
   try {
-    entries = await driver.listModels();
+    entries = await driver.listPickerEntries();
   } catch (err) {
     console.log(c.yellow(`Couldn't read the model picker: ${(err as Error).message.split("\n")[0]}`));
     return current;
@@ -288,7 +289,7 @@ async function main() {
     : DEFAULT_EXTENDED_THINKING;
   let modelName = "unknown";
   try {
-    modelName = await driver.setModel(startModel, {
+    modelName = await driver.setModelWithFallback(startModel, {
       onFallback: (wanted, got) =>
         console.log(c.yellow(`${wanted} isn't in this account's model picker — using ${got} instead.`)),
     });
@@ -298,7 +299,8 @@ async function main() {
     // The Thinking level submenu (where the picker has one) is what decides
     // how hard Auto thinks; the account default is Low.
     try {
-      const level = await driver.setThinkingLevel(wantLevel);
+      await driver.setThinkingLevel(wantLevel);
+      const level = wantLevel;
       levelNote = `\n  ${c.dim("thinking")} level ${level}`;
     } catch {
       // No such submenu on this picker — nothing to set.
@@ -331,7 +333,7 @@ ${c.magenta(glyph.star)} ${c.bold("gemini-code")} ${c.dim(`v${VERSION} — Claud
         : ""
   }
   ${c.dim("context")} project tree (${tree.split("\n").length} lines)${memory ? `, ${MEMORY_FILENAME}` : ""}${docs.length ? `, ${docs.length} doc${docs.length > 1 ? "s" : ""} (${docs.map((d) => d.path).join(", ")})` : ""}
-  ${c.dim("tools")}   ${[...tools.map((t) => t.name), "delegate_tasks", "update_plan", "screenshot_page", "read_page", "browser_open", "browser_do", ...(gemConsultant ? ["ask_gem"] : [])].join(", ")}
+  ${c.dim("tools")}   ${tools.filter((t) => !t.deferred).map((t) => t.name).join(", ")}, ${c.dim("and more loaded on demand")}
   ${c.dim("workers")} up to ${MAX_PARALLEL_WORKERS} parallel Gemini tabs${
     roots.length ? `\n  ${c.dim("roots")}   + ${roots.map((r) => r.display).join(", ")} ${c.dim("(--add-dir)")}` : ""
   }
@@ -353,53 +355,20 @@ ${created ? `\n  ${c.green(glyph.ok)} created ${MEMORY_FILENAME} for durable pro
 ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing while a task runs steers it.")}
 `);
 
-  /**
-   * The main tab can delegate subtasks to parallel worker tabs. Workers get
-   * the same context and tools but NOT this one, so delegation can't nest.
-   */
   const journal = new PlanJournal();
-  const makeMainSession = (mem: string | undefined, resumePlan?: string) => {
-    const ctx = { tree, memory: mem, docs: [...docs.filter((d) => !rootDocs.includes(d)), ...rootDocs], resumePlan, roots };
-    const delegate = createDelegateTool({
-      parent: driver,
-      context: { tree, memory: mem, docs: ctx.docs, roots },
-      modelAlias: startModel,
-      log: (msg) => console.log(msg),
-      createSession: (workerDriver, workerContext) =>
-        // Workers: no delegate tool (no nesting), no journal (the main
-        // thread owns the plan), and the "worker" role so they report back
-        // a short summary instead of pasting code into the orchestrator.
-        new AgentSession(
-          workerDriver,
-          workerContext,
-          [
-            createScreenshotTool(workerDriver),
-            createBrowsePageTool(workerDriver),
-            ...createBrowserTools(workerDriver),
-            // Workers share the ONE Gem tab (questions are queued inside the
-            // tool): they need the project's conventions more than the
-            // planning tab does.
-            ...(gemConsultant ? [gemConsultant.tool] : []),
-          ],
-          undefined,
-          "worker"
-        ),
-    });
-    return new AgentSession(
+  const mcp = new McpManager();
+  let skills = await skillSummaries();
+  const makeMainSession = (mem: string | undefined, resumePlan?: string) =>
+    createMainSession({
       driver,
-      ctx,
-      [
-        delegate,
-        createUpdatePlanTool(journal),
-        createScreenshotTool(driver),
-        createBrowsePageTool(driver),
-        ...createBrowserTools(driver),
-        ...(gemConsultant ? [gemConsultant.tool] : []),
-      ],
+      context: { tree, memory: mem, docs: [...docs.filter((d) => !rootDocs.includes(d)), ...rootDocs], resumePlan, roots, skills },
       journal,
-      ORCHESTRATOR_MODE ? "orchestrator" : "solo"
-    );
-  };
+      modelAlias: () => startModel,
+      gemTool: gemConsultant?.tool,
+      mcpTools: () => mcp.tools,
+      orchestrator: ORCHESTRATOR_MODE,
+      log: (msg) => console.log(msg),
+    });
 
   // The resume plan is injected once, into the first session only — after
   // that it's either finished or superseded by the new run's own journal.
@@ -434,6 +403,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
     }
     await journal.markInterrupted("session terminated");
     await gemConsultant?.close();
+    await mcp.close();
     // Don't leave a dev server holding its port after we're gone.
     killAllBackgroundProcesses();
     releaseInstanceLock();
@@ -557,6 +527,12 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
     });
   };
 
+  // Here rather than with the rest of startup, because a project's servers
+  // need approving, and that needs the prompt wired up. Nothing has been sent
+  // yet, so the session can be remade with their tools.
+  await mcp.connectAll((msg) => console.log(c.dim(msg)));
+  if (mcp.tools.length) session = makeMainSession(memory, resumable?.raw);
+
   try {
     while (true) {
       const input = await nextLine();
@@ -588,11 +564,11 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
               } else {
                 let wanted = arg;
                 if (/^\d+$/.test(arg)) {
-                  const entry = (await driver.listModels()).filter((e) => !e.submenu)[Number(arg) - 1];
+                  const entry = (await driver.listPickerEntries()).filter((e) => !e.submenu)[Number(arg) - 1];
                   if (!entry) throw new Error(`no model number ${arg} — /models lists them`);
                   wanted = entry.label;
                 }
-                const name = await driver.setModel(wanted, {
+                const name = await driver.setModelWithFallback(wanted, {
                   onFallback: (w, g) => console.log(c.yellow(`  ${w} isn't in this picker — using ${g}`)),
                 });
                 console.log(`  ${c.green(glyph.ok)} model: ${c.bold(name)} ${c.dim(`(picker: ${await driver.getCurrentModel()})`)}\n`);
@@ -601,7 +577,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
 
             case "models": {
               process.stdout.write(c.dim("  reading the picker...\r"));
-              const entries = await driver.listModels();
+              const entries = await driver.listPickerEntries();
               console.log(`  ${c.bold("Models in this account's picker")} ${c.dim("(/model <number or label>)")}`);
               for (const line of pickerLines(entries)) console.log(line);
               console.log("");
@@ -614,7 +590,8 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
                 console.log(`  usage: /level ${THINKING_LEVELS.join("|")}\n`);
                 break;
               }
-              const level = await driver.setThinkingLevel(want);
+              if (want) await driver.setThinkingLevel(want);
+              const level = want ?? (await driver.getThinkingLevel()) ?? "not offered by this picker";
               console.log(`  ${c.green(glyph.ok)} thinking level: ${c.bold(level)}\n`);
               break;
             }
@@ -762,6 +739,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
               forgetAll();
               // A fresh thread has no memory of the primer, so the next task
               // must re-send it — that's what a new AgentSession does.
+              skills = await skillSummaries();
               session = makeMainSession(await readMemory());
               console.log(`  ${c.green(glyph.ok)} fresh conversation thread\n`);
               break;
@@ -831,6 +809,13 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
               }
               await appendMemory(arg);
               console.log(`  ${c.green(glyph.ok)} saved to ${MEMORY_FILENAME}\n`);
+              break;
+
+            case "mcp":
+              if (!mcp.status.length) console.log(`  ${c.dim(`no MCP servers — add them to ${MCP_CONFIG_FILENAME}`)}\n`);
+              for (const s of mcp.status) {
+                console.log(`  ${c.cyan(s.name)} ${s.state}, ${s.tools.length} tool(s)${s.error ? ` — ${s.error}` : ""}`);
+              }
               break;
 
             case "tools":
@@ -903,6 +888,7 @@ ${c.dim("Type a task, or /help for commands. Ctrl+V pastes an image; typing whil
     setAsker(undefined);
     // Close the Gem's tab with the session that opened it.
     await gemConsultant?.close();
+    await mcp.close();
     rl.close();
     killAllBackgroundProcesses();
     releaseInstanceLock();
@@ -929,6 +915,12 @@ Usage:
       --tabs <n>              parallel Gemini tabs = concurrent requests (default 2)
       --api-key <key>         require "Authorization: Bearer <key>"
       --cors-origin <url>     let a browser app at <url> call it (repeatable)
+  gemini-code skills list     show the skills Gemini can use
+  gemini-code skills add <owner/repo or GitHub URL> [--all] [--only=a,b]
+                              install Claude-compatible skills from GitHub
+  gemini-code skills remove <name>
+                              remove an installed skill
+  gemini-code bridge          run the agent over JSON lines on stdin/stdout (the desktop UI uses this)
   gemini-code open-chrome     open a normal Chrome window to sign into (do this first)
   gemini-code login           check that the signed-in Chrome is reachable
   gemini-code doctor          check Node, Chrome, the profile, PATH and the sign-in state
@@ -949,6 +941,50 @@ Settings (environment, or "gemini-code config set <key> <value>", or <project>/.
   GEMINI_CODE_API_KEY         same as serve --api-key
   GEMINI_CODE_API_PORT, GEMINI_CODE_API_HOST, GEMINI_CODE_API_TABS, GEMINI_CODE_API_CORS
 `;
+
+/** `gemini-code skills`: installing is the user's to do, so it's a command, not a tool. */
+async function skillsCommand(): Promise<void> {
+  const [action, ...rest] = process.argv.slice(3);
+  const flags = rest.filter((arg) => arg.startsWith("--"));
+  const [target] = rest.filter((arg) => !arg.startsWith("--"));
+
+  if (action === "list" || !action) {
+    const installed = await listInstalled();
+    const others = [...(await findSkills()).values()].filter((s) => !installed.some((i) => i.name === s.name));
+    if (!installed.length && !others.length) console.log(`No skills yet. Add one with: gemini-code skills add <github repo>`);
+    for (const s of installed) console.log(`${c.cyan(s.name)} ${c.dim(s.source ?? "")}\n  ${s.description}`);
+    for (const s of others) console.log(`${c.cyan(s.name)} ${c.dim(`(${s.source})`)}\n  ${s.description}`);
+    return;
+  }
+
+  if (action === "remove" && target) {
+    await removeSkill(target);
+    console.log(`  ${c.green("✓")} removed ${target}`);
+    return;
+  }
+
+  if (action === "add" && target) {
+    const only = flags.find((flag) => flag.startsWith("--only="))?.slice("--only=".length).split(",");
+    const found = await discoverSkills(target);
+    if (!found.length) throw new Error(`No skills found in ${target}. A skill is a folder with a SKILL.md.`);
+    if (found.length > 1 && !only && !flags.includes("--all")) {
+      console.log(`${target} has ${found.length} skills:\n`);
+      for (const s of found) console.log(`  ${c.cyan(s.name)}\n    ${s.description.slice(0, 100)}`);
+      console.log(`\nChoose with --only=<name>,<name> or install them all with --all.`);
+      process.exitCode = 1;
+      return;
+    }
+    const installed = await installSkills(target, only ?? found.map((s) => s.name));
+    for (const s of installed) {
+      const scripts = s.scripts.length ? ` ${c.yellow(`(${s.scripts.length} script${s.scripts.length > 1 ? "s" : ""} it may ask to run)`)}` : "";
+      console.log(`  ${c.green("✓")} ${s.name}${scripts}`);
+    }
+    return;
+  }
+
+  console.error(`Usage:\n  gemini-code skills list\n  gemini-code skills add <owner/repo or GitHub URL> [--all] [--only=a,b]\n  gemini-code skills remove <name>`);
+  process.exitCode = 1;
+}
 
 /** `gemini-code serve`: the OpenAI-compatible API. */
 async function serve(): Promise<void> {
@@ -1019,6 +1055,10 @@ async function cli(): Promise<void> {
       return main();
     case "serve":
       return serve();
+    case "bridge":
+      return runBridge();
+    case "skills":
+      return skillsCommand();
     case "open-chrome":
       return void openChrome();
     case "login":
