@@ -32,7 +32,8 @@ try {
 # Production dependencies only, in their own folder: dev tooling has no place in the exe.
 Push-Location $agent
 try {
-    npm ci --omit=dev --no-audit --no-fund
+    # dist/ is already built; the package's prepare script (and its scripts/ folder) aren't in the stage.
+    npm ci --omit=dev --ignore-scripts --no-audit --no-fund
     if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
 } finally {
     Pop-Location

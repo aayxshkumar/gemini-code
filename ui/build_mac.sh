@@ -20,7 +20,8 @@ mkdir -p "$AGENT"
 cp -R "$REPO/dist" "$AGENT/dist"
 cp "$REPO/package.json" "$REPO/package-lock.json" "$AGENT/"
 # Production dependencies only, in their own folder.
-(cd "$AGENT" && npm ci --omit=dev --no-audit --no-fund)
+# dist/ is already built; the package's prepare script (and its scripts/ folder) aren't in the stage.
+(cd "$AGENT" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund)
 rm -rf "$AGENT/node_modules/.bin"
 cp "$(command -v node)" "$AGENT/node"
 
