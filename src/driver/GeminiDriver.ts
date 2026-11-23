@@ -23,6 +23,26 @@ import { HTML_TO_MARKDOWN } from "./markdown.js";
 const GEMS_URL = "https://gemini.google.com/gems/view";
 const gemChatUrl = (id: string) => `https://gemini.google.com/gem/${id}`;
 
+/**
+ * Makes loopback addresses bypass any HTTP(S) proxy, by adding them to
+ * NO_PROXY / no_proxy (keeping whatever is already listed).
+ *
+ * Playwright honours HTTP_PROXY / HTTPS_PROXY even for localhost. On a work
+ * laptop with a company proxy set, its request to the browser's debug port
+ * (http://localhost:9222/json/version) went to the proxy, which answered
+ * 403 — and gemini-code couldn't attach to the browser at all. Exported for
+ * the tests.
+ */
+export function bypassProxyForLoopback(env: NodeJS.ProcessEnv = process.env): void {
+  const loopback = ["localhost", "127.0.0.1", "::1"];
+  for (const name of ["NO_PROXY", "no_proxy"]) {
+    const current = (env[name] ?? "").split(",").map((h) => h.trim()).filter(Boolean);
+    if (current.includes("*")) continue; // already bypasses everything
+    const missing = loopback.filter((h) => !current.includes(h));
+    if (missing.length) env[name] = [...current, ...missing].join(",");
+  }
+}
+
 /** Where `applySiteSelectors` looks for the user's own selector overrides. */
 export function selectorOverridesPath(): string {
   return path.join(process.env.GEMINI_CODE_HOME || path.join(homedir(), ".gemini-code"), "selectors.json");
@@ -409,7 +429,18 @@ export class GeminiDriver implements IGeminiDriver {
    * security-sensitive login step is deliberately kept manual.
    */
   async attach(cdpUrl = "http://localhost:9222"): Promise<void> {
-    const browser = await chromium.connectOverCDP(cdpUrl);
+    // The debug port is on this machine; never send that through a proxy.
+    bypassProxyForLoopback();
+    const browser = await chromium.connectOverCDP(cdpUrl).catch((err: Error) => {
+      if (/\b403\b/.test(err.message)) {
+        throw new Error(
+          `The browser's debug port (${cdpUrl}) answered 403 Forbidden. Something between gemini-code and the ` +
+            `browser refused the connection — usually a proxy or security tool that intercepts localhost. ` +
+            `Add localhost and 127.0.0.1 to its bypass list (or to NO_PROXY), then try again.\n(${err.message.split("\n")[0]})`
+        );
+      }
+      throw err;
+    });
     this.ownsBrowser = false;
     // Keep the handle so close() can drop the CDP connection. Without this
     // the open websocket keeps Node's event loop alive and the process

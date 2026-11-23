@@ -61,7 +61,7 @@ import { appUrl, isAppPage, isEnterprise, isSignInPage, parseEnterpriseUrl } fro
 import { enterpriseConfigured, setEnterprise } from "../enterprise.js";
 import { envNameFor } from "../config.js";
 import { createAskGemTool } from "../tools/askGem.js";
-import { gemIdFromHref } from "../driver/GeminiDriver.js";
+import { gemIdFromHref, bypassProxyForLoopback } from "../driver/GeminiDriver.js";
 import { gemFlag, gemModeFlag, enterpriseFlag, serveArgs } from "../args.js";
 import { startServer } from "../server/openai.js";
 import { isDialogRace } from "../driver/processGuards.js";
@@ -1835,6 +1835,19 @@ async function main() {
     assert.ok(menuRowMatches("fast", "Auto\nGemini 3 models"), "the default must work on an Auto-only picker");
     assert.ok(!menuRowMatches("4 Argon", "3.1 Pro\nAdvanced reasoning"));
     assert.ok(!menuRowMatches("fast", "Thinking level"));
+  });
+
+  console.log("Browser attach:");
+  await test("the debug port bypasses any proxy: loopback is added to NO_PROXY, keeping what's there", () => {
+    const env: NodeJS.ProcessEnv = { HTTPS_PROXY: "http://proxy.corp:8080", NO_PROXY: "corp.example.com, .internal" };
+    bypassProxyForLoopback(env);
+    assert.equal(env.NO_PROXY, "corp.example.com,.internal,localhost,127.0.0.1,::1");
+    assert.equal(env.no_proxy, "localhost,127.0.0.1,::1");
+    bypassProxyForLoopback(env);
+    assert.equal(env.NO_PROXY, "corp.example.com,.internal,localhost,127.0.0.1,::1", "running twice adds nothing");
+    const all: NodeJS.ProcessEnv = { NO_PROXY: "*" };
+    bypassProxyForLoopback(all);
+    assert.equal(all.NO_PROXY, "*", "a bypass-everything list is left alone");
   });
 
   console.log("Gemini Enterprise:");
